@@ -160,10 +160,7 @@ def main():
         model = Seq2SeqFEConvLSTM(
                 input_channels=1,
                 hidden_channels=args.hidden_size,
-                height=args.image_size,
-                width=args.image_size,
-                h_kernel_size=args.kernel_size,
-                u_kernel_size=args.kernel_size,
+                kernel_size=args.kernel_size,
                 v_range=args.v_range,
                 pool_type='max',
                 decoder_conv_layers=args.decoder_conv_layers
@@ -173,10 +170,7 @@ def main():
         model = Seq2SeqFEConvLSTM(
                 input_channels=1,
                 hidden_channels=args.hidden_size,
-                height=args.image_size,
-                width=args.image_size,
-                h_kernel_size=args.kernel_size,
-                u_kernel_size=args.kernel_size,
+                kernel_size=args.kernel_size,
                 v_range=0,
                 pool_type='max',
                 decoder_conv_layers=args.decoder_conv_layers
