@@ -1,9 +1,9 @@
 import torch
 from tqdm import tqdm
-from moving_mnist.moving_mnist_dataset import FixedVelocityMovingMNIST
-from moving_mnist.visualization import log_sequence_predictions, log_sequence_predictions_new
 import numpy as np
 from torch.utils.data import DataLoader
+from moving_mnist_dataset import FixedVelocityMovingMNIST
+from visualization import log_sequence_predictions, log_sequence_predictions_new
 
 
 def train_epoch(model, dataloader, optimizer, criterion, device, input_frames, teacher_forcing_ratio, grad_clip=None):

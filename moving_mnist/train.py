@@ -2,7 +2,7 @@ import argparse
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, random_split, Subset
-from moving_mnist.moving_mnist_dataset import MovingMNISTDataset
+from moving_mnist_dataset import MovingMNISTDataset
 from channel_based_FEConvLSTM_model import Seq2SeqFEConvLSTM
 from tqdm import tqdm
 import wandb
@@ -11,7 +11,7 @@ import numpy as np
 import random
 import time
 import os
-from moving_mnist.train_eval_utils import train_epoch, eval_epoch, eval_len_generalization, eval_velocity_generalization
+from train_eval_utils import train_epoch, eval_epoch, eval_len_generalization, eval_velocity_generalization
 
 
 def main():
@@ -23,7 +23,7 @@ def main():
     parser.add_argument('--epochs', type=int, default=50)
     parser.add_argument('--min_epochs', type=int, default=50, help='Minimum number of epochs to train')
     parser.add_argument('--lr', type=float, default=1e-3)
-    parser.add_argument('--model', choices=['grnn', 'fernn'], default='fernn')
+    parser.add_argument('--model', choices=['lstm', 'felstm'], default='felstm')
     parser.add_argument('--hidden_size', type=int, default=128)
     parser.add_argument('--num_layers', type=int, default=1)
     parser.add_argument('--kernel_size', type=int, default=3)
