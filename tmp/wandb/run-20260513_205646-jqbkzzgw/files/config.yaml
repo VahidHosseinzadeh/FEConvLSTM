@@ -1,0 +1,159 @@
+_wandb:
+    value:
+        cli_version: 0.24.2
+        e:
+            hpj534ceueqnm0oh4wn4ha3di6wlimpb:
+                args:
+                    - --model
+                    - lstm
+                    - --v_range
+                    - "0"
+                    - --data_v_range
+                    - "1"
+                    - --hidden_size
+                    - "64"
+                    - --decoder_conv_layers
+                    - "4"
+                    - --batch_size
+                    - "32"
+                    - --lr
+                    - "3e-5"
+                    - --epochs
+                    - "30"
+                    - --min_epochs
+                    - "10"
+                    - --teacher_forcing_ratio
+                    - "0.0"
+                    - --grad_clip
+                    - "0.0"
+                    - --data_seed
+                    - "42"
+                    - --model_seed
+                    - "42"
+                    - --wandb_project
+                    - FEConvLSTM
+                    - --gen_seq_len
+                    - "40"
+                codePath: moving_mnist/train.py
+                codePathLocal: moving_mnist/train.py
+                cpu_count: 48
+                cpu_count_logical: 48
+                cudaVersion: "12.7"
+                disk:
+                    /:
+                        total: "462044258304"
+                        used: "39532359680"
+                email: vahid.hoseinzade64@gmail.com
+                executable: /mmfs1/cm/shared/apps_local/python/3.11/envs/torch2.2/bin/python
+                gpu: NVIDIA A100 80GB PCIe
+                gpu_count: 2
+                gpu_nvidia:
+                    - architecture: Ampere
+                      cudaCores: 6912
+                      memoryTotal: "85899345920"
+                      name: NVIDIA A100 80GB PCIe
+                      uuid: GPU-c9b9d17e-9209-9e52-03b8-aa2f0ec7b50d
+                    - architecture: Ampere
+                      cudaCores: 6912
+                      memoryTotal: "85899345920"
+                      name: NVIDIA A100 80GB PCIe
+                      uuid: GPU-83e129a1-a274-a366-0ea2-aabfdcfaf23e
+                host: gpu001
+                memory:
+                    total: "540461924352"
+                os: Linux-5.14.0-162.6.1.el9_1.x86_64-x86_64-with-glibc2.34
+                program: /mmfs1/home/jacks.local/vhosseinzadehjavari/FEConvlstm_repo/FEConvLSTM/moving_mnist/train.py
+                python: CPython 3.12.2
+                root: ./tmp/
+                slurm:
+                    conf: /cm/shared/apps/slurm/var/etc/slurm/slurm.conf
+                startedAt: "2026-05-14T01:56:46.792032Z"
+                writerId: hpj534ceueqnm0oh4wn4ha3di6wlimpb
+        m: []
+        python_version: 3.12.2
+        t:
+            "1":
+                - 1
+                - 11
+                - 41
+                - 49
+            "2":
+                - 1
+                - 11
+                - 41
+                - 49
+            "3":
+                - 16
+            "4": 3.12.2
+            "5": 0.24.2
+            "6": 4.37.2
+            "12": 0.24.2
+            "13": linux-x86_64
+batch_size:
+    value: 32
+data_seed:
+    value: 42
+data_v_range:
+    value: 1
+decoder_conv_layers:
+    value: 4
+epochs:
+    value: 30
+evaluate_only:
+    value: false
+gen_seq_len:
+    value: 40
+gen_vel_max:
+    value: 2
+gen_vel_min:
+    value: -2
+gen_vel_n_seq:
+    value: 128
+gen_vel_step:
+    value: 1
+grad_clip:
+    value: 0
+hidden_size:
+    value: 64
+image_size:
+    value: 28
+input_frames:
+    value: 10
+kernel_size:
+    value: 3
+load_model:
+    value: null
+lr:
+    value: 3e-05
+max_train_samples:
+    value: null
+min_epochs:
+    value: 10
+model:
+    value: lstm
+model_save_dir:
+    value: ./fernn/movmnist/
+model_seed:
+    value: 42
+num_layers:
+    value: 1
+root:
+    value: ./data
+run_name:
+    value: null
+run_velocity_generalization:
+    value: false
+seq_len:
+    value: 20
+teacher_forcing_ratio:
+    value: 0
+v_range:
+    value: 0
+wandb_dir:
+    value: ./tmp/
+wandb_entity:
+    value: null
+wandb_name:
+    value: null
+wandb_project:
+    value: FEConvLSTM

@@ -1,0 +1,21 @@
+2026-05-13 19:32:06,105 INFO    MainThread:360030 [wandb_setup.py:_flush():81] Current SDK version is 0.24.2
+2026-05-13 19:32:06,105 INFO    MainThread:360030 [wandb_setup.py:_flush():81] Configure stats pid to 360030
+2026-05-13 19:32:06,105 INFO    MainThread:360030 [wandb_setup.py:_flush():81] Loading settings from environment variables
+2026-05-13 19:32:06,105 INFO    MainThread:360030 [wandb_init.py:setup_run_log_directory():717] Logging user logs to tmp/wandb/run-20260513_193206-gvd2nolm/logs/debug.log
+2026-05-13 19:32:06,105 INFO    MainThread:360030 [wandb_init.py:setup_run_log_directory():718] Logging internal logs to tmp/wandb/run-20260513_193206-gvd2nolm/logs/debug-internal.log
+2026-05-13 19:32:06,105 INFO    MainThread:360030 [wandb_init.py:init():844] calling init triggers
+2026-05-13 19:32:06,105 INFO    MainThread:360030 [wandb_init.py:init():849] wandb.init called with sweep_config: {}
+config: {'root': './data', 'seq_len': 20, 'input_frames': 10, 'batch_size': 32, 'epochs': 30, 'min_epochs': 10, 'lr': 0.001, 'model': 'felstm', 'hidden_size': 64, 'num_layers': 1, 'kernel_size': 3, 'decoder_conv_layers': 4, 'max_train_samples': None, 'teacher_forcing_ratio': 0.0, 'image_size': 28, 'v_range': 2, 'data_v_range': 2, 'gen_seq_len': 40, 'data_seed': 42, 'model_seed': 42, 'run_name': None, 'model_save_dir': './fernn/movmnist/', 'load_model': None, 'evaluate_only': False, 'gen_vel_min': -2, 'gen_vel_max': 2, 'gen_vel_step': 1, 'gen_vel_n_seq': 128, 'run_velocity_generalization': False, 'grad_clip': 0.0, 'wandb_entity': None, 'wandb_project': 'FEConvLSTM', 'wandb_dir': './tmp/', 'wandb_name': None, '_wandb': {}}
+2026-05-13 19:32:06,105 INFO    MainThread:360030 [wandb_init.py:init():892] starting backend
+2026-05-13 19:32:07,949 INFO    MainThread:360030 [wandb_init.py:init():895] sending inform_init request
+2026-05-13 19:32:08,045 INFO    MainThread:360030 [wandb_init.py:init():903] backend started and connected
+2026-05-13 19:32:08,046 INFO    MainThread:360030 [wandb_init.py:init():973] updated telemetry
+2026-05-13 19:32:08,046 INFO    MainThread:360030 [wandb_init.py:init():997] communicating run to backend with 90.0 second timeout
+2026-05-13 19:32:08,784 INFO    MainThread:360030 [wandb_init.py:init():1042] starting run threads in backend
+2026-05-13 19:32:14,492 INFO    MainThread:360030 [wandb_run.py:_console_start():2529] atexit reg
+2026-05-13 19:32:14,492 INFO    MainThread:360030 [wandb_run.py:_redirect():2377] redirect: wrap_raw
+2026-05-13 19:32:14,492 INFO    MainThread:360030 [wandb_run.py:_redirect():2446] Wrapping output streams.
+2026-05-13 19:32:14,492 INFO    MainThread:360030 [wandb_run.py:_redirect():2469] Redirects installed.
+2026-05-13 19:32:14,705 INFO    MainThread:360030 [wandb_init.py:init():1082] run started, returning control to user process
+2026-05-13 19:32:19,401 INFO    wandb-AsyncioManager-main:360030 [service_client.py:_forward_responses():94] Reached EOF.
+2026-05-13 19:32:19,401 INFO    wandb-AsyncioManager-main:360030 [mailbox.py:close():154] Closing mailbox, abandoning 1 handles.

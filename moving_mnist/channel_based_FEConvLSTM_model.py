@@ -32,9 +32,17 @@ class FEConvLSTMCell(nn.Module):
             kernel_size,
             padding=padding,
             padding_mode='circular',
-            bias=False
+            bias=True
         )
 
+        # Initialize forget gate bias positively
+        nn.init.constant_(
+            self.conv.bias[
+                hidden_channels : 2 * hidden_channels
+            ],
+            1.0
+        )
+        
     def shift_tensor(self, x):
 
         # x:
@@ -187,7 +195,7 @@ class Seq2SeqFEConvLSTM(nn.Module):
                     kernel_size=3,
                     padding=1,
                     padding_mode='circular',
-                    bias=False
+                    bias=True
                 ),
                 nn.ReLU()
             ]
@@ -199,7 +207,7 @@ class Seq2SeqFEConvLSTM(nn.Module):
                 kernel_size=3,
                 padding=1,
                 padding_mode='circular',
-                bias=False
+                bias=True
             )
         ]
 

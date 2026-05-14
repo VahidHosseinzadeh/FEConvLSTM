@@ -1,0 +1,78 @@
+{
+  "os": "Linux-5.14.0-162.6.1.el9_1.x86_64-x86_64-with-glibc2.34",
+  "python": "CPython 3.12.2",
+  "startedAt": "2026-05-14T02:14:59.172484Z",
+  "args": [
+    "--model",
+    "felstm",
+    "--v_range",
+    "1",
+    "--data_v_range",
+    "1",
+    "--hidden_size",
+    "64",
+    "--decoder_conv_layers",
+    "4",
+    "--batch_size",
+    "32",
+    "--lr",
+    "3e-5",
+    "--epochs",
+    "30",
+    "--min_epochs",
+    "10",
+    "--teacher_forcing_ratio",
+    "0.0",
+    "--grad_clip",
+    "1.0",
+    "--data_seed",
+    "42",
+    "--model_seed",
+    "42",
+    "--wandb_project",
+    "FEConvLSTM",
+    "--gen_seq_len",
+    "40"
+  ],
+  "program": "/mmfs1/home/jacks.local/vhosseinzadehjavari/FEConvlstm_repo/FEConvLSTM/moving_mnist/train.py",
+  "codePath": "moving_mnist/train.py",
+  "codePathLocal": "moving_mnist/train.py",
+  "email": "vahid.hoseinzade64@gmail.com",
+  "root": "./tmp/",
+  "host": "gpu001",
+  "executable": "/mmfs1/cm/shared/apps_local/python/3.11/envs/torch2.2/bin/python",
+  "cpu_count": 48,
+  "cpu_count_logical": 48,
+  "gpu": "NVIDIA A100 80GB PCIe",
+  "gpu_count": 2,
+  "disk": {
+    "/": {
+      "total": "462044258304",
+      "used": "39532675072"
+    }
+  },
+  "memory": {
+    "total": "540461924352"
+  },
+  "gpu_nvidia": [
+    {
+      "name": "NVIDIA A100 80GB PCIe",
+      "memoryTotal": "85899345920",
+      "cudaCores": 6912,
+      "architecture": "Ampere",
+      "uuid": "GPU-c9b9d17e-9209-9e52-03b8-aa2f0ec7b50d"
+    },
+    {
+      "name": "NVIDIA A100 80GB PCIe",
+      "memoryTotal": "85899345920",
+      "cudaCores": 6912,
+      "architecture": "Ampere",
+      "uuid": "GPU-83e129a1-a274-a366-0ea2-aabfdcfaf23e"
+    }
+  ],
+  "cudaVersion": "12.7",
+  "slurm": {
+    "conf": "/cm/shared/apps/slurm/var/etc/slurm/slurm.conf"
+  },
+  "writerId": "9uylqsqvrnbkwqnpaw15p4pta9fdoqa6"
+}
