@@ -14,6 +14,18 @@ import os
 from train_eval_utils import train_epoch, eval_epoch, eval_len_generalization, eval_velocity_generalization
 
 
+class MSEPlusL1Loss(nn.Module):
+    def __init__(self, mse_weight=1.0, l1_weight=1.0):
+        super().__init__()
+        self.mse = nn.MSELoss()
+        self.l1 = nn.L1Loss()
+        self.mse_weight = mse_weight
+        self.l1_weight = l1_weight
+
+    def forward(self, input_seq, target_seq):
+        return self.mse_weight * self.mse(input_seq, target_seq) + self.l1_weight * self.l1(input_seq, target_seq)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Train & evaluate RNN models on Moving MNIST")
     parser.add_argument('--root', type=str, default='./data')
@@ -82,7 +94,7 @@ def main():
         image_size=args.image_size,
         velocity_range_x=(-args.data_v_range,args.data_v_range),
         velocity_range_y=(-args.data_v_range,args.data_v_range),
-        num_digits=1
+        num_digits=2
     )
     
     test_dataset = MovingMNISTDataset(
@@ -92,7 +104,7 @@ def main():
         image_size=args.image_size,
         velocity_range_x=(-args.data_v_range,args.data_v_range),
         velocity_range_y=(-args.data_v_range,args.data_v_range),
-        num_digits=1
+        num_digits=2
     )
 
     gen_test_dataset = MovingMNISTDataset(
@@ -102,7 +114,7 @@ def main():
             image_size=args.image_size,
             velocity_range_x=(-args.data_v_range, args.data_v_range),
             velocity_range_y=(-args.data_v_range, args.data_v_range),
-            num_digits=1,
+            num_digits=2,
             random=False
     )
 
@@ -188,7 +200,7 @@ def main():
     # If evaluate_only is True, skip training and only run evaluation
     if args.evaluate_only:
         print("Running evaluation only...")
-        criterion = nn.MSELoss()
+        criterion = MSEPlusL1Loss()
         test_loss = eval_epoch(model, test_loader, criterion, device, args.input_frames, 0, split_name="test")
         print(f"Test Loss: {test_loss:.4f}")
 
@@ -236,7 +248,7 @@ def main():
 
     # Optimizers & loss
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
-    criterion = nn.MSELoss()
+    criterion = MSEPlusL1Loss()
 
     # Training loop
     history = {'train_loss': [], 'val_loss': [], 'test_loss': []}
