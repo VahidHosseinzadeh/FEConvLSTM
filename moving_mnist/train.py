@@ -26,6 +26,44 @@ class MSEPlusL1Loss(nn.Module):
         return self.mse_weight * self.mse(input_seq, target_seq) + self.l1_weight * self.l1(input_seq, target_seq)
 
 
+def log_length_generalization_curve(gen_mean, gen_std, gen_pred_frames, args):
+    steps = np.arange(1, gen_pred_frames + 1)
+
+    fig, ax = plt.subplots(figsize=(6, 4))
+    ax.plot(steps, gen_mean, label="MSE")
+    ax.fill_between(
+        steps,
+        (gen_mean - gen_std).clip(min=0),
+        gen_mean + gen_std,
+        alpha=0.3,
+        label="± std",
+    )
+    ax.set_xlabel("Prediction horizon t")
+    ax.set_ylabel("MSE")
+    ax.set_title(f"Length generalization (seq_len = {args.gen_seq_len})")
+    ax.legend()
+    wandb.log({"len_gen_curve_image": wandb.Image(fig)})
+    plt.close(fig)
+
+    table_data = [
+        [int(step), float(m), max(0.0, float(m - s)), float(m + s)]
+        for step, m, s in zip(steps, gen_mean, gen_std)
+    ]
+    table = wandb.Table(
+        data=table_data,
+        columns=["prediction_horizon", "mse", "mse_min", "mse_max"],
+    )
+    wandb.log({"len_gen_curve_table": table})
+    wandb.log({
+        "len_gen_curve_plot": wandb.plot.line(
+            table,
+            x="prediction_horizon",
+            y="mse",
+            title="Length generalization",
+        )
+    })
+
+
 def main():
     parser = argparse.ArgumentParser(description="Train & evaluate RNN models on Moving MNIST")
     parser.add_argument('--root', type=str, default='./data')
@@ -216,6 +254,7 @@ def main():
         wandb.log({f"len_gen_mean_t{t+1}": gen_mean[t] for t in range(len(gen_mean))})
         wandb.log({f"len_gen_std_t{t+1}":  gen_std[t]  for t in range(len(gen_std))})
         wandb.log({f"len_gen_mean_mean_over_time": gen_mean.mean()})
+        log_length_generalization_curve(gen_mean, gen_std, gen_pred_frames, args)
 
         if args.run_velocity_generalization:
             print("Running velocity generalization test...")
@@ -287,22 +326,7 @@ def main():
             wandb.log({f"len_gen_mean_t{t+1}": gen_mean[t] for t in range(len(gen_mean))})
             wandb.log({f"len_gen_std_t{t+1}":  gen_std[t]  for t in range(len(gen_std))})
             wandb.log({f"len_gen_mean_mean_over_time": gen_mean.mean()})
-
-            # ---- wandb line plot ----
-            steps = np.arange(1, gen_pred_frames + 1)
-            fig, ax = plt.subplots(figsize=(6, 4))
-            ax.plot(steps, gen_mean, label="MSE")
-            ax.fill_between(steps,
-                            (gen_mean - gen_std).clip(min=0),
-                            gen_mean + gen_std,
-                            alpha=0.3,
-                            label="± std")
-            ax.set_xlabel("Prediction horizon t")
-            ax.set_ylabel("MSE")
-            ax.set_title(f"Length generalization (seq_len = {args.gen_seq_len})")
-            ax.legend()
-            wandb.log({f"len_gen_curve": wandb.Image(fig)})
-            plt.close(fig)
+            log_length_generalization_curve(gen_mean, gen_std, gen_pred_frames, args)
             
             if args.run_velocity_generalization:
                 vx, vy, err = eval_velocity_generalization(model, device, args)
