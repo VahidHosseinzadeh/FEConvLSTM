@@ -2,6 +2,7 @@ import argparse
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, random_split, Subset
+from velocity_model_based_MEConvLSTM_model import Seq2SeqMEConvLSTM
 from moving_mnist_dataset import MovingMNISTDataset
 from channel_based_FEConvLSTM_model import Seq2SeqFEConvLSTM
 from tqdm import tqdm
@@ -73,7 +74,7 @@ def main():
     parser.add_argument('--epochs', type=int, default=50)
     parser.add_argument('--min_epochs', type=int, default=50, help='Minimum number of epochs to train')
     parser.add_argument('--lr', type=float, default=1e-3)
-    parser.add_argument('--model', choices=['lstm', 'felstm'], default='felstm')
+    parser.add_argument('--model', choices=['lstm', 'felstm', 'melstm'], default='felstm')
     parser.add_argument('--hidden_size', type=int, default=128)
     parser.add_argument('--num_layers', type=int, default=1)
     parser.add_argument('--kernel_size', type=int, default=3)
@@ -82,6 +83,7 @@ def main():
     parser.add_argument('--teacher_forcing_ratio', type=float, default=0.0, help='Probability of using teacher forcing during training (0.0-1.0)')
     parser.add_argument('--image_size', type=int, default=28)
     parser.add_argument('--v_range', type=int, default=2)
+    parser.add_argument('--num_vel_modes', type=int, default=2, help='Number of velocity modes for MEConvLSTM')
     parser.add_argument('--data_v_range', type=int, default=2)
     parser.add_argument('--gen_seq_len', type=int, default=40, help='Sequence length used **only** for length‑generalization evaluation (must be > seq_len)')
     parser.add_argument('--data_seed', type=int, default=42, help='Random seed for dataset splitting')
@@ -224,6 +226,15 @@ def main():
                 v_range=0,
                 pool_type='max',
                 decoder_conv_layers=args.decoder_conv_layers
+            ).to(device)
+    elif args.model == "melstm":
+        model = Seq2SeqMEConvLSTM(
+                input_channels=1,
+                hidden_channels=args.hidden_size,
+                kernel_size=args.kernel_size,
+                n_slots= args.num_vel_modes,
+                slot_reduce = 'max',
+                decoder_layers = args.decoder_conv_layers
             ).to(device)
 
     # Load model if specified
