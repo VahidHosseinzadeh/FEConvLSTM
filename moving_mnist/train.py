@@ -103,7 +103,6 @@ def main():
     parser.add_argument('--wandb_project', type=str, default="FERNN", help='Wandb project')
     parser.add_argument('--wandb_dir', type=str, default='./tmp/', help='Wandb directory')
     parser.add_argument('--wandb_name', type=str, default=None, help='Wandb name')
-    parser.add_argument('--horizon_length', type=int, default=10, help='Freeze motion after this many frames for length generalization test')
     args = parser.parse_args()
 
     # Set seeds for reproducibility
@@ -251,7 +250,7 @@ def main():
 
         motion_difficulty=None,
 
-        freeze_after=args.horizon_length,
+        freeze_after=args.input_frames-1,
 
         min_center_distance=20,
         reject_overlap=True,
@@ -263,7 +262,7 @@ def main():
         transform=None,
         download=True,
 
-        random=True,  # Fixed sequences for length generalization
+        random=False,  # Fixed sequences for length generalization
         seed=42,
         max_tries=300
     )

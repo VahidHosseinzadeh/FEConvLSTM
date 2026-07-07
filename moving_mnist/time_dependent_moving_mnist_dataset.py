@@ -84,10 +84,10 @@ class TDMovingMNISTDataset(Dataset):
         # then freeze the velocity.  None = no freezing.
         freeze_after=None,
 
-        min_center_distance=12,
+        min_center_distance=20,
         reject_overlap=True,
         require_distinct_velocities=True,
-        require_distinct_digits=False,
+        require_distinct_digits=True,
 
         return_motion=True,
         return_positions=False,
