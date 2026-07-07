@@ -57,7 +57,8 @@ def eval_epoch(model, dataloader, criterion, device, input_frames, epoch, split_
             output_seq = model(
                 input_seq,
                 pred_len=pred_len,
-                teacher_forcing_ratio=0.0
+                teacher_forcing_ratio=0.0,
+                target_seq=target_seq
             )
             loss = criterion(output_seq, target_seq)
             batch_loss = loss.item()

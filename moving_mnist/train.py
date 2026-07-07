@@ -4,6 +4,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, random_split, Subset
 from velocity_model_based_MEConvLSTM_model import Seq2SeqMEConvLSTM
 from moving_mnist_dataset import MovingMNISTDataset
+from time_dependent_moving_mnist_dataset import TDMovingMNISTDataset
 from channel_based_FEConvLSTM_model import Seq2SeqFEConvLSTM
 from tqdm import tqdm
 import wandb
@@ -102,6 +103,7 @@ def main():
     parser.add_argument('--wandb_project', type=str, default="FERNN", help='Wandb project')
     parser.add_argument('--wandb_dir', type=str, default='./tmp/', help='Wandb directory')
     parser.add_argument('--wandb_name', type=str, default=None, help='Wandb name')
+    parser.add_argument('--horizon_length', type=int, default=10, help='Freeze motion after this many frames for length generalization test')
     args = parser.parse_args()
 
     # Set seeds for reproducibility
@@ -126,36 +128,144 @@ def main():
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    # Dataset and splits
-    train_dataset = MovingMNISTDataset(
+    
+
+    # # Dataset and splits
+    # train_dataset = MovingMNISTDataset(
+    #     root=args.root,
+    #     train=True,
+    #     seq_len=args.seq_len,
+    #     image_size=args.image_size,
+    #     velocity_range_x=(-args.data_v_range,args.data_v_range),
+    #     velocity_range_y=(-args.data_v_range,args.data_v_range),
+    #     num_digits=2
+    # )
+    
+    # test_dataset = MovingMNISTDataset(
+    #     root=args.root,
+    #     train=False,
+    #     seq_len=args.seq_len,
+    #     image_size=args.image_size,
+    #     velocity_range_x=(-args.data_v_range,args.data_v_range),
+    #     velocity_range_y=(-args.data_v_range,args.data_v_range),
+    #     num_digits=2
+    # )
+
+    # gen_test_dataset = MovingMNISTDataset(
+    #         root=args.root,
+    #         train=False,
+    #         seq_len=args.gen_seq_len,
+    #         image_size=args.image_size,
+    #         velocity_range_x=(-args.data_v_range, args.data_v_range),
+    #         velocity_range_y=(-args.data_v_range, args.data_v_range),
+    #         num_digits=2,
+    #         random=False
+    # )
+
+    train_dataset = TDMovingMNISTDataset(
         root=args.root,
         train=True,
         seq_len=args.seq_len,
+        num_digits=2,
         image_size=args.image_size,
-        velocity_range_x=(-args.data_v_range,args.data_v_range),
-        velocity_range_y=(-args.data_v_range,args.data_v_range),
-        num_digits=2
+        max_speed=args.data_v_range,
+
+        motion_mode="piecewise",
+        transition_mode="smooth",
+
+        min_segment=3,
+        max_segment=6,
+
+        p_change=0.25,
+        smooth_probability=0.8,
+
+        motion_difficulty=None,
+
+        min_center_distance=20,
+        reject_overlap=True,
+        require_distinct_velocities=True,
+
+        return_motion=False,
+        return_positions=False,
+
+        transform=None,
+        download=True,
+
+        random=True,
+        seed=42,
+
+        max_tries=300,
     )
-    
-    test_dataset = MovingMNISTDataset(
+
+    test_dataset = TDMovingMNISTDataset(
         root=args.root,
         train=False,
         seq_len=args.seq_len,
+        num_digits=2,
         image_size=args.image_size,
-        velocity_range_x=(-args.data_v_range,args.data_v_range),
-        velocity_range_y=(-args.data_v_range,args.data_v_range),
-        num_digits=2
-    )
+        max_speed=args.data_v_range,
 
-    gen_test_dataset = MovingMNISTDataset(
-            root=args.root,
-            train=False,
-            seq_len=args.gen_seq_len,
-            image_size=args.image_size,
-            velocity_range_x=(-args.data_v_range, args.data_v_range),
-            velocity_range_y=(-args.data_v_range, args.data_v_range),
-            num_digits=2,
-            random=False
+        motion_mode="piecewise",
+        transition_mode="smooth",
+
+        min_segment=3,
+        max_segment=6,
+
+        p_change=0.25,
+        smooth_probability=0.8,
+
+        motion_difficulty=None,
+
+        min_center_distance=20,
+        reject_overlap=True,
+        require_distinct_velocities=True,
+
+        return_motion=False,
+        return_positions=False,
+
+        transform=None,
+        download=True,
+
+        random=True,
+        seed=42,
+
+        max_tries=300,
+    )
+    
+    gen_test_dataset = TDMovingMNISTDataset(
+        root=args.root,
+        train=False,
+        seq_len=args.gen_seq_len,
+        num_digits=2,
+        image_size=args.image_size,
+        max_speed=args.data_v_range,
+
+        motion_mode="stochastic",
+        transition_mode="smooth",
+
+        min_segment=3,
+        max_segment=6,
+
+        p_change=0.25,
+        smooth_probability=0.8,
+
+        motion_difficulty=None,
+
+        freeze_after=args.horizon_length,
+
+        min_center_distance=20,
+        reject_overlap=True,
+        require_distinct_velocities=True,
+
+        return_motion=False,
+        return_positions=False,
+
+        transform=None,
+        download=True,
+
+        random=True,  # Fixed sequences for length generalization
+        seed=42,
+        max_tries=300
     )
 
     # Split training data into train and validation
