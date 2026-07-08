@@ -390,6 +390,7 @@ class TDMovingMNISTDataset(Dataset):
 
         return self._apply_freeze(motions)
 
+
     def _apply_freeze(self, motions):
         """
         If freeze_after is set, overwrite motions[freeze_after:] with the
@@ -405,11 +406,9 @@ class TDMovingMNISTDataset(Dataset):
         T = motions.shape[0]
         f = int(np.clip(self.freeze_after, 1, T))
 
-        if f < T:
-            # velocity at the last dynamic step, shape (N, 2)
-            last_v = motions[f - 1].clone()
-            # broadcast over remaining steps
-            motions[f:] = last_v.unsqueeze(0).expand(T - f, -1, -1)
+        if f >= 2:
+            last_v = motions[f - 2].clone()
+            motions[f - 1:] = last_v.unsqueeze(0).expand(T - (f - 1), -1, -1)
 
         return motions
 

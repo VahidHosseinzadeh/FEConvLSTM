@@ -250,7 +250,7 @@ def main():
 
         motion_difficulty=None,
 
-        freeze_after=args.input_frames-1,
+        freeze_after=args.input_frames,
 
         min_center_distance=20,
         reject_overlap=True,

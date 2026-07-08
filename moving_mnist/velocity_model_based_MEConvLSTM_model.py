@@ -201,7 +201,8 @@ class Seq2SeqMEConvLSTM(nn.Module):
                 input_seq,
                 pred_len,
                 teacher_forcing_ratio=0.0,
-                target_seq=None):
+                target_seq=None,
+                return_velocity=False):
         """
         input_seq : (B, T_in, C, H, W),  T_in >= 2
         pred_len  : int
@@ -218,6 +219,7 @@ class Seq2SeqMEConvLSTM(nn.Module):
 
         # ---- Encoder ------------------------------------------------
         v_last = torch.zeros(B, K, 2, device=input_seq.device, dtype=input_seq.dtype)
+        estimated_velocities = []
 
         for t in range(T_in):
 
@@ -236,6 +238,9 @@ class Seq2SeqMEConvLSTM(nn.Module):
 
             h, c   = self.cell(input_seq[:, t], h, c, v)
             v_last = v
+            
+            if t > 0:
+                estimated_velocities.append(v.detach())
 
         # ---- Decoder ------------------------------------------------
         prev_frame = input_seq[:, -1]
