@@ -147,3 +147,78 @@ def log_sequence_predictions_new(
         # ----------- log to wandb & close -------------------------------------
         wandb.log({f"{split_name}sequence_{idx}": wandb.Image(fig)})
         plt.close(fig)
+
+
+def log_state_evolution(
+    h_states,
+    c_states=None,
+    split_name="train",
+    num_samples=3,
+    subsample_t=1,
+    input_frames=None,
+):
+    """
+    Visualise the per-slot channel-mean h (and optionally c) maps over time,
+    for a handful of random samples — the exact h.mean(dim=2)/c.mean(dim=2)
+    reduction Seq2SeqMEConvLSTM._track_velocities correlates against, so
+    this shows what the velocity tracker actually sees at every step.
+
+    h_states, c_states : (B, T, K, H, W), from model(..., return_states=True)
+        (the dict's "h"/"c" entries). c_states is optional.
+    input_frames : if given, decoder timesteps (t >= input_frames) are
+        labelled in a different colour to mark the encoder/decoder boundary.
+    """
+    B, T, K, H, W = h_states.shape
+    num_samples = min(num_samples, B)
+    indices = np.random.choice(B, num_samples, replace=False)
+
+    T_shown = max(1, T // subsample_t)
+    rows = K * (2 if c_states is not None else 1)
+
+    for idx in indices:
+        h_sample = h_states[idx].detach().cpu()   # (T, K, H, W)
+        c_sample = c_states[idx].detach().cpu() if c_states is not None else None
+
+        fig, axes = plt.subplots(
+            rows, T_shown,
+            figsize=(max(6, T_shown * 1.1), max(2, rows * 1.3)),
+            gridspec_kw={"wspace": 0.05, "hspace": 0.2},
+            squeeze=False,
+        )
+
+        for tt in range(T_shown):
+            t = tt * subsample_t
+            is_decoder = input_frames is not None and t >= input_frames
+            title_color = "crimson" if is_decoder else "black"
+
+            for k in range(K):
+                v = h_sample[t, k]
+                vmax = v.abs().max().clamp(min=1e-8).item()
+                axes[k, tt].imshow(v, cmap="coolwarm", vmin=-vmax, vmax=vmax)
+                axes[k, tt].axis("off")
+
+            if c_sample is not None:
+                for k in range(K):
+                    v = c_sample[t, k]
+                    vmax = v.abs().max().clamp(min=1e-8).item()
+                    axes[K + k, tt].imshow(v, cmap="coolwarm", vmin=-vmax, vmax=vmax)
+                    axes[K + k, tt].axis("off")
+
+            axes[0, tt].set_title(f"t={t}", fontsize=8, color=title_color)
+
+        for k in range(K):
+            axes[k, 0].text(-0.4, 0.5, f"h slot{k}", rotation=90,
+                             va="center", ha="center", fontsize=8,
+                             transform=axes[k, 0].transAxes)
+        if c_sample is not None:
+            for k in range(K):
+                axes[K + k, 0].text(-0.4, 0.5, f"c slot{k}", rotation=90,
+                                     va="center", ha="center", fontsize=8,
+                                     transform=axes[K + k, 0].transAxes)
+
+        fig.suptitle(f"{split_name} h/c evolution — sample {idx}"
+                     + (" (red titles = decoder)" if input_frames is not None else ""),
+                     fontsize=10)
+
+        wandb.log({f"{split_name}_states_sample{idx}": wandb.Image(fig)})
+        plt.close(fig)

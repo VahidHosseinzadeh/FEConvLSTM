@@ -202,12 +202,18 @@ class Seq2SeqMEConvLSTM(nn.Module):
                 pred_len,
                 teacher_forcing_ratio=0.0,
                 target_seq=None,
-                return_velocity=False):
+                return_velocity=False,
+                return_states=False):
         """
         input_seq : (B, T_in, C, H, W),  T_in >= 2
         pred_len  : int
         teacher_forcing_ratio : float in [0, 1]
         target_seq : (B, pred_len, C, H, W) or None
+        return_states : if True, also return the per-timestep channel-mean
+            h/c maps (the exact h.mean(dim=2)/c.mean(dim=2) reduction
+            _track_velocities correlates against), one entry per encoder
+            *and* decoder step, stacked to (B, T_in + pred_len, K, H, W).
+            For inspection/logging only — detached, no effect on training.
         """
         if not self.batch_first:
             input_seq = input_seq.permute(1, 0, 2, 3, 4)
@@ -220,6 +226,7 @@ class Seq2SeqMEConvLSTM(nn.Module):
         # ---- Encoder ------------------------------------------------
         # v_last = torch.zeros(B, K, 2, device=input_seq.device, dtype=input_seq.dtype)
         estimated_velocities = []
+        h_states, c_states = ([], []) if return_states else (None, None)
 
         for t in range(T_in):
 
@@ -238,9 +245,13 @@ class Seq2SeqMEConvLSTM(nn.Module):
 
             h, c   = self.cell(input_seq[:, t], h, c, v)
             v_last = v
-            
+
             if t > 0:
                 estimated_velocities.append(v.detach())
+
+            if return_states:
+                h_states.append(h.mean(dim=2).detach())
+                c_states.append(c.mean(dim=2).detach())
 
         # ---- Decoder ------------------------------------------------
         prev_frame = input_seq[:, -1]
@@ -291,10 +302,23 @@ class Seq2SeqMEConvLSTM(nn.Module):
             outputs.append(pred)
             prev_frame = pred
 
+            if return_states:
+                h_states.append(h.mean(dim=2).detach())
+                c_states.append(c.mean(dim=2).detach())
+
         outputs = torch.stack(outputs, dim=1)
 
-        if return_velocity:
-            estimated_velocities = torch.stack(estimated_velocities, dim=1)
-            return outputs, estimated_velocities
+        result = [outputs]
 
-        return outputs
+        if return_velocity:
+            result.append(torch.stack(estimated_velocities, dim=1))
+
+        if return_states:
+            result.append({
+                "h": torch.stack(h_states, dim=1),   # (B, T_in+pred_len, K, H, W)
+                "c": torch.stack(c_states, dim=1),
+            })
+
+        if len(result) == 1:
+            return result[0]
+        return tuple(result)

@@ -3,7 +3,7 @@ from tqdm import tqdm
 import numpy as np
 from torch.utils.data import DataLoader
 from moving_mnist_dataset import FixedVelocityMovingMNIST
-from visualization import log_sequence_predictions, log_sequence_predictions_new
+from visualization import log_sequence_predictions, log_sequence_predictions_new, log_state_evolution
 from velocity_metrics import VelocityMetrics
 
 
@@ -39,13 +39,23 @@ def train_epoch_velocity_check(
 
         optimizer.zero_grad()
 
-        output_seq, pred_motion = model(
-            input_seq,
-            pred_len=pred_len,
-            teacher_forcing_ratio=teacher_forcing_ratio,
-            target_seq=target_seq,
-            return_velocity=True,
-        )
+        if i == 0:
+            output_seq, pred_motion, states = model(
+                input_seq,
+                pred_len=pred_len,
+                teacher_forcing_ratio=teacher_forcing_ratio,
+                target_seq=target_seq,
+                return_velocity=True,
+                return_states=True,
+            )
+        else:
+            output_seq, pred_motion = model(
+                input_seq,
+                pred_len=pred_len,
+                teacher_forcing_ratio=teacher_forcing_ratio,
+                target_seq=target_seq,
+                return_velocity=True,
+            )
 
         velocity_metrics.update(pred_motion, gt_motion)
 
@@ -68,6 +78,12 @@ def train_epoch_velocity_check(
                 target_seq,
                 output_seq,
                 split_name="train",
+            )
+            log_state_evolution(
+                states["h"],
+                states["c"],
+                split_name="train",
+                input_frames=input_frames,
             )
 
     velocity_metrics.report("Training Velocity")
@@ -105,13 +121,23 @@ def eval_epoch_velocity_check(
             target_seq = seq[:, input_frames:]
             pred_len = target_seq.size(1)
 
-            output_seq, pred_motion = model(
-                input_seq,
-                pred_len=pred_len,
-                teacher_forcing_ratio=0.0,
-                target_seq=target_seq,
-                return_velocity=True,
-            )
+            if i == 0:
+                output_seq, pred_motion, states = model(
+                    input_seq,
+                    pred_len=pred_len,
+                    teacher_forcing_ratio=0.0,
+                    target_seq=target_seq,
+                    return_velocity=True,
+                    return_states=True,
+                )
+            else:
+                output_seq, pred_motion = model(
+                    input_seq,
+                    pred_len=pred_len,
+                    teacher_forcing_ratio=0.0,
+                    target_seq=target_seq,
+                    return_velocity=True,
+                )
 
             velocity_metrics.update(pred_motion, gt_motion)
 
@@ -128,6 +154,12 @@ def eval_epoch_velocity_check(
                     target_seq,
                     output_seq,
                     split_name=split_name,
+                )
+                log_state_evolution(
+                    states["h"],
+                    states["c"],
+                    split_name=split_name,
+                    input_frames=input_frames,
                 )
 
     velocity_metrics.report(f"{split_name} Velocity")
@@ -172,12 +204,21 @@ def eval_len_generalization_velocity_check(
 
             T = tgt.size(1)
 
-            pred, pred_motion = model(
-                inp,
-                pred_len=T,
-                teacher_forcing_ratio=0.0,
-                return_velocity=True,
-            )
+            if first_pass:
+                pred, pred_motion, states = model(
+                    inp,
+                    pred_len=T,
+                    teacher_forcing_ratio=0.0,
+                    return_velocity=True,
+                    return_states=True,
+                )
+            else:
+                pred, pred_motion = model(
+                    inp,
+                    pred_len=T,
+                    teacher_forcing_ratio=0.0,
+                    return_velocity=True,
+                )
 
             velocity_metrics.update(pred_motion, gt_motion)
 
@@ -198,6 +239,13 @@ def eval_len_generalization_velocity_check(
                     num_samples=10,
                     device=device,
                     subsample_t=subsample_t,
+                )
+                log_state_evolution(
+                    states["h"],
+                    states["c"],
+                    split_name="len_gen",
+                    subsample_t=subsample_t,
+                    input_frames=input_frames,
                 )
 
             else:
