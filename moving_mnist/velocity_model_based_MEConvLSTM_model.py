@@ -218,7 +218,7 @@ class Seq2SeqMEConvLSTM(nn.Module):
         h, c = self.cell.init_hidden(B, K, H, W, input_seq.device, input_seq.dtype)
 
         # ---- Encoder ------------------------------------------------
-        v_last = torch.zeros(B, K, 2, device=input_seq.device, dtype=input_seq.dtype)
+        # v_last = torch.zeros(B, K, 2, device=input_seq.device, dtype=input_seq.dtype)
         estimated_velocities = []
 
         for t in range(T_in):
@@ -265,6 +265,9 @@ class Seq2SeqMEConvLSTM(nn.Module):
                 # ---------------------------------------------------------
                 v = self._track_velocities(h, target_seq[:, t])
 
+                # Save decoder velocity estimate
+                estimated_velocities.append(v.clone().detach()) 
+
                 if (self.training and
                         torch.rand(1).item() < teacher_forcing_ratio):
                     current_frame = target_seq[:, t]
@@ -288,4 +291,10 @@ class Seq2SeqMEConvLSTM(nn.Module):
             outputs.append(pred)
             prev_frame = pred
 
-        return torch.stack(outputs, dim=1)
+        outputs = torch.stack(outputs, dim=1)
+
+        if return_velocity:
+            estimated_velocities = torch.stack(estimated_velocities, dim=1)
+            return outputs, estimated_velocities
+
+        return outputs

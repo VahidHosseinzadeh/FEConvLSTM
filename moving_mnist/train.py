@@ -15,6 +15,8 @@ import time
 import os
 from train_eval_utils import train_epoch, eval_epoch, eval_len_generalization, eval_velocity_generalization
 
+from train_eval_utils_velocity_check import train_epoch_velocity_check, eval_epoch_velocity_check, eval_len_generalization_velocity_check
+from velocity_metrics import VelocityMetrics
 
 class MSEPlusL1Loss(nn.Module):
     def __init__(self, mse_weight=1.0, l1_weight=1.0):
@@ -103,7 +105,21 @@ def main():
     parser.add_argument('--wandb_project', type=str, default="FERNN", help='Wandb project')
     parser.add_argument('--wandb_dir', type=str, default='./tmp/', help='Wandb directory')
     parser.add_argument('--wandb_name', type=str, default=None, help='Wandb name')
+    parser.add_argument("--check_velocity_predictor",action="store_true",help="Debug the velocity predictor during training/evaluation.")
     args = parser.parse_args()
+
+    if args.check_velocity_predictor:
+
+        train_fn = train_epoch_velocity_check
+        eval_fn = eval_epoch_velocity_check
+        len_gen_fn = eval_len_generalization_velocity_check
+
+    else:
+
+        train_fn = train_epoch
+        eval_fn = eval_epoch
+        len_gen_fn = eval_len_generalization
+
 
     # Set seeds for reproducibility
     # Data seed for consistent dataset splits
@@ -184,7 +200,7 @@ def main():
         reject_overlap=True,
         require_distinct_velocities=True,
 
-        return_motion=False,
+        return_motion=args.check_velocity_predictor,
         return_positions=False,
 
         transform=None,
@@ -219,7 +235,7 @@ def main():
         reject_overlap=True,
         require_distinct_velocities=True,
 
-        return_motion=False,
+        return_motion=args.check_velocity_predictor,
         return_positions=False,
 
         transform=None,
@@ -256,7 +272,7 @@ def main():
         reject_overlap=True,
         require_distinct_velocities=True,
 
-        return_motion=False,
+        return_motion=args.check_velocity_predictor,
         return_positions=False,
 
         transform=None,
@@ -359,7 +375,7 @@ def main():
     if args.evaluate_only:
         print("Running evaluation only...")
         criterion = MSEPlusL1Loss()
-        test_loss = eval_epoch(model, test_loader, criterion, device, args.input_frames, 0, split_name="test")
+        test_loss = eval_fn(model, test_loader, criterion, device, args.input_frames, 0, split_name="test")
         print(f"Test Loss: {test_loss:.4f}")
 
         wandb.log({
@@ -368,7 +384,7 @@ def main():
         })
 
         print("Running length generalization test...")
-        gen_mean, gen_std = eval_len_generalization(model, gen_test_loader, device, args.input_frames, subsample_t=2)
+        gen_mean, gen_std = len_gen_fn(model, gen_test_loader, device, args.input_frames, subsample_t=2)
         print(f"Length generalization mean MSE: {gen_mean.mean():.4f}")
 
         wandb.log({f"len_gen_mean_t{t+1}": gen_mean[t] for t in range(len(gen_mean))})
@@ -414,8 +430,8 @@ def main():
     best_val_losses = float('inf')
     
     for epoch in range(1, args.epochs + 1):
-        train_loss = train_epoch(model, train_loader, optimizer, criterion, device, args.input_frames, args.teacher_forcing_ratio, args.grad_clip)
-        val_loss = eval_epoch(model, val_loader, criterion, device, args.input_frames, epoch, split_name="val")
+        train_loss = train_fn(model, train_loader, optimizer, criterion, device, args.input_frames, args.teacher_forcing_ratio, args.grad_clip)
+        val_loss = eval_fn(model, val_loader, criterion, device, args.input_frames, epoch, split_name="val")
         history['train_loss'].append(train_loss)
         history['val_loss'].append(val_loss)
         print(f"Epoch {epoch}/{args.epochs} | {args.model:^8} | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f}")
@@ -436,12 +452,12 @@ def main():
             print(f"Saved new best model for {args.model} at {model_path}")
             
             # Evaluate on test set with best model
-            test_loss = eval_epoch(model, test_loader, criterion, device, args.input_frames, epoch, split_name="test")
+            test_loss = eval_fn(model, test_loader, criterion, device, args.input_frames, epoch, split_name="test")
 
             history['test_loss'].append(test_loss)
             print(f"Test Loss: {test_loss:.4f}")
 
-            gen_mean, gen_std = eval_len_generalization(model, gen_test_loader, device, args.input_frames)
+            gen_mean, gen_std = len_gen_fn(model, gen_test_loader, device, args.input_frames)
 
             wandb.log({f"len_gen_mean_t{t+1}": gen_mean[t] for t in range(len(gen_mean))})
             wandb.log({f"len_gen_std_t{t+1}":  gen_std[t]  for t in range(len(gen_std))})
