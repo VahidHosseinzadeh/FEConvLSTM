@@ -87,6 +87,7 @@ def main():
     parser.add_argument('--image_size', type=int, default=28)
     parser.add_argument('--v_range', type=int, default=2)
     parser.add_argument('--num_vel_modes', type=int, default=2, help='Number of velocity modes for MEConvLSTM')
+    parser.add_argument('--subpixel_velocity', action='store_true', help='Enable parabolic subpixel refinement in PhaseCorrelation (MEConvLSTM only, default: off, integer-pixel velocities)')
     parser.add_argument('--data_v_range', type=int, default=2)
     parser.add_argument('--gen_seq_len', type=int, default=40, help='Sequence length used **only** for length‑generalization evaluation (must be > seq_len)')
     parser.add_argument('--data_seed', type=int, default=42, help='Random seed for dataset splitting')
@@ -312,6 +313,9 @@ def main():
     print(f"Min epochs: {args.min_epochs}")
     print(f"Learning rate: {args.lr}")
     print(f"Model: {args.model}")
+    if args.model == "melstm":
+        print(f"Num velocity modes: {args.num_vel_modes}")
+        print(f"Subpixel velocity: {args.subpixel_velocity}")
     print(f"Hidden size: {args.hidden_size}")
     print(f"Num layers: {args.num_layers}")
     print(f"Decoder conv layers: {args.decoder_conv_layers}")
@@ -359,7 +363,8 @@ def main():
                 kernel_size=args.kernel_size,
                 n_slots= args.num_vel_modes,
                 slot_reduce = 'max',
-                decoder_layers = args.decoder_conv_layers
+                decoder_layers = args.decoder_conv_layers,
+                phase_corr_kwargs={'subpixel': args.subpixel_velocity},
             ).to(device)
 
     # Load model if specified
