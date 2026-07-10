@@ -6,7 +6,10 @@ from moving_mnist_dataset import FixedVelocityMovingMNIST
 from visualization import log_sequence_predictions, log_sequence_predictions_new
 
 
-def train_epoch(model, dataloader, optimizer, criterion, device, input_frames, teacher_forcing_ratio, grad_clip=None):
+def train_epoch(model, dataloader, optimizer, criterion, device, input_frames, teacher_forcing_ratio, grad_clip=None, x_track_until_step=0):
+    # x_track_until_step is accepted (unused) so main() can call train_fn/eval_fn/len_gen_fn
+    # uniformly regardless of which of these gets dispatched -- only Seq2SeqMEConvLSTM's
+    # forward() understands this kwarg; felstm/lstm don't and shouldn't receive it.
     model.train()
     running_loss = 0.0
     pbar = tqdm(dataloader, desc="Training", leave=False)
@@ -43,7 +46,7 @@ def train_epoch(model, dataloader, optimizer, criterion, device, input_frames, t
     return running_loss / len(dataloader.dataset)
 
 
-def eval_epoch(model, dataloader, criterion, device, input_frames, epoch, split_name):
+def eval_epoch(model, dataloader, criterion, device, input_frames, epoch, split_name, x_track_until_step=0):
     model.eval()
     running_loss = 0.0
     with torch.no_grad():
@@ -72,7 +75,7 @@ def eval_epoch(model, dataloader, criterion, device, input_frames, epoch, split_
     return running_loss / len(dataloader.dataset)
 
 
-def eval_len_generalization(model, dataloader, device, input_frames, subsample_t=1):
+def eval_len_generalization(model, dataloader, device, input_frames, subsample_t=1, x_track_until_step=0):
     """
     Returns:
         mean_err  – numpy array [T]  (MSE at each future step, averaged over test set)

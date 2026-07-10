@@ -18,6 +18,7 @@ def train_epoch_velocity_check(
     input_frames,
     teacher_forcing_ratio,
     grad_clip=None,
+    x_track_until_step=0,
 ):
 
     model.train()
@@ -47,6 +48,7 @@ def train_epoch_velocity_check(
                 target_seq=target_seq,
                 return_velocity=True,
                 return_states=True,
+                x_track_until_step=x_track_until_step,
             )
         else:
             output_seq, pred_motion = model(
@@ -55,6 +57,7 @@ def train_epoch_velocity_check(
                 teacher_forcing_ratio=teacher_forcing_ratio,
                 target_seq=target_seq,
                 return_velocity=True,
+                x_track_until_step=x_track_until_step,
             )
 
         velocity_metrics.update(pred_motion, gt_motion)
@@ -102,7 +105,8 @@ def eval_epoch_velocity_check(
     device,
     input_frames,
     epoch,
-    split_name
+    split_name,
+    x_track_until_step=0,
 ):
 
     model.eval()
@@ -132,6 +136,7 @@ def eval_epoch_velocity_check(
                     target_seq=target_seq,
                     return_velocity=True,
                     return_states=True,
+                    x_track_until_step=x_track_until_step,
                 )
             else:
                 output_seq, pred_motion = model(
@@ -140,6 +145,7 @@ def eval_epoch_velocity_check(
                     teacher_forcing_ratio=0.0,
                     target_seq=target_seq,
                     return_velocity=True,
+                    x_track_until_step=x_track_until_step,
                 )
 
             velocity_metrics.update(pred_motion, gt_motion)
@@ -182,6 +188,7 @@ def eval_len_generalization_velocity_check(
     device,
     input_frames,
     subsample_t=1,
+    x_track_until_step=0,
 ):
 
     model.eval()
@@ -217,6 +224,7 @@ def eval_len_generalization_velocity_check(
                     teacher_forcing_ratio=0.0,
                     return_velocity=True,
                     return_states=True,
+                    x_track_until_step=x_track_until_step,
                 )
             else:
                 pred, pred_motion = model(
@@ -224,6 +232,7 @@ def eval_len_generalization_velocity_check(
                     pred_len=T,
                     teacher_forcing_ratio=0.0,
                     return_velocity=True,
+                    x_track_until_step=x_track_until_step,
                 )
 
             velocity_metrics.update(pred_motion, gt_motion)

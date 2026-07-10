@@ -106,6 +106,7 @@ def main():
     parser.add_argument('--wandb_dir', type=str, default='./tmp/', help='Wandb directory')
     parser.add_argument('--wandb_name', type=str, default=None, help='Wandb name')
     parser.add_argument("--check_velocity_predictor",action="store_true",help="Debug the velocity predictor during training/evaluation.")
+    parser.add_argument('--x_track_until_step', type=int, default=0, help='MEConvLSTM only, requires --check_velocity_predictor: for global step t < this value, track velocity from raw x_(t-1)/x_t correlation + continuity matching instead of h-based tracking. 0 (default) = always h-based (today\'s original behavior). Set >= your seq_len/gen_seq_len for pure x-based tracking throughout.')
     args = parser.parse_args()
 
     if args.check_velocity_predictor:
@@ -312,6 +313,8 @@ def main():
     print(f"Min epochs: {args.min_epochs}")
     print(f"Learning rate: {args.lr}")
     print(f"Model: {args.model}")
+    if args.model == "melstm":
+        print(f"x_track_until_step: {args.x_track_until_step}")
     print(f"Hidden size: {args.hidden_size}")
     print(f"Num layers: {args.num_layers}")
     print(f"Decoder conv layers: {args.decoder_conv_layers}")
@@ -375,7 +378,7 @@ def main():
     if args.evaluate_only:
         print("Running evaluation only...")
         criterion = MSEPlusL1Loss()
-        test_loss = eval_fn(model, test_loader, criterion, device, args.input_frames, 0, split_name="test")
+        test_loss = eval_fn(model, test_loader, criterion, device, args.input_frames, 0, split_name="test", x_track_until_step=args.x_track_until_step)
         print(f"Test Loss: {test_loss:.4f}")
 
         wandb.log({
@@ -384,7 +387,7 @@ def main():
         })
 
         print("Running length generalization test...")
-        gen_mean, gen_std = len_gen_fn(model, gen_test_loader, device, args.input_frames, subsample_t=2)
+        gen_mean, gen_std = len_gen_fn(model, gen_test_loader, device, args.input_frames, subsample_t=2, x_track_until_step=args.x_track_until_step)
         print(f"Length generalization mean MSE: {gen_mean.mean():.4f}")
 
         wandb.log({f"len_gen_mean_t{t+1}": gen_mean[t] for t in range(len(gen_mean))})
@@ -430,8 +433,8 @@ def main():
     best_val_losses = float('inf')
     
     for epoch in range(1, args.epochs + 1):
-        train_loss = train_fn(model, train_loader, optimizer, criterion, device, args.input_frames, args.teacher_forcing_ratio, args.grad_clip)
-        val_loss = eval_fn(model, val_loader, criterion, device, args.input_frames, epoch, split_name="val")
+        train_loss = train_fn(model, train_loader, optimizer, criterion, device, args.input_frames, args.teacher_forcing_ratio, args.grad_clip, x_track_until_step=args.x_track_until_step)
+        val_loss = eval_fn(model, val_loader, criterion, device, args.input_frames, epoch, split_name="val", x_track_until_step=args.x_track_until_step)
         history['train_loss'].append(train_loss)
         history['val_loss'].append(val_loss)
         print(f"Epoch {epoch}/{args.epochs} | {args.model:^8} | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f}")
@@ -452,12 +455,12 @@ def main():
             print(f"Saved new best model for {args.model} at {model_path}")
             
             # Evaluate on test set with best model
-            test_loss = eval_fn(model, test_loader, criterion, device, args.input_frames, epoch, split_name="test")
+            test_loss = eval_fn(model, test_loader, criterion, device, args.input_frames, epoch, split_name="test", x_track_until_step=args.x_track_until_step)
 
             history['test_loss'].append(test_loss)
             print(f"Test Loss: {test_loss:.4f}")
 
-            gen_mean, gen_std = len_gen_fn(model, gen_test_loader, device, args.input_frames)
+            gen_mean, gen_std = len_gen_fn(model, gen_test_loader, device, args.input_frames, x_track_until_step=args.x_track_until_step)
 
             wandb.log({f"len_gen_mean_t{t+1}": gen_mean[t] for t in range(len(gen_mean))})
             wandb.log({f"len_gen_std_t{t+1}":  gen_std[t]  for t in range(len(gen_std))})

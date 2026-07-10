@@ -49,6 +49,9 @@ ENV/
 *.swp
 *.swo
 
+# Claude Code personal settings
+.claude/settings.local.json
+
 # Data and models
 data/
 fernn/

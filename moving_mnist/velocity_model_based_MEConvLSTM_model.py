@@ -1,4 +1,6 @@
 import random
+from itertools import permutations as _permutations
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -184,6 +186,52 @@ class Seq2SeqMEConvLSTM(nn.Module):
             v_flat, _ = self.phase_corr_track(h_tmpl, f_rep)
         return v_flat.squeeze(1).reshape(B, K, 2)
 
+    def _match_by_continuity(self, candidates, v_prev):
+        """
+        Regularity condition: velocity shouldn't jump discontinuously
+        frame-to-frame, so assign each of the K raw candidate peaks to
+        whichever slot's *previous* velocity it's closest to. Brute-force
+        over all K! permutations (K is small -- n_slots is typically 2-3),
+        vectorised over the batch per permutation rather than a nested
+        per-item loop.
+
+        candidates : (B, K, 2)  raw peaks, arbitrary order (e.g. from topk)
+        v_prev     : (B, K, 2)  each slot's velocity from the previous step
+        -> matched : (B, K, 2), permuted so matched[:, k] continues slot k
+        """
+        B, K, _ = candidates.shape
+        perms = list(_permutations(range(K)))
+
+        # (n_perms, B) sum-squared-distance cost of each permutation
+        costs = torch.stack([
+            (candidates[:, list(p), :] - v_prev).pow(2).sum(dim=(1, 2))
+            for p in perms
+        ], dim=0)
+
+        best_perm_idx = costs.argmin(dim=0)  # (B,)
+        perm_tensor = torch.tensor(perms, device=candidates.device)  # (n_perms, K)
+        chosen_perms = perm_tensor[best_perm_idx]  # (B, K)
+
+        return torch.gather(candidates, 1, chosen_perms.unsqueeze(-1).expand(-1, -1, 2))
+
+    def _track_velocities_from_frames(self, prev_frame, frame, v_prev):
+        """
+        Raw frame-pair correlation, redone every step (the same mechanism
+        _bootstrap_velocities uses once at encoder t=1), matched to slots by
+        continuity with the previous step's per-slot velocity. Unlike
+        _track_velocities, this never looks at h -- it only ever sees crisp
+        raw pixels, at the cost of having no notion of "my" content beyond
+        motion continuity (two slots crossing paths / swapping velocities
+        between steps could get mismatched).
+
+        prev_frame, frame : (B, C, H, W)
+        v_prev             : (B, K, 2)  each slot's velocity from the previous step
+        -> v : (B, K, 2)
+        """
+        with torch.no_grad():
+            candidates, _ = self.phase_corr_bootstrap(prev_frame, frame)  # (B, K, 2)
+            return self._match_by_continuity(candidates, v_prev)
+
     def _pool_slots(self, h):
         """h : (B, K, Ch, H, W) -> (B, Ch, H, W)"""
         if self.slot_reduce == 'mean':
@@ -203,12 +251,24 @@ class Seq2SeqMEConvLSTM(nn.Module):
                 teacher_forcing_ratio=0.0,
                 target_seq=None,
                 return_velocity=False,
-                return_states=False):
+                return_states=False,
+                x_track_until_step=0):
         """
         input_seq : (B, T_in, C, H, W),  T_in >= 2
         pred_len  : int
         teacher_forcing_ratio : float in [0, 1]
         target_seq : (B, pred_len, C, H, W) or None
+        x_track_until_step : for global step t (0-indexed over the whole
+            T_in+pred_len sequence, encoder followed by decoder) below this
+            threshold, track with _track_velocities_from_frames (raw
+            x_{t-1}/x_t correlation + continuity matching) instead of the
+            usual h-based _track_velocities. Motivation: h is diffuse/
+            still-forming early in the sequence (see some_debugging.ipynb),
+            so raw pixels may track better there; h becomes sharper by
+            several steps in, where h-based tracking takes back over.
+            0 (default) = always h-based, i.e. today's exact behaviour.
+            Has no effect on t=0 (always v=0) or encoder t=1 (always
+            bootstrap) -- both already special-cased regardless.
         return_states : if True, also return the per-timestep channel-mean
             h/c maps (the exact h.mean(dim=2)/c.mean(dim=2) reduction
             _track_velocities correlates against), one entry per encoder
@@ -243,6 +303,10 @@ class Seq2SeqMEConvLSTM(nn.Module):
             elif t == 1:
                 # First non-zero h. Bootstrap from (X_0, X_1).
                 v = self._bootstrap_velocities(input_seq[:, 0], input_seq[:, 1])
+
+            elif t < x_track_until_step:
+                # Raw x-based tracking, matched to slots by continuity.
+                v = self._track_velocities_from_frames(input_seq[:, t - 1], input_seq[:, t], v_last)
 
             else:
                 # Slot self-tracking. X_t consumed exactly once.
@@ -280,10 +344,16 @@ class Seq2SeqMEConvLSTM(nn.Module):
                 #   ratio=1 → cell sees GT (stable training signal)
                 #   ratio=0 → cell sees own prediction (closer to inference)
                 # ---------------------------------------------------------
-                v = self._track_velocities(h, target_seq[:, t])
+                if T_in + t < x_track_until_step:
+                    true_prev_frame = input_seq[:, -1] if t == 0 else target_seq[:, t - 1]
+                    v = self._track_velocities_from_frames(true_prev_frame, target_seq[:, t], v_last)
+                else:
+                    v = self._track_velocities(h, target_seq[:, t])
+
+                v_last = v
 
                 # Save decoder velocity estimate
-                estimated_velocities.append(v.clone().detach()) 
+                estimated_velocities.append(v.clone().detach())
 
                 if (self.training and
                         torch.rand(1).item() < teacher_forcing_ratio):
