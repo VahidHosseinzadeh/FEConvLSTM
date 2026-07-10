@@ -89,7 +89,7 @@ def main():
     parser.add_argument('--num_vel_modes', type=int, default=2, help='Number of velocity modes for MEConvLSTM')
     parser.add_argument('--subpixel_velocity', action='store_true', help='Enable parabolic subpixel refinement in PhaseCorrelation (MEConvLSTM only, default: off, integer-pixel velocities)')
     parser.add_argument('--learnable_track_reduction', action='store_true', help='MEConvLSTM only: replace the fixed h.mean(dim=2) reduction in _track_velocities with a learnable 1x1 conv, trained via a straight-through estimator through PhaseCorrelation (default: off, fixed mean, no gradient into tracking)')
-    parser.add_argument('--track_grad_scale', type=float, default=0.1, help='Scales the straight-through gradient into the learnable track reduction (only used if --learnable_track_reduction). Empirically-checked starting point, not a tuned optimum -- worth sweeping e.g. 0.03-0.3')
+    parser.add_argument('--track_grad_scale', type=float, default=0.01, help='Scales the straight-through gradient into the learnable track reduction (only used if --learnable_track_reduction). Extremely scale-sensitive -- 0.1 caused pre-clip grad norms 20-150x baseline at hidden_size=32/seq_len=20; watch pre-clip grad norm against a non-learnable run on your exact config before trusting this default')
     parser.add_argument('--track_temperature', type=float, default=0.1, help='Softmax temperature (relative to the correlation surface\'s own std) for the differentiable soft-argmax used by --learnable_track_reduction')
     parser.add_argument('--data_v_range', type=int, default=2)
     parser.add_argument('--gen_seq_len', type=int, default=40, help='Sequence length used **only** for length‑generalization evaluation (must be > seq_len)')

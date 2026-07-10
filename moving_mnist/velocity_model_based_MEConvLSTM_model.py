@@ -130,7 +130,7 @@ class Seq2SeqMEConvLSTM(nn.Module):
                  batch_first=True,
                  phase_corr_kwargs=None,
                  learnable_track_reduction=False,
-                 track_grad_scale=0.1):
+                 track_grad_scale=0.01):
         super().__init__()
 
         self.batch_first     = batch_first
@@ -146,14 +146,20 @@ class Seq2SeqMEConvLSTM(nn.Module):
             n_modes=1, differentiable=learnable_track_reduction,
             grad_scale=track_grad_scale, **pc_kw
         )
-        # track_grad_scale=0.1 is an empirically-checked starting point, not
-        # a tuned optimum: it keeps this path's contribution to cell.conv's
-        # total gradient to roughly a +3% nudge over the no-learnable-
-        # reduction baseline on a small sanity model, rather than dominating
-        # it (grad_scale=1.0 measured ~100x cell.conv's own baseline
-        # gradient in the same test — enough to hijack clip_grad_norm_'s
-        # single global rescaling for every other parameter, not just this
-        # one). Worth sweeping (e.g. 0.03-0.3) once training on real runs.
+        # track_grad_scale is extremely scale-sensitive -- it was first
+        # calibrated at hidden_channels=8/seq_len=10/teacher_forcing=1.0
+        # (0.1 looked gentle there: ~+3% on cell.conv's baseline gradient),
+        # but at hidden_channels=32/seq_len=20/piecewise motion/
+        # teacher_forcing=0.0, that same 0.1 produced pre-clip grad norms
+        # of 17-56 (vs baseline's ~0.1-0.4) -- 20-150x over the usual
+        # clip_grad_norm_ threshold, meaning nearly every update was
+        # dictated by this one path instead of the reconstruction loss,
+        # not just "a bit more aggressive." 0.01 brought it back in line
+        # with baseline at that scale. Treat this as a per-run
+        # hyperparameter to sanity-check (watch pre-clip grad norm vs. a
+        # learnable_track_reduction=False run on the same config), not a
+        # fixed constant -- it does not obviously transfer across
+        # hidden_channels / sequence length / motion difficulty.
 
         # If enabled, _track_velocities correlates against a *learned*
         # per-slot reduction of h instead of a fixed h.mean(dim=2), trained
