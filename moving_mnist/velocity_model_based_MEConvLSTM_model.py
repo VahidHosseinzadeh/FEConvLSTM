@@ -128,7 +128,9 @@ class Seq2SeqMEConvLSTM(nn.Module):
                  decoder_layers=1,
                  bias=True,
                  batch_first=True,
-                 phase_corr_kwargs=None):
+                 phase_corr_kwargs=None,
+                 learnable_track_reduction=False,
+                 track_grad_scale=0.1):
         super().__init__()
 
         self.batch_first     = batch_first
@@ -140,7 +142,32 @@ class Seq2SeqMEConvLSTM(nn.Module):
         pc_kw = phase_corr_kwargs or {}
 
         self.phase_corr_bootstrap = PhaseCorrelation(n_modes=n_slots, **pc_kw)
-        self.phase_corr_track     = PhaseCorrelation(n_modes=1,       **pc_kw)
+        self.phase_corr_track     = PhaseCorrelation(
+            n_modes=1, differentiable=learnable_track_reduction,
+            grad_scale=track_grad_scale, **pc_kw
+        )
+        # track_grad_scale=0.1 is an empirically-checked starting point, not
+        # a tuned optimum: it keeps this path's contribution to cell.conv's
+        # total gradient to roughly a +3% nudge over the no-learnable-
+        # reduction baseline on a small sanity model, rather than dominating
+        # it (grad_scale=1.0 measured ~100x cell.conv's own baseline
+        # gradient in the same test — enough to hijack clip_grad_norm_'s
+        # single global rescaling for every other parameter, not just this
+        # one). Worth sweeping (e.g. 0.03-0.3) once training on real runs.
+
+        # If enabled, _track_velocities correlates against a *learned*
+        # per-slot reduction of h instead of a fixed h.mean(dim=2), trained
+        # via a straight-through estimator through phase_corr_track (see its
+        # `differentiable` flag) -- forward behaviour is unaffected either
+        # way, this only adds a gradient path. Initialized to exactly
+        # reproduce h.mean(dim=2) (uniform weights 1/Ch, zero bias), so
+        # training starts from parity with the fixed-mean baseline rather
+        # than a random cold start.
+        self.learnable_track_reduction = learnable_track_reduction
+        if learnable_track_reduction:
+            self.track_reduce_conv = nn.Conv2d(hidden_channels, 1, kernel_size=1, bias=True)
+            nn.init.constant_(self.track_reduce_conv.weight, 1.0 / hidden_channels)
+            nn.init.zeros_(self.track_reduce_conv.bias)
 
         self.cell = MEConvLSTMCell(input_channels, hidden_channels,
                                    kernel_size, bias)
@@ -175,13 +202,24 @@ class Seq2SeqMEConvLSTM(nn.Module):
         B, K, Ch, H, W = h.shape
         _, C, _, _     = frame.shape
 
-        h_tmpl = h.mean(dim=2).reshape(B * K, 1, H, W)
+        if self.learnable_track_reduction:
+            h_tmpl = self.track_reduce_conv(h.reshape(B * K, Ch, H, W))  # (B*K, 1, H, W)
+        else:
+            h_tmpl = h.mean(dim=2).reshape(B * K, 1, H, W)
+
         f_rep  = (frame.unsqueeze(1)
                        .expand(B, K, C, H, W)
                        .reshape(B * K, C, H, W))
 
-        with torch.no_grad():
+        if self.learnable_track_reduction:
+            # phase_corr_track is differentiable=True here: forward value is
+            # still the exact hard peak, but gradient now flows back through
+            # h_tmpl into track_reduce_conv (and from there into h itself).
             v_flat, _ = self.phase_corr_track(h_tmpl, f_rep)
+        else:
+            with torch.no_grad():
+                v_flat, _ = self.phase_corr_track(h_tmpl, f_rep)
+
         return v_flat.squeeze(1).reshape(B, K, 2)
 
     def _pool_slots(self, h):

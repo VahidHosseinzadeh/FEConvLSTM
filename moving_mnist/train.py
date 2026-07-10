@@ -88,6 +88,9 @@ def main():
     parser.add_argument('--v_range', type=int, default=2)
     parser.add_argument('--num_vel_modes', type=int, default=2, help='Number of velocity modes for MEConvLSTM')
     parser.add_argument('--subpixel_velocity', action='store_true', help='Enable parabolic subpixel refinement in PhaseCorrelation (MEConvLSTM only, default: off, integer-pixel velocities)')
+    parser.add_argument('--learnable_track_reduction', action='store_true', help='MEConvLSTM only: replace the fixed h.mean(dim=2) reduction in _track_velocities with a learnable 1x1 conv, trained via a straight-through estimator through PhaseCorrelation (default: off, fixed mean, no gradient into tracking)')
+    parser.add_argument('--track_grad_scale', type=float, default=0.1, help='Scales the straight-through gradient into the learnable track reduction (only used if --learnable_track_reduction). Empirically-checked starting point, not a tuned optimum -- worth sweeping e.g. 0.03-0.3')
+    parser.add_argument('--track_temperature', type=float, default=0.1, help='Softmax temperature (relative to the correlation surface\'s own std) for the differentiable soft-argmax used by --learnable_track_reduction')
     parser.add_argument('--data_v_range', type=int, default=2)
     parser.add_argument('--gen_seq_len', type=int, default=40, help='Sequence length used **only** for length‑generalization evaluation (must be > seq_len)')
     parser.add_argument('--data_seed', type=int, default=42, help='Random seed for dataset splitting')
@@ -316,6 +319,10 @@ def main():
     if args.model == "melstm":
         print(f"Num velocity modes: {args.num_vel_modes}")
         print(f"Subpixel velocity: {args.subpixel_velocity}")
+        print(f"Learnable track reduction: {args.learnable_track_reduction}")
+        if args.learnable_track_reduction:
+            print(f"  track_grad_scale: {args.track_grad_scale}")
+            print(f"  track_temperature: {args.track_temperature}")
     print(f"Hidden size: {args.hidden_size}")
     print(f"Num layers: {args.num_layers}")
     print(f"Decoder conv layers: {args.decoder_conv_layers}")
@@ -364,7 +371,9 @@ def main():
                 n_slots= args.num_vel_modes,
                 slot_reduce = 'max',
                 decoder_layers = args.decoder_conv_layers,
-                phase_corr_kwargs={'subpixel': args.subpixel_velocity},
+                phase_corr_kwargs={'subpixel': args.subpixel_velocity, 'temperature': args.track_temperature},
+                learnable_track_reduction=args.learnable_track_reduction,
+                track_grad_scale=args.track_grad_scale,
             ).to(device)
 
     # Load model if specified

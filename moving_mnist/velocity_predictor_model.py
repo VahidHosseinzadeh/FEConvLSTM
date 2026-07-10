@@ -10,6 +10,9 @@ class PhaseCorrelation(nn.Module):
         pad_factor=1,
         eps=1e-8,
         subpixel=False,
+        differentiable=False,
+        temperature=0.1,
+        grad_scale=1.0,
     ):
         super().__init__()
 
@@ -18,6 +21,37 @@ class PhaseCorrelation(nn.Module):
         self.pad_factor = pad_factor
         self.eps = eps
         self.subpixel = subpixel
+
+        # Straight-through estimator: forward pass is unchanged (still the
+        # exact hard topk peak, +subpixel if enabled); backward pass uses
+        # the gradient of a soft-argmax (softmax-weighted expected position)
+        # over the same correlation surface. Lets gradient reach whatever
+        # produced frame1 (e.g. a learnable reduction of h) without changing
+        # runtime behaviour at all. Only meaningful for a single peak per
+        # correlation surface — n_modes=1 — since softmax-weighted expectation
+        # collapses multiple peaks to one centroid, which isn't a sensible
+        # target when n_modes>1 (e.g. bootstrap's K-peak case).
+        #
+        # temperature controls how sharply the soft-argmax concentrates
+        # around the true peak (semantic accuracy of v_soft as an estimate).
+        # grad_scale is a separate, independent multiplier on the resulting
+        # gradient's magnitude. These two need to be decoupled: empirically,
+        # a temperature that makes v_soft land close to the hard peak also
+        # produces a gradient that can be comparable in magnitude to (or
+        # larger than) the model's other gradients — dangerous, since
+        # clip_grad_norm_ rescales the *whole* parameter vector by one
+        # global norm, so a dominant/noisy path can drown out the legitimate
+        # reconstruction-loss gradient for every other parameter too.
+        # grad_scale lets this path be a gentle nudge instead.
+        self.differentiable = differentiable
+        self.temperature = temperature
+        self.grad_scale = grad_scale
+        if differentiable:
+            assert n_modes == 1, (
+                "PhaseCorrelation(differentiable=True) only supports n_modes=1: "
+                "soft-argmax gives one centroid per correlation surface, which "
+                "isn't a meaningful target when extracting >1 peak."
+            )
 
     def _parabolic_subpixel(self, corr, y, x, H, W):
         """
@@ -70,6 +104,42 @@ class PhaseCorrelation(nn.Module):
 
         return dy, dx
 
+    def _soft_argmax(self, corr, H, W):
+        """
+        Differentiable expected peak location: normalize the whole
+        correlation surface into a distribution over grid positions via
+        softmax, then take its mean. Unlike torch.topk, every step here has
+        a well-defined gradient with respect to corr.
+
+        corr : (B, H, W) unflattened correlation surface
+
+        Returns
+        -------
+        y_soft, x_soft : (B,) float
+        """
+        B = corr.shape[0]
+        corr_flat = corr.reshape(B, -1)
+        # Scale by corr's own per-sample std, not an absolute value: corr's
+        # numeric range depends on input statistics (and can drift over
+        # training), so an absolute temperature would need re-tuning
+        # whenever that scale changes. self.temperature is then a unitless
+        # "sharpness in std units" knob instead of tied to a specific scale.
+        corr_std = corr_flat.std(dim=1, keepdim=True).clamp(min=1e-8)
+        weights = torch.softmax(corr_flat / (self.temperature * corr_std), dim=1)  # (B, H*W)
+
+        yy, xx = torch.meshgrid(
+            torch.arange(H, device=corr.device, dtype=corr.dtype),
+            torch.arange(W, device=corr.device, dtype=corr.dtype),
+            indexing="ij",
+        )
+        yy = yy.reshape(-1)  # (H*W,)
+        xx = xx.reshape(-1)
+
+        y_soft = (weights * yy[None, :]).sum(dim=1)  # (B,)
+        x_soft = (weights * xx[None, :]).sum(dim=1)
+
+        return y_soft, x_soft
+
     def forward(self, frame1, frame2):
         """
         Parameters
@@ -120,6 +190,16 @@ class PhaseCorrelation(nn.Module):
             dy, dx = self._parabolic_subpixel(corr, y0, x0, H_pad, W_pad)
             y = y + dy
             x = x + dx
+
+        if self.differentiable:
+            # Straight-through: value stays exactly the hard (+subpixel) peak
+            # computed above; gradient becomes grad_scale times the gradient
+            # of the soft-argmax below (see grad_scale note in __init__).
+            y_soft, x_soft = self._soft_argmax(corr, H_pad, W_pad)
+            y_soft = (self.grad_scale * y_soft).unsqueeze(1)  # (B, 1), n_modes == 1 (asserted in __init__)
+            x_soft = (self.grad_scale * x_soft).unsqueeze(1)
+            y = y_soft + (y - y_soft).detach()
+            x = x_soft + (x - x_soft).detach()
 
         if self.periodic_bc:
             x = torch.where(x > W_pad / 2, x - W_pad, x)
