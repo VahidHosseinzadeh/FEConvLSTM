@@ -212,7 +212,12 @@ class Seq2SeqMEConvLSTM(nn.Module):
         return_states : if True, also return the per-timestep channel-mean
             h/c maps (the exact h.mean(dim=2)/c.mean(dim=2) reduction
             _track_velocities correlates against), one entry per encoder
-            *and* decoder step, stacked to (B, T_in + pred_len, K, H, W).
+            *and* decoder step, stacked to (B, T_in + pred_len, K, H, W),
+            plus "frames": the actual frame consumed by the cell at each of
+            those steps (input_seq[:, t] for encoder steps; whichever frame
+            teacher forcing selected for decoder steps), stacked to
+            (B, T_in + pred_len, C, H, W) — so states["frames"][:, t] is
+            exactly what produced states["h"][:, t] / states["c"][:, t].
             For inspection/logging only — detached, no effect on training.
         """
         if not self.batch_first:
@@ -226,7 +231,7 @@ class Seq2SeqMEConvLSTM(nn.Module):
         # ---- Encoder ------------------------------------------------
         # v_last = torch.zeros(B, K, 2, device=input_seq.device, dtype=input_seq.dtype)
         estimated_velocities = []
-        h_states, c_states = ([], []) if return_states else (None, None)
+        h_states, c_states, frame_states = ([], [], []) if return_states else (None, None, None)
 
         for t in range(T_in):
 
@@ -252,6 +257,7 @@ class Seq2SeqMEConvLSTM(nn.Module):
             if return_states:
                 h_states.append(h.mean(dim=2).detach())
                 c_states.append(c.mean(dim=2).detach())
+                frame_states.append(input_seq[:, t].detach())
 
         # ---- Decoder ------------------------------------------------
         prev_frame = input_seq[:, -1]
@@ -297,6 +303,9 @@ class Seq2SeqMEConvLSTM(nn.Module):
                 v             = v_last
                 current_frame = prev_frame.detach()
 
+            if return_states:
+                frame_states.append(current_frame.detach())
+
             h, c  = self.cell(current_frame, h, c, v)
             pred  = self.decoder(self._pool_slots(h))
             outputs.append(pred)
@@ -315,8 +324,9 @@ class Seq2SeqMEConvLSTM(nn.Module):
 
         if return_states:
             result.append({
-                "h": torch.stack(h_states, dim=1),   # (B, T_in+pred_len, K, H, W)
+                "h": torch.stack(h_states, dim=1),        # (B, T_in+pred_len, K, H, W)
                 "c": torch.stack(c_states, dim=1),
+                "frames": torch.stack(frame_states, dim=1),  # (B, T_in+pred_len, C, H, W)
             })
 
         if len(result) == 1:

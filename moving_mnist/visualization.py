@@ -152,6 +152,7 @@ def log_sequence_predictions_new(
 def log_state_evolution(
     h_states,
     c_states=None,
+    frames=None,
     split_name="train",
     num_samples=3,
     subsample_t=1,
@@ -165,6 +166,10 @@ def log_state_evolution(
 
     h_states, c_states : (B, T, K, H, W), from model(..., return_states=True)
         (the dict's "h"/"c" entries). c_states is optional.
+    frames : (B, T, C, H, W), the dict's "frames" entry — the actual frame
+        the cell consumed at each step. If given, it's drawn as a bottom
+        row so column t's frame lines up directly under column t's h/c,
+        i.e. "this frame produced the state above it".
     input_frames : if given, decoder timesteps (t >= input_frames) are
         labelled in a different colour to mark the encoder/decoder boundary.
     """
@@ -173,11 +178,14 @@ def log_state_evolution(
     indices = np.random.choice(B, num_samples, replace=False)
 
     T_shown = max(1, T // subsample_t)
-    rows = K * (2 if c_states is not None else 1)
+    state_rows = K * (2 if c_states is not None else 1)
+    frame_rows = 1 if frames is not None else 0
+    rows = state_rows + frame_rows
 
     for idx in indices:
         h_sample = h_states[idx].detach().cpu()   # (T, K, H, W)
         c_sample = c_states[idx].detach().cpu() if c_states is not None else None
+        frame_sample = frames[idx].detach().cpu() if frames is not None else None  # (T, C, H, W)
 
         fig, axes = plt.subplots(
             rows, T_shown,
@@ -204,6 +212,12 @@ def log_state_evolution(
                     axes[K + k, tt].imshow(v, cmap="coolwarm", vmin=-vmax, vmax=vmax)
                     axes[K + k, tt].axis("off")
 
+            if frame_sample is not None:
+                axes[state_rows, tt].imshow(
+                    frame_sample[t].mean(dim=0), cmap="gray", vmin=0, vmax=1
+                )
+                axes[state_rows, tt].axis("off")
+
             axes[0, tt].set_title(f"t={t}", fontsize=8, color=title_color)
 
         for k in range(K):
@@ -215,6 +229,10 @@ def log_state_evolution(
                 axes[K + k, 0].text(-0.4, 0.5, f"c slot{k}", rotation=90,
                                      va="center", ha="center", fontsize=8,
                                      transform=axes[K + k, 0].transAxes)
+        if frame_sample is not None:
+            axes[state_rows, 0].text(-0.4, 0.5, "frame", rotation=90,
+                                      va="center", ha="center", fontsize=8,
+                                      transform=axes[state_rows, 0].transAxes)
 
         fig.suptitle(f"{split_name} h/c evolution — sample {idx}"
                      + (" (red titles = decoder)" if input_frames is not None else ""),

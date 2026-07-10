@@ -82,6 +82,7 @@ def train_epoch_velocity_check(
             log_state_evolution(
                 states["h"],
                 states["c"],
+                frames=states["frames"],
                 split_name="train",
                 input_frames=input_frames,
             )
@@ -158,6 +159,7 @@ def eval_epoch_velocity_check(
                 log_state_evolution(
                     states["h"],
                     states["c"],
+                    frames=states["frames"],
                     split_name=split_name,
                     input_frames=input_frames,
                 )
@@ -243,6 +245,7 @@ def eval_len_generalization_velocity_check(
                 log_state_evolution(
                     states["h"],
                     states["c"],
+                    frames=states["frames"],
                     split_name="len_gen",
                     subsample_t=subsample_t,
                     input_frames=input_frames,
