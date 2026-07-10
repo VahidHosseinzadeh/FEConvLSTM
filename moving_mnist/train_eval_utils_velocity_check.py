@@ -4,7 +4,7 @@ import numpy as np
 from torch.utils.data import DataLoader
 from moving_mnist_dataset import FixedVelocityMovingMNIST
 from visualization import log_sequence_predictions, log_sequence_predictions_new, log_state_evolution
-from velocity_metrics import VelocityMetrics
+from velocity_metrics import VelocityMetrics, motions_to_true_vel
 
 
 
@@ -81,8 +81,10 @@ def train_epoch_velocity_check(
             )
             log_state_evolution(
                 states["h"],
-                states["c"],
                 frames=states["frames"],
+                gt_frames=torch.cat([input_seq, target_seq], dim=1),
+                pred_vel=pred_motion,
+                gt_vel=motions_to_true_vel(gt_motion, pred_motion.size(1)),
                 split_name="train",
                 input_frames=input_frames,
             )
@@ -158,8 +160,10 @@ def eval_epoch_velocity_check(
                 )
                 log_state_evolution(
                     states["h"],
-                    states["c"],
                     frames=states["frames"],
+                    gt_frames=torch.cat([input_seq, target_seq], dim=1),
+                    pred_vel=pred_motion,
+                    gt_vel=motions_to_true_vel(gt_motion, pred_motion.size(1)),
                     split_name=split_name,
                     input_frames=input_frames,
                 )
@@ -244,8 +248,10 @@ def eval_len_generalization_velocity_check(
                 )
                 log_state_evolution(
                     states["h"],
-                    states["c"],
                     frames=states["frames"],
+                    gt_frames=torch.cat([inp, tgt], dim=1),
+                    pred_vel=pred_motion,
+                    gt_vel=motions_to_true_vel(gt_motion, pred_motion.size(1)),
                     split_name="len_gen",
                     subsample_t=subsample_t,
                     input_frames=input_frames,

@@ -151,25 +151,36 @@ def log_sequence_predictions_new(
 
 def log_state_evolution(
     h_states,
-    c_states=None,
     frames=None,
+    gt_frames=None,
+    pred_vel=None,
+    gt_vel=None,
     split_name="train",
     num_samples=3,
     subsample_t=1,
     input_frames=None,
 ):
     """
-    Visualise the per-slot channel-mean h (and optionally c) maps over time,
-    for a handful of random samples — the exact h.mean(dim=2)/c.mean(dim=2)
-    reduction Seq2SeqMEConvLSTM._track_velocities correlates against, so
-    this shows what the velocity tracker actually sees at every step.
+    Visualise the per-slot channel-mean h maps over time — the exact
+    h.mean(dim=2) reduction Seq2SeqMEConvLSTM._track_velocities correlates
+    against, so this shows what the velocity tracker actually sees — for a
+    handful of random samples, with the frame the cell actually consumed
+    and the true frame directly below for comparison, plus predicted vs.
+    ground-truth velocity annotated per column.
 
-    h_states, c_states : (B, T, K, H, W), from model(..., return_states=True)
-        (the dict's "h"/"c" entries). c_states is optional.
-    frames : (B, T, C, H, W), the dict's "frames" entry — the actual frame
-        the cell consumed at each step. If given, it's drawn as a bottom
-        row so column t's frame lines up directly under column t's h/c,
-        i.e. "this frame produced the state above it".
+    h_states   : (B, T, K, H, W), states["h"] from model(..., return_states=True).
+    frames     : (B, T, C, H, W), states["frames"] — the frame the cell
+        actually consumed at each step (its own prediction in the decoder,
+        unless teacher forcing kicked in).
+    gt_frames  : (B, T, C, H, W), the true frame at each step, e.g.
+        torch.cat([input_seq, target_seq], dim=1) — what *should* be there,
+        for comparison against `frames` (most informative in the decoder,
+        where the two can diverge).
+    pred_vel, gt_vel : (B, T-1, K, 2) — estimated vs. true velocity.
+        pred_vel[:, i] / gt_vel[:, i] is the velocity used to produce
+        h_states[:, i+1] (h_states[:, 0] has no associated velocity: h=0
+        there and v is fixed to zero by convention). gt_vel is typically
+        motions_to_true_vel(dataset_motions, pred_vel.size(1)).
     input_frames : if given, decoder timesteps (t >= input_frames) are
         labelled in a different colour to mark the encoder/decoder boundary.
     """
@@ -178,19 +189,26 @@ def log_state_evolution(
     indices = np.random.choice(B, num_samples, replace=False)
 
     T_shown = max(1, T // subsample_t)
-    state_rows = K * (2 if c_states is not None else 1)
-    frame_rows = 1 if frames is not None else 0
-    rows = state_rows + frame_rows
+    has_frames = frames is not None
+    has_gt_frames = gt_frames is not None
+    has_vel = pred_vel is not None and gt_vel is not None
+
+    rows = K + int(has_frames) + int(has_gt_frames)
+    frame_row = K
+    gt_row = K + int(has_frames)
+    bottom_row = rows - 1
 
     for idx in indices:
         h_sample = h_states[idx].detach().cpu()   # (T, K, H, W)
-        c_sample = c_states[idx].detach().cpu() if c_states is not None else None
-        frame_sample = frames[idx].detach().cpu() if frames is not None else None  # (T, C, H, W)
+        frame_sample = frames[idx].detach().cpu() if has_frames else None      # (T, C, H, W)
+        gt_sample = gt_frames[idx].detach().cpu() if has_gt_frames else None   # (T, C, H, W)
+        pv = pred_vel[idx].detach().cpu() if has_vel else None   # (T-1, K, 2)
+        gv = gt_vel[idx].detach().cpu() if has_vel else None     # (T-1, N, 2)
 
         fig, axes = plt.subplots(
             rows, T_shown,
-            figsize=(max(6, T_shown * 1.1), max(2, rows * 1.3)),
-            gridspec_kw={"wspace": 0.05, "hspace": 0.2},
+            figsize=(max(6, T_shown * 1.3), max(2, rows * 1.3) + 0.6),
+            gridspec_kw={"wspace": 0.05, "hspace": 0.35},
             squeeze=False,
         )
 
@@ -205,38 +223,52 @@ def log_state_evolution(
                 axes[k, tt].imshow(v, cmap="coolwarm", vmin=-vmax, vmax=vmax)
                 axes[k, tt].axis("off")
 
-            if c_sample is not None:
-                for k in range(K):
-                    v = c_sample[t, k]
-                    vmax = v.abs().max().clamp(min=1e-8).item()
-                    axes[K + k, tt].imshow(v, cmap="coolwarm", vmin=-vmax, vmax=vmax)
-                    axes[K + k, tt].axis("off")
-
-            if frame_sample is not None:
-                axes[state_rows, tt].imshow(
+            if has_frames:
+                axes[frame_row, tt].imshow(
                     frame_sample[t].mean(dim=0), cmap="gray", vmin=0, vmax=1
                 )
-                axes[state_rows, tt].axis("off")
+                axes[frame_row, tt].axis("off")
+
+            if has_gt_frames:
+                axes[gt_row, tt].imshow(
+                    gt_sample[t].mean(dim=0), cmap="gray", vmin=0, vmax=1
+                )
+                axes[gt_row, tt].axis("off")
 
             axes[0, tt].set_title(f"t={t}", fontsize=8, color=title_color)
+
+            # pv/gv only cover steps where the tracker actually ran; in pure
+            # inference (target_seq=None) the decoder freezes v_last and
+            # isn't appended, so pv can be shorter than h_states — skip
+            # columns beyond what's available rather than index out of range.
+            if has_vel and 1 <= t <= pv.shape[0] and t - 1 < gv.shape[0]:
+                p_str = " ".join(f"({x:.0f},{y:.0f})" for x, y in pv[t - 1].tolist())
+                g_str = " ".join(f"({x:.0f},{y:.0f})" for x, y in gv[t - 1].tolist())
+                axes[bottom_row, tt].text(
+                    0.5, -0.4, f"p:{p_str}\ng:{g_str}",
+                    transform=axes[bottom_row, tt].transAxes,
+                    ha="center", va="top", fontsize=5.5,
+                )
 
         for k in range(K):
             axes[k, 0].text(-0.4, 0.5, f"h slot{k}", rotation=90,
                              va="center", ha="center", fontsize=8,
                              transform=axes[k, 0].transAxes)
-        if c_sample is not None:
-            for k in range(K):
-                axes[K + k, 0].text(-0.4, 0.5, f"c slot{k}", rotation=90,
-                                     va="center", ha="center", fontsize=8,
-                                     transform=axes[K + k, 0].transAxes)
-        if frame_sample is not None:
-            axes[state_rows, 0].text(-0.4, 0.5, "frame", rotation=90,
-                                      va="center", ha="center", fontsize=8,
-                                      transform=axes[state_rows, 0].transAxes)
+        if has_frames:
+            axes[frame_row, 0].text(-0.4, 0.5, "frame\n(used)", rotation=90,
+                                     va="center", ha="center", fontsize=7,
+                                     transform=axes[frame_row, 0].transAxes)
+        if has_gt_frames:
+            axes[gt_row, 0].text(-0.4, 0.5, "frame\n(GT)", rotation=90,
+                                  va="center", ha="center", fontsize=7,
+                                  transform=axes[gt_row, 0].transAxes)
 
-        fig.suptitle(f"{split_name} h/c evolution — sample {idx}"
-                     + (" (red titles = decoder)" if input_frames is not None else ""),
-                     fontsize=10)
+        title = f"{split_name} h evolution — sample {idx}"
+        if input_frames is not None:
+            title += " (red titles = decoder)"
+        if has_vel:
+            title += "  |  p=predicted vel, g=GT vel, per slot/digit in order"
+        fig.suptitle(title, fontsize=10)
 
         wandb.log({f"{split_name}_states_sample{idx}": wandb.Image(fig)})
         plt.close(fig)
