@@ -74,3 +74,6 @@ Thumbs.db
 # Misc
 *.log
 *.csv
+
+.vscode/
+.claude/
