@@ -79,6 +79,10 @@ def main():
     parser.add_argument('--epochs', type=int, default=50)
     parser.add_argument('--min_epochs', type=int, default=50, help='Minimum number of epochs to train')
     parser.add_argument('--lr', type=float, default=1e-3)
+    parser.add_argument('--use_lr_scheduler', action='store_true', help='Enable ReduceLROnPlateau: cuts LR when val_loss stops improving')
+    parser.add_argument('--lr_patience', type=int, default=5, help='Epochs with no val_loss improvement before cutting LR (only with --use_lr_scheduler)')
+    parser.add_argument('--lr_factor', type=float, default=0.5, help='Multiplicative LR cut factor (only with --use_lr_scheduler)')
+    parser.add_argument('--lr_min', type=float, default=1e-6, help='Floor below which LR will not be reduced further (only with --use_lr_scheduler)')
     parser.add_argument('--model', choices=['lstm', 'felstm', 'melstm'], default='felstm')
     parser.add_argument('--hidden_size', type=int, default=128)
     parser.add_argument('--num_layers', type=int, default=1)
@@ -320,6 +324,9 @@ def main():
     print(f"Epochs: {args.epochs}")
     print(f"Min epochs: {args.min_epochs}")
     print(f"Learning rate: {args.lr}")
+    print(f"LR scheduler: {'ReduceLROnPlateau' if args.use_lr_scheduler else 'none'}")
+    if args.use_lr_scheduler:
+        print(f"  patience={args.lr_patience}  factor={args.lr_factor}  min_lr={args.lr_min}")
     print(f"Model: {args.model}")
     print(f"Hidden size: {args.hidden_size}")
     print(f"Num layers: {args.num_layers}")
@@ -434,6 +441,13 @@ def main():
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     criterion = MSEPlusL1Loss()
 
+    scheduler = None
+    if args.use_lr_scheduler:
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode='min', factor=args.lr_factor,
+            patience=args.lr_patience, min_lr=args.lr_min,
+        )
+
     # Training loop
     history = {'train_loss': [], 'val_loss': [], 'test_loss': []}
     best_val_losses = float('inf')
@@ -444,11 +458,19 @@ def main():
         history['train_loss'].append(train_loss)
         history['val_loss'].append(val_loss)
         print(f"Epoch {epoch}/{args.epochs} | {args.model:^8} | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f}")
-        
+
+        if scheduler is not None:
+            lr_before = optimizer.param_groups[0]['lr']
+            scheduler.step(val_loss)
+            lr_after = optimizer.param_groups[0]['lr']
+            if lr_after < lr_before:
+                print(f"  LR reduced: {lr_before:.2e} -> {lr_after:.2e}")
+
         # Log metrics to wandb
         wandb.log({
             "train_loss": train_loss,
             "val_loss": val_loss,
+            "lr": optimizer.param_groups[0]['lr'],
             "epoch": epoch
         })
         

@@ -181,7 +181,11 @@ class VelocityMetrics:
     true_vel : (B, T, N, 2)   ground-truth velocities, N digits
                                (pass motions[:, :T] from the dataset)
 
-    K must equal N.
+    K must be >= N. When K > N (more slots than digits, e.g. for extra
+    tracking redundancy), the best-assignment search picks the best
+    N-of-K slot subset (and its order) per batch item -- the "extra"
+    K-N slots are simply never selected for that item. When K == N this
+    reduces to exactly the original full-permutation behaviour.
 
     Metrics reported per time step
     --------------------------------
@@ -209,30 +213,35 @@ class VelocityMetrics:
     @staticmethod
     def _best_assignment(pred_vel, true_vel):
         """
-        For each batch item find the permutation of K slots that maximises
-        the number of correct velocity predictions across all T time steps.
+        For each batch item find the length-N ordered selection of K slots
+        (which N of the K slots, and in what order they line up against the
+        N digits) that maximises the number of correct velocity predictions
+        across all T time steps. itertools.permutations(range(K), N) gives
+        exactly this: all injective maps from digit-position to slot-index.
+        When K == N it's the usual set of full permutations.
 
         pred_vel : (B, T, K, 2)  float
         true_vel : (B, T, N, 2)  long / float
-        returns  : matched_pred (B, T, N, 2), best_perms (B, K) long
+        returns  : matched_pred (B, T, N, 2), best_perms (B, N) long
+                   -- best_perms[b, n] is the slot index matched to digit n
         """
         B, T, K, _ = pred_vel.shape
         N           = true_vel.shape[2]
-        assert K == N, f"n_slots ({K}) must equal num_digits ({N})"
+        assert K >= N, f"n_slots ({K}) must be >= num_digits ({N})"
 
-        all_perms   = list(_permutations(range(K)))
-        matched     = torch.zeros_like(pred_vel)    # will hold reordered pred
-        best_perms  = torch.zeros(B, K, dtype=torch.long)
+        all_perms   = list(_permutations(range(K), N))
+        matched     = torch.zeros(B, T, N, 2, dtype=pred_vel.dtype)
+        best_perms  = torch.zeros(B, N, dtype=torch.long)
 
         pred_r = torch.round(pred_vel)   # (B, T, K, 2)
         true_f = true_vel.float()        # (B, T, N, 2)
 
         for b in range(B):
             best_count = -1
-            best_p     = list(range(K))
+            best_p     = list(range(N))
 
             for perm in all_perms:
-                # reorder slots: (T, N, 2)
+                # select+reorder N of the K slots: (T, N, 2)
                 p_pred  = pred_r[b, :, perm, :]
                 # count exact (vx, vy) matches across all (t, n)
                 count   = (p_pred == true_vel[b].float()).all(dim=-1).sum().item()
@@ -313,7 +322,7 @@ class VelocityMetrics:
         print(title)
         print(
             "  Accuracy is computed under the best per-sequence slot→digit "
-            "assignment (K! permutations).\n"
+            "assignment (best N-of-K slot selection, K>=N).\n"
             "  t=2 near-zero is structural: both slots have identical hidden "
             "states after t=1 (warp(0,v)=0)."
         )
