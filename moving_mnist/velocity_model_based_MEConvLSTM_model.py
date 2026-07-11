@@ -25,6 +25,26 @@ class MEConvLSTMCell(nn.Module):
         if bias:
             nn.init.constant_(self.conv.bias[hidden_dim:2 * hidden_dim], 1.0)
 
+        # (H, W, device, dtype) -> (yy, xx) base pixel-index grid. Depends only
+        # on shape/device/dtype, not on the batch or velocity -- identical on
+        # every warp() call within a run, so build it once instead of every
+        # timestep of every forward pass. Plain dict (not a buffer): a stale
+        # entry for an old device just goes unused after .to(device), doesn't
+        # need saving/loading with the model.
+        self._meshgrid_cache = {}
+
+    def _get_base_grid(self, H, W, device, dtype):
+        key = (H, W, device, dtype)
+        cached = self._meshgrid_cache.get(key)
+        if cached is None:
+            cached = torch.meshgrid(
+                torch.arange(H, device=device, dtype=dtype),
+                torch.arange(W, device=device, dtype=dtype),
+                indexing="ij"
+            )
+            self._meshgrid_cache[key] = cached
+        return cached
+
     def warp(self, x, u):
         """
         x : (B, K, C, H, W)
@@ -37,11 +57,7 @@ class MEConvLSTMCell(nn.Module):
         dx = u[:, 0, None, None]
         dy = u[:, 1, None, None]
 
-        yy, xx = torch.meshgrid(
-            torch.arange(H, device=x.device, dtype=x.dtype),
-            torch.arange(W, device=x.device, dtype=x.dtype),
-            indexing="ij"
-        )
+        yy, xx = self._get_base_grid(H, W, x.device, x.dtype)
         yy = yy.unsqueeze(0).expand(B * K, -1, -1)
         xx = xx.unsqueeze(0).expand(B * K, -1, -1)
 

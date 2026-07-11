@@ -74,6 +74,7 @@ def main():
     parser.add_argument('--seq_len', type=int, default=20)
     parser.add_argument('--input_frames', type=int, default=10)
     parser.add_argument('--batch_size', type=int, default=128)
+    parser.add_argument('--num_workers', type=int, default=4, help='DataLoader worker processes (0 = load on the main process, no parallelism)')
     parser.add_argument('--epochs', type=int, default=50)
     parser.add_argument('--min_epochs', type=int, default=50, help='Minimum number of epochs to train')
     parser.add_argument('--lr', type=float, default=1e-3)
@@ -295,11 +296,16 @@ def main():
         train_ds = Subset(train_ds, indices)
         print(f"Limited training to {args.max_train_samples} samples")
     
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True)
-    val_loader = DataLoader(val_ds, batch_size=args.batch_size)
-    test_loader = DataLoader(test_dataset, batch_size=args.batch_size)
+    loader_kwargs = dict(
+        num_workers=args.num_workers,
+        pin_memory=(device.type == 'cuda'),
+        persistent_workers=(args.num_workers > 0),
+    )
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, **loader_kwargs)
+    val_loader = DataLoader(val_ds, batch_size=args.batch_size, **loader_kwargs)
+    test_loader = DataLoader(test_dataset, batch_size=args.batch_size, **loader_kwargs)
     gen_test_loader = DataLoader(gen_test_dataset,
-                                batch_size=args.batch_size)
+                                batch_size=args.batch_size, **loader_kwargs)
 
 
     print(f"Train size: {len(train_ds)}, Val size: {len(val_ds)}, Test size: {len(test_dataset)}")
