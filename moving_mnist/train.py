@@ -73,6 +73,7 @@ def main():
     parser.add_argument('--root', type=str, default='./data')
     parser.add_argument('--seq_len', type=int, default=20)
     parser.add_argument('--input_frames', type=int, default=10)
+    parser.add_argument('--gen_input_frames', type=int, default=15, help='Encoder input frame count used **only** for the length-generalization experiment (separate from --input_frames, which is used for train/val/test)')
     parser.add_argument('--batch_size', type=int, default=128)
     parser.add_argument('--num_workers', type=int, default=4, help='DataLoader worker processes (0 = load on the main process, no parallelism)')
     parser.add_argument('--epochs', type=int, default=50)
@@ -139,8 +140,9 @@ def main():
                name=args.wandb_name)
 
     assert args.input_frames < args.seq_len, "input_frames must be less than seq_len"
+    assert args.gen_input_frames < args.gen_seq_len, "gen_input_frames must be less than gen_seq_len"
     pred_frames = args.seq_len - args.input_frames
-    gen_pred_frames = args.gen_seq_len - args.input_frames
+    gen_pred_frames = args.gen_seq_len - args.gen_input_frames
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -256,7 +258,7 @@ def main():
         image_size=args.image_size,
         max_speed=args.data_v_range,
 
-        motion_mode="stochastic",
+        motion_mode="piecewise",
         transition_mode="smooth",
 
         min_segment=3,
@@ -267,7 +269,7 @@ def main():
 
         motion_difficulty=None,
 
-        freeze_after=args.input_frames,
+        freeze_after=args.gen_input_frames,
 
         min_center_distance=20,
         reject_overlap=True,
@@ -311,6 +313,7 @@ def main():
     print(f"Train size: {len(train_ds)}, Val size: {len(val_ds)}, Test size: {len(test_dataset)}")
     print(f"Length‑gen test size: {len(gen_test_dataset)} | Eval sequence length: {args.gen_seq_len}")
     print(f"Input frames: {args.input_frames}, Pred frames: {pred_frames}")
+    print(f"Gen input frames: {args.gen_input_frames}, Gen pred frames: {gen_pred_frames} (gen_seq_len={args.gen_seq_len})")
     print(f"Model seed: {args.model_seed}")
     print(f"Data seed: {args.data_seed}")
     print(f"Batch size: {args.batch_size}")
@@ -390,7 +393,7 @@ def main():
         })
 
         print("Running length generalization test...")
-        gen_mean, gen_std = len_gen_fn(model, gen_test_loader, device, args.input_frames, subsample_t=2)
+        gen_mean, gen_std = len_gen_fn(model, gen_test_loader, device, args.gen_input_frames, subsample_t=2)
         print(f"Length generalization mean MSE: {gen_mean.mean():.4f}")
 
         wandb.log({f"len_gen_mean_t{t+1}": gen_mean[t] for t in range(len(gen_mean))})
@@ -463,7 +466,7 @@ def main():
             history['test_loss'].append(test_loss)
             print(f"Test Loss: {test_loss:.4f}")
 
-            gen_mean, gen_std = len_gen_fn(model, gen_test_loader, device, args.input_frames)
+            gen_mean, gen_std = len_gen_fn(model, gen_test_loader, device, args.gen_input_frames)
 
             wandb.log({f"len_gen_mean_t{t+1}": gen_mean[t] for t in range(len(gen_mean))})
             wandb.log({f"len_gen_std_t{t+1}":  gen_std[t]  for t in range(len(gen_std))})
