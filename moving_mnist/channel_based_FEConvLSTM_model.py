@@ -42,25 +42,47 @@ class FEConvLSTMCell(nn.Module):
             ],
             1.0
         )
-        
+
+        # (H, W, device) -> flat gather index (num_v, H*W) reproducing the
+        # per-velocity torch.roll pattern below. Depends only on shape/
+        # device, not on B/C/the actual tensor values -- identical every
+        # call, so build it once instead of doing num_v separate torch.roll
+        # kernel launches (in a Python loop, twice per cell step, every
+        # timestep) on every single forward pass.
+        self._shift_index_cache = {}
+
+    def _get_shift_index(self, H, W, device):
+        key = (H, W, device)
+        idx = self._shift_index_cache.get(key)
+        if idx is None:
+            yy, xx = torch.meshgrid(
+                torch.arange(H, device=device),
+                torch.arange(W, device=device),
+                indexing="ij",
+            )
+            rows = []
+            for (vx, vy) in self.v_list:
+                # matches torch.roll(x, shifts=(vy, vx), dims=(2, 3)):
+                # output[h, w] = input[(h - vy) mod H, (w - vx) mod W]
+                src_y = (yy - vy) % H
+                src_x = (xx - vx) % W
+                rows.append((src_y * W + src_x).reshape(-1))
+            idx = torch.stack(rows, dim=0)  # (num_v, H*W), long
+            self._shift_index_cache[key] = idx
+        return idx
+
     def shift_tensor(self, x):
 
         # x:
         # (B, num_v, C, H, W)
+        B, num_v, C, H, W = x.shape
 
-        shifted = []
+        idx = self._get_shift_index(H, W, x.device)          # (num_v, H*W)
+        idx = idx.view(1, num_v, 1, H * W).expand(B, num_v, C, H * W)
 
-        for i, (vx, vy) in enumerate(self.v_list):
-
-            shifted.append(
-                torch.roll(
-                    x[:, i],
-                    shifts=(vy, vx),
-                    dims=(2, 3)
-                )
-            )
-
-        return torch.stack(shifted, dim=1)
+        x_flat = x.reshape(B, num_v, C, H * W)
+        shifted = torch.gather(x_flat, dim=3, index=idx)
+        return shifted.reshape(B, num_v, C, H, W)
 
     def forward(self, u_t, state):
 
