@@ -93,6 +93,7 @@ def main():
     parser.add_argument('--image_size', type=int, default=28)
     parser.add_argument('--v_range', type=int, default=2)
     parser.add_argument('--num_vel_modes', type=int, default=2, help='Number of velocity modes for MEConvLSTM')
+    parser.add_argument('--grouped_conv', action='store_true', help='MEConvLSTM: give each velocity slot its own conv kernel (groups=n_slots) instead of sharing one kernel across slots. Per-slot hidden width is hidden_size // n_slots to keep params at/under the shared-kernel baseline.')
     parser.add_argument('--data_v_range', type=int, default=2)
     parser.add_argument('--gen_seq_len', type=int, default=40, help='Sequence length used **only** for length‑generalization evaluation (must be > seq_len)')
     parser.add_argument('--data_seed', type=int, default=42, help='Random seed for dataset splitting')
@@ -328,6 +329,8 @@ def main():
     if args.use_lr_scheduler:
         print(f"  patience={args.lr_patience}  factor={args.lr_factor}  min_lr={args.lr_min}")
     print(f"Model: {args.model}")
+    if args.model == "melstm":
+        print(f"Grouped conv (independent per-slot kernel): {args.grouped_conv}")
     print(f"Hidden size: {args.hidden_size}")
     print(f"Num layers: {args.num_layers}")
     print(f"Decoder conv layers: {args.decoder_conv_layers}")
@@ -375,7 +378,8 @@ def main():
                 kernel_size=args.kernel_size,
                 n_slots= args.num_vel_modes,
                 slot_reduce = 'max',
-                decoder_layers = args.decoder_conv_layers
+                decoder_layers = args.decoder_conv_layers,
+                grouped_conv = args.grouped_conv
             ).to(device)
 
     # Load model if specified

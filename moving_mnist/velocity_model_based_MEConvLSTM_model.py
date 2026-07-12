@@ -8,22 +8,52 @@ from velocity_predictor_model import PhaseCorrelation
 
 class MEConvLSTMCell(nn.Module):
 
-    def __init__(self, input_dim, hidden_dim, kernel_size=3, bias=True):
+    def __init__(self, input_dim, hidden_dim, kernel_size=3, bias=True,
+                 n_slots=1, grouped=False):
         super().__init__()
 
         if isinstance(kernel_size, int):
             kernel_size = (kernel_size, kernel_size)
         padding = (kernel_size[0] // 2, kernel_size[1] // 2)
-        self.hidden_dim = hidden_dim
 
-        self.conv = nn.Conv2d(
-            input_dim + hidden_dim, 4 * hidden_dim,
-            kernel_size, padding=padding,
-            padding_mode="circular", bias=bias
-        )
+        self.grouped = grouped and n_slots > 1
+        self.n_slots = n_slots
 
-        if bias:
-            nn.init.constant_(self.conv.bias[hidden_dim:2 * hidden_dim], 1.0)
+        if self.grouped:
+            # Independent kernel per slot via one grouped conv (groups=K)
+            # instead of K sequential Conv2d calls. A groups=K conv's param
+            # count scales as K * per_slot_width * (...) -- i.e. 1/K of an
+            # ungrouped conv with the same *total* channel widths -- so to
+            # stay at/under the shared-conv baseline's param count we shrink
+            # the per-slot hidden width instead of keeping hidden_dim fixed
+            # per slot (which would cost Kx the params).
+            per_slot = hidden_dim // n_slots
+            assert per_slot > 0, (
+                f"hidden_dim={hidden_dim} too small for n_slots={n_slots} "
+                f"with grouped=True (per-slot hidden would be 0)"
+            )
+            self.hidden_dim = per_slot
+            self.conv = nn.Conv2d(
+                n_slots * (input_dim + per_slot), n_slots * 4 * per_slot,
+                kernel_size, padding=padding, padding_mode="circular",
+                groups=n_slots, bias=bias
+            )
+            if bias:
+                # Grouped-conv output channels are laid out as n_slots
+                # consecutive blocks (one per group), each block internally
+                # ordered [i, f, o, g] by our own convention (see forward()).
+                # Set every slot's forget-gate sub-block to +1.
+                bias_view = self.conv.bias.view(n_slots, 4, per_slot)
+                nn.init.constant_(bias_view[:, 1, :], 1.0)
+        else:
+            self.hidden_dim = hidden_dim
+            self.conv = nn.Conv2d(
+                input_dim + hidden_dim, 4 * hidden_dim,
+                kernel_size, padding=padding,
+                padding_mode="circular", bias=bias
+            )
+            if bias:
+                nn.init.constant_(self.conv.bias[hidden_dim:2 * hidden_dim], 1.0)
 
         # (H, W, device, dtype) -> (yy, xx) base pixel-index grid. Depends only
         # on shape/device/dtype, not on the batch or velocity -- identical on
@@ -74,6 +104,24 @@ class MEConvLSTMCell(nn.Module):
 
         h = self.warp(h, u)
         c = self.warp(c, u)
+
+        if self.grouped:
+            # Keep the slot dim in the channel axis (not the batch axis) so
+            # groups=K routes each slot through its own kernel.
+            x_exp = x.unsqueeze(1).expand(-1, K, -1, -1, -1)          # (B,K,Cin,H,W)
+            combined = torch.cat([x_exp, h], dim=2)                   # (B,K,Cin+Ch,H,W)
+            combined = combined.reshape(B, -1, H, W)                  # (B,K*(Cin+Ch),H,W)
+
+            gates = self.conv(combined)                               # (B,K*4*Ch,H,W)
+            gates = gates.view(B, K, 4, Ch, H, W)
+            i, f, o, g = (gates[:, :, j].reshape(B * K, Ch, H, W) for j in range(4))
+            i, f, o, g = torch.sigmoid(i), torch.sigmoid(f), torch.sigmoid(o), torch.tanh(g)
+
+            c = c.reshape(B * K, Ch, H, W)
+            c = f * c + i * g
+            h = o * torch.tanh(c)
+
+            return h.view(B, K, Ch, H, W), c.view(B, K, Ch, H, W)
 
         x_exp = x.unsqueeze(1).expand(-1, K, -1, -1, -1).reshape(B * K, -1, H, W)
         h     = h.reshape(B * K, Ch, H, W)
@@ -144,7 +192,8 @@ class Seq2SeqMEConvLSTM(nn.Module):
                  decoder_layers=1,
                  bias=True,
                  batch_first=True,
-                 phase_corr_kwargs=None):
+                 phase_corr_kwargs=None,
+                 grouped_conv=False):
         super().__init__()
 
         self.batch_first     = batch_first
@@ -159,14 +208,23 @@ class Seq2SeqMEConvLSTM(nn.Module):
         self.phase_corr_track     = PhaseCorrelation(n_modes=1,       **pc_kw)
 
         self.cell = MEConvLSTMCell(input_channels, hidden_channels,
-                                   kernel_size, bias)
+                                   kernel_size, bias,
+                                   n_slots=n_slots, grouped=grouped_conv)
+
+        # With grouped_conv=True the cell shrinks its per-slot hidden width
+        # to keep conv params at/under the shared-conv baseline (see
+        # MEConvLSTMCell.__init__) -- so _pool_slots()/the decoder must use
+        # the cell's *actual* per-slot width, not the raw hidden_channels
+        # argument (which is the nominal budget, not the true channel count
+        # once grouped).
+        cell_hidden = self.cell.hidden_dim
 
         layers = []
         for _ in range(decoder_layers):
-            layers += [nn.Conv2d(hidden_channels, hidden_channels,
+            layers += [nn.Conv2d(cell_hidden, cell_hidden,
                                  3, padding=1, padding_mode='circular', bias=True),
                        nn.ReLU()]
-        layers += [nn.Conv2d(hidden_channels, output_channels,
+        layers += [nn.Conv2d(cell_hidden, output_channels,
                              3, padding=1, padding_mode='circular', bias=True)]
         self.decoder = nn.Sequential(*layers)
 
