@@ -341,7 +341,12 @@ class Seq2SeqMEConvLSTM(nn.Module):
                     current_frame.unsqueeze(1).expand(-1, K, -1, -1, -1), v)
 
             if return_states:
-                frame_states.append(current_frame.detach())
+                # Log what the cell actually consumed, not the pre-warp
+                # current_frame -- cell_input may be per-slot (B,K,C,H,W)
+                # when motion-compensated, so pool across slots to match the
+                # (B,C,H,W) shape logged for the GT-fed branch.
+                logged_input = cell_input if cell_input.dim() == 4 else cell_input.mean(dim=1)
+                frame_states.append(logged_input.detach())
 
             h, c  = self.cell(cell_input, h, c, v)
             pred  = self.decoder(self._pool_slots(h))
