@@ -70,12 +70,22 @@ class MEConvLSTMCell(nn.Module):
         return x.view(B, K, C, H, W)
 
     def forward(self, x, h, c, u):
+        """
+        x : (B, C, H, W) -- shared/unwarped, already at the target position
+                             (e.g. a true observed frame), broadcast to all
+                             K slots as-is
+            or (B, K, C, H, W) -- already per-slot (e.g. motion-compensated
+                             by the caller), used as-is
+        """
         B, K, Ch, H, W = h.shape
 
         h = self.warp(h, u)
         c = self.warp(c, u)
 
-        x_exp = x.unsqueeze(1).expand(-1, K, -1, -1, -1).reshape(B * K, -1, H, W)
+        if x.dim() == 4:
+            x_exp = x.unsqueeze(1).expand(-1, K, -1, -1, -1).reshape(B * K, -1, H, W)
+        else:
+            x_exp = x.reshape(B * K, -1, H, W)
         h     = h.reshape(B * K, Ch, H, W)
         c     = c.reshape(B * K, Ch, H, W)
 
@@ -304,8 +314,17 @@ class Seq2SeqMEConvLSTM(nn.Module):
                 if (self.training and
                         torch.rand(1).item() < teacher_forcing_ratio):
                     current_frame = target_seq[:, t]
+                    cell_input    = current_frame
                 else:
+                    # No true frame at the target position -- v just warped
+                    # h/c forward to it, so feeding the raw (unwarped) old
+                    # frame back in re-anchors the cell to the OLD position
+                    # instead of the new one, which is what produced the
+                    # one-step lag. Motion-compensate it per slot so the
+                    # observation lines up with the warped h/c.
                     current_frame = prev_frame.detach()
+                    cell_input    = self.cell.warp(
+                        current_frame.unsqueeze(1).expand(-1, K, -1, -1, -1), v)
 
             else:
                 # ---------------------------------------------------------
@@ -318,11 +337,13 @@ class Seq2SeqMEConvLSTM(nn.Module):
                 # ---------------------------------------------------------
                 v             = v_last
                 current_frame = prev_frame.detach()
+                cell_input    = self.cell.warp(
+                    current_frame.unsqueeze(1).expand(-1, K, -1, -1, -1), v)
 
             if return_states:
                 frame_states.append(current_frame.detach())
 
-            h, c  = self.cell(current_frame, h, c, v)
+            h, c  = self.cell(cell_input, h, c, v)
             pred  = self.decoder(self._pool_slots(h))
             outputs.append(pred)
             prev_frame = pred
