@@ -161,7 +161,6 @@ estimated_velocities[i]  corresponds to  motions[i]  (0-indexed):
   i=0         : bootstrap(X_0, X_1)           → motions[0]
   i=1..T_in-2 : track(h, X_{i+1})             → motions[i]
   i=T_in-1..  : track(h, target_seq[:,i-T_in+1]) → motions[i]
-                 (only exactly aligned when teacher_forcing_ratio=1)
 Printed as "t=i+1" in the report.
 """
 
@@ -309,11 +308,50 @@ class VelocityMetrics:
                     }
 
     # ------------------------------------------------------------------
-    # Report
+    # Summary / Report
     # ------------------------------------------------------------------
 
-    def report(self, title="Velocity Report"):
+    def summary(self):
+        """
+        Structured per-timestep + overall metrics, computed once so both
+        report() (console) and any external logger (e.g. wandb, via
+        visualization.log_velocity_report) share the same numbers instead
+        of recomputing them. Returns None if no data has been recorded yet.
+        """
         if self._T is None:
+            return None
+
+        per_t_total = self.total.clamp(min=1)
+        per_t_acc   = (100.0 * self.correct.float() / per_t_total).tolist()
+        per_t_l2    = (self.l2_sum / per_t_total).tolist()
+
+        overall_total = max(1, self.total.sum().item())
+        overall_acc   = 100.0 * self.correct.sum().item() / overall_total
+        overall_l2    = self.l2_sum.sum().item() / overall_total
+
+        half      = self._T // 2
+        enc_total = max(1, self.total[:half].sum().item())
+        dec_total = max(1, self.total[half:].sum().item())
+        encoder_acc = 100.0 * self.correct[:half].sum().item() / enc_total
+        decoder_acc = 100.0 * self.correct[half:].sum().item() / dec_total
+
+        return {
+            "T"             : self._T,
+            "per_t_acc"     : per_t_acc,
+            "per_t_l2"      : per_t_l2,
+            "per_t_correct" : self.correct.tolist(),
+            "per_t_total"   : self.total.tolist(),
+            "overall_acc"   : overall_acc,
+            "overall_l2"    : overall_l2,
+            "encoder_acc"   : encoder_acc,
+            "decoder_acc"   : decoder_acc,
+            "last_step_acc" : per_t_acc[-1],
+            "last_step_l2"  : per_t_l2[-1],
+        }
+
+    def report(self, title="Velocity Report"):
+        s = self.summary()
+        if s is None:
             print("No data recorded yet.")
             return
 
@@ -330,17 +368,13 @@ class VelocityMetrics:
         print(f"{'t':>4}  {'acc%':>8}  {'mean_L2':>8}  {'correct/total':>15}  note")
         print("-" * 100)
 
-        for t in range(self._T):
-            total   = max(1, self.total[t].item())
-            acc     = 100.0 * self.correct[t].item() / total
-            mean_l2 = self.l2_sum[t].item() / total
-
+        for t in range(s["T"]):
             note = ""
             if t == 1:   # printed as t=2, first track call
                 note = "← slot degeneracy (both slots identical at this step)"
 
-            row = (f"{t+1:>4}  {acc:>8.2f}  {mean_l2:>8.3f}"
-                   f"  {self.correct[t].item():>7}/{total:<7}  {note}")
+            row = (f"{t+1:>4}  {s['per_t_acc'][t]:>8.2f}  {s['per_t_l2'][t]:>8.3f}"
+                   f"  {s['per_t_correct'][t]:>7}/{s['per_t_total'][t]:<7}  {note}")
             print(row)
 
             if t in self.examples:
@@ -351,32 +385,17 @@ class VelocityMetrics:
                       f"  pred_round={e['pred_round']}"
                       f"  true={e['true']}")
 
-        overall_acc = (100.0 * self.correct.sum().item()
-                       / max(1, self.total.sum().item()))
-        overall_l2  = (self.l2_sum.sum().item()
-                       / max(1, self.total.sum().item()))
-
         print("-" * 100)
-        print(f"Overall accuracy (best assignment) : {overall_acc:.2f}%")
-        print(f"Overall mean L2  (best assignment) : {overall_l2:.3f}")
+        print(f"Overall accuracy (best assignment) : {s['overall_acc']:.2f}%")
+        print(f"Overall mean L2  (best assignment) : {s['overall_l2']:.3f}")
         print("=" * 100)
         print()
 
         # ---- breakdown: encoder vs decoder -------------------------
         # The caller should know T_in to split; we report halves as proxy.
-        half = self._T // 2
-        enc_acc = (100.0 * self.correct[:half].sum().item()
-                   / max(1, self.total[:half].sum().item()))
-        dec_acc = (100.0 * self.correct[half:].sum().item()
-                   / max(1, self.total[half:].sum().item()))
-        print(f"  Encoder steps (t=1..{half})   accuracy: {enc_acc:.2f}%")
-        print(f"  Decoder steps (t={half+1}..{self._T}) accuracy: {dec_acc:.2f}%")
-        print(
-            "  Note: decoder accuracy is only meaningful when "
-            "teacher_forcing_ratio=1\n"
-            "        (with ratio<1, h tracks predictions not GT frames,\n"
-            "        so estimated velocities don't align with motions)."
-        )
+        half = s["T"] // 2
+        print(f"  Encoder steps (t=1..{half})   accuracy: {s['encoder_acc']:.2f}%")
+        print(f"  Decoder steps (t={half+1}..{s['T']}) accuracy: {s['decoder_acc']:.2f}%")
         print()
 
 
@@ -408,47 +427,3 @@ def motions_to_true_vel(motions, T_estimated):
     """
     T = min(T_estimated, motions.shape[1])
     return motions[:, :T].float()
-
-
-# ============================================================================
-# Usage example (pseudocode in comments)
-# ============================================================================
-
-"""
-In train_eval_utils.py:
-
-from velocity_metrics import VelocityMetrics, motions_to_true_vel
-
-def eval_epoch_with_velocity(model, dataloader, criterion, device,
-                              input_frames, epoch, split_name):
-    model.eval()
-    vm = VelocityMetrics()
-    running_loss = 0.0
-
-    with torch.no_grad():
-        for seq, _, motions in dataloader:      # dataset with return_motion=True
-            seq     = seq.to(device)
-            motions = motions.to(device)        # (B, T_seq, N, 2)
-
-            inp = seq[:, :input_frames]
-            tgt = seq[:, input_frames:]
-
-            # Always pass target_seq so decoder velocities are aligned with GT
-            out, est_vel = model(
-                inp,
-                pred_len=tgt.size(1),
-                teacher_forcing_ratio=1.0,     # required for decoder vel accuracy
-                target_seq=tgt,
-                return_velocity=True
-            )
-            # est_vel : (B, T_in-1+pred_len, K, 2)
-
-            true_vel = motions_to_true_vel(motions, est_vel.size(1))
-            vm.update(est_vel, true_vel.to(est_vel.device))
-
-            loss = criterion(out, tgt)
-            running_loss += loss.item() * seq.size(0)
-
-    vm.report(title=f"Velocity Report — {split_name} epoch {epoch}")
-    return running_loss / len(dataloader.dataset)
-"""

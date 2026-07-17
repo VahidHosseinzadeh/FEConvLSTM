@@ -151,10 +151,7 @@ def log_sequence_predictions_new(
 
 def log_state_evolution(
     h_states,
-    frames=None,
     gt_frames=None,
-    pred_vel=None,
-    gt_vel=None,
     split_name="train",
     num_samples=3,
     subsample_t=1,
@@ -162,25 +159,14 @@ def log_state_evolution(
 ):
     """
     Visualise the per-slot channel-mean h maps over time — the exact
-    h.mean(dim=2) reduction Seq2SeqMEConvLSTM._track_velocities correlates
+    h.mean(dim=2) reduction Seq2SeqMEConvLSTM.track_velocities correlates
     against, so this shows what the velocity tracker actually sees — for a
-    handful of random samples, with the frame the cell actually consumed
-    and the true frame directly below for comparison, plus predicted vs.
-    ground-truth velocity annotated per column.
+    handful of random samples, with the true frame directly below for
+    comparison.
 
     h_states   : (B, T, K, H, W), states["h"] from model(..., return_states=True).
-    frames     : (B, T, C, H, W), states["frames"] — the frame the cell
-        actually consumed at each step (its own prediction in the decoder,
-        unless teacher forcing kicked in).
     gt_frames  : (B, T, C, H, W), the true frame at each step, e.g.
-        torch.cat([input_seq, target_seq], dim=1) — what *should* be there,
-        for comparison against `frames` (most informative in the decoder,
-        where the two can diverge).
-    pred_vel, gt_vel : (B, T-1, K, 2) — estimated vs. true velocity.
-        pred_vel[:, i] / gt_vel[:, i] is the velocity used to produce
-        h_states[:, i+1] (h_states[:, 0] has no associated velocity: h=0
-        there and v is fixed to zero by convention). gt_vel is typically
-        motions_to_true_vel(dataset_motions, pred_vel.size(1)).
+        torch.cat([input_seq, target_seq], dim=1).
     input_frames : if given, decoder timesteps (t >= input_frames) are
         labelled in a different colour to mark the encoder/decoder boundary.
     """
@@ -189,21 +175,14 @@ def log_state_evolution(
     indices = np.random.choice(B, num_samples, replace=False)
 
     T_shown = max(1, T // subsample_t)
-    has_frames = frames is not None
     has_gt_frames = gt_frames is not None
-    has_vel = pred_vel is not None and gt_vel is not None
 
-    rows = K + int(has_frames) + int(has_gt_frames)
-    frame_row = K
-    gt_row = K + int(has_frames)
-    bottom_row = rows - 1
+    rows = K + int(has_gt_frames)
+    gt_row = K
 
     for idx in indices:
         h_sample = h_states[idx].detach().cpu()   # (T, K, H, W)
-        frame_sample = frames[idx].detach().cpu() if has_frames else None      # (T, C, H, W)
         gt_sample = gt_frames[idx].detach().cpu() if has_gt_frames else None   # (T, C, H, W)
-        pv = pred_vel[idx].detach().cpu() if has_vel else None   # (T-1, K, 2)
-        gv = gt_vel[idx].detach().cpu() if has_vel else None     # (T-1, N, 2)
 
         fig, axes = plt.subplots(
             rows, T_shown,
@@ -223,12 +202,6 @@ def log_state_evolution(
                 axes[k, tt].imshow(v, cmap="coolwarm", vmin=-vmax, vmax=vmax)
                 axes[k, tt].axis("off")
 
-            if has_frames:
-                axes[frame_row, tt].imshow(
-                    frame_sample[t].mean(dim=0), cmap="gray", vmin=0, vmax=1
-                )
-                axes[frame_row, tt].axis("off")
-
             if has_gt_frames:
                 axes[gt_row, tt].imshow(
                     gt_sample[t].mean(dim=0), cmap="gray", vmin=0, vmax=1
@@ -237,27 +210,10 @@ def log_state_evolution(
 
             axes[0, tt].set_title(f"t={t}", fontsize=8, color=title_color)
 
-            # pv/gv only cover steps where the tracker actually ran; in pure
-            # inference (target_seq=None) the decoder freezes v_last and
-            # isn't appended, so pv can be shorter than h_states — skip
-            # columns beyond what's available rather than index out of range.
-            if has_vel and 1 <= t <= pv.shape[0] and t - 1 < gv.shape[0]:
-                p_str = " ".join(f"({x:.0f},{y:.0f})" for x, y in pv[t - 1].tolist())
-                g_str = " ".join(f"({x:.0f},{y:.0f})" for x, y in gv[t - 1].tolist())
-                axes[bottom_row, tt].text(
-                    0.5, -0.4, f"p:{p_str}\ng:{g_str}",
-                    transform=axes[bottom_row, tt].transAxes,
-                    ha="center", va="top", fontsize=5.5,
-                )
-
         for k in range(K):
             axes[k, 0].text(-0.4, 0.5, f"h slot{k}", rotation=90,
                              va="center", ha="center", fontsize=8,
                              transform=axes[k, 0].transAxes)
-        if has_frames:
-            axes[frame_row, 0].text(-0.4, 0.5, "frame\n(used)", rotation=90,
-                                     va="center", ha="center", fontsize=7,
-                                     transform=axes[frame_row, 0].transAxes)
         if has_gt_frames:
             axes[gt_row, 0].text(-0.4, 0.5, "frame\n(GT)", rotation=90,
                                   va="center", ha="center", fontsize=7,
@@ -266,9 +222,49 @@ def log_state_evolution(
         title = f"{split_name} h evolution — sample {idx}"
         if input_frames is not None:
             title += " (red titles = decoder)"
-        if has_vel:
-            title += "  |  p=predicted vel, g=GT vel, per slot/digit in order"
         fig.suptitle(title, fontsize=10)
 
         wandb.log({f"{split_name}_states_sample{idx}": wandb.Image(fig)})
         plt.close(fig)
+
+
+def log_velocity_report(summary, split_name="train", epoch=None):
+    """
+    Log a VelocityMetrics.summary() dict to wandb: a per-timestep table
+    (accuracy/mean-L2/correct/total, one row per t) plus overall/encoder/
+    decoder/last-step scalars. The scalars are logged under a stable key
+    each call, so wandb charts them as a trend across calls (epochs) rather
+    than needing a hand-built "accuracy per epoch" table.
+
+    summary : dict from VelocityMetrics.summary(), or None (no-op if so —
+        summary() returns None when nothing has been recorded yet).
+    epoch   : if given, included in the logged dict so points align with
+        the "epoch" x-axis already used elsewhere (e.g. train.py's
+        train_loss/val_loss logging).
+    """
+    if summary is None:
+        return
+
+    table = wandb.Table(columns=["t", "acc_pct", "mean_l2", "correct", "total"])
+    for t in range(summary["T"]):
+        table.add_data(
+            t + 1,
+            summary["per_t_acc"][t],
+            summary["per_t_l2"][t],
+            summary["per_t_correct"][t],
+            summary["per_t_total"][t],
+        )
+
+    log_dict = {
+        f"{split_name}_vel_table"       : table,
+        f"{split_name}_vel_overall_acc" : summary["overall_acc"],
+        f"{split_name}_vel_overall_l2"  : summary["overall_l2"],
+        f"{split_name}_vel_encoder_acc" : summary["encoder_acc"],
+        f"{split_name}_vel_decoder_acc" : summary["decoder_acc"],
+        f"{split_name}_vel_last_step_acc": summary["last_step_acc"],
+        f"{split_name}_vel_last_step_l2" : summary["last_step_l2"],
+    }
+    if epoch is not None:
+        log_dict["epoch"] = epoch
+
+    wandb.log(log_dict)

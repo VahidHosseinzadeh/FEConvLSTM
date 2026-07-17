@@ -174,12 +174,12 @@ class Seq2SeqMEConvLSTM(nn.Module):
     # Velocity helpers
     # ------------------------------------------------------------------
 
-    def _bootstrap_velocities(self, x0, x1):
+    def bootstrap_velocities(self, x0, x1):
         """K peaks from raw frame pair. Called once: encoder t=1."""
         v, _ = self.phase_corr_bootstrap(x0, x1)
         return v   # (B, K, 2)
 
-    def _track_velocities(self, h, frame):
+    def track_velocities(self, h, frame):
         """
         Per-slot self-tracking: correlate each slot's h against frame.
         All B*K pairs in one batched call.
@@ -200,7 +200,7 @@ class Seq2SeqMEConvLSTM(nn.Module):
             v_flat, _ = self.phase_corr_track(h_tmpl, f_rep)
         return v_flat.squeeze(1).reshape(B, K, 2)
 
-    def _pool_slots(self, h):
+    def pool_slots(self, h):
         """h : (B, K, Ch, H, W) -> (B, Ch, H, W)"""
         if self.slot_reduce == 'mean':
             return h.mean(dim=1)
@@ -216,7 +216,6 @@ class Seq2SeqMEConvLSTM(nn.Module):
     def forward(self,
                 input_seq,
                 pred_len,
-                teacher_forcing_ratio=0.0,
                 target_seq=None,
                 return_velocity=False,
                 return_states=False):
@@ -226,15 +225,10 @@ class Seq2SeqMEConvLSTM(nn.Module):
         teacher_forcing_ratio : float in [0, 1]
         target_seq : (B, pred_len, C, H, W) or None
         return_states : if True, also return the per-timestep channel-mean
-            h/c maps (the exact h.mean(dim=2)/c.mean(dim=2) reduction
-            _track_velocities correlates against), one entry per encoder
-            *and* decoder step, stacked to (B, T_in + pred_len, K, H, W),
-            plus "frames": the actual frame consumed by the cell at each of
-            those steps (input_seq[:, t] for encoder steps; whichever frame
-            teacher forcing selected for decoder steps), stacked to
-            (B, T_in + pred_len, C, H, W) — so states["frames"][:, t] is
-            exactly what produced states["h"][:, t] / states["c"][:, t].
-            For inspection/logging only — detached, no effect on training.
+            h map (the exact h.mean(dim=2) reduction track_velocities
+            correlates against), one entry per encoder *and* decoder step,
+            stacked to (B, T_in + pred_len, K, H, W). For inspection/logging
+            only — detached, no effect on training.
         """
         if not self.batch_first:
             input_seq = input_seq.permute(1, 0, 2, 3, 4)
@@ -247,7 +241,7 @@ class Seq2SeqMEConvLSTM(nn.Module):
         # ---- Encoder ------------------------------------------------
         # v_last = torch.zeros(B, K, 2, device=input_seq.device, dtype=input_seq.dtype)
         estimated_velocities = []
-        h_states, c_states, frame_states = ([], [], []) if return_states else (None, None, None)
+        h_states = [] if return_states else None
 
         for t in range(T_in):
 
@@ -258,11 +252,11 @@ class Seq2SeqMEConvLSTM(nn.Module):
 
             elif t == 1:
                 # First non-zero h. Bootstrap from (X_0, X_1).
-                v = self._bootstrap_velocities(input_seq[:, 0], input_seq[:, 1])
+                v = self.bootstrap_velocities(input_seq[:, 0], input_seq[:, 1])
 
             else:
                 # Slot self-tracking. X_t consumed exactly once.
-                v = self._track_velocities(h, input_seq[:, t])
+                v = self.track_velocities(h, input_seq[:, t])
 
             h, c   = self.cell(input_seq[:, t], h, c, v)
             v_last = v
@@ -272,64 +266,31 @@ class Seq2SeqMEConvLSTM(nn.Module):
 
             if return_states:
                 h_states.append(h.mean(dim=2).detach())
-                c_states.append(c.mean(dim=2).detach())
-                frame_states.append(input_seq[:, t].detach())
 
         # ---- Decoder ------------------------------------------------
         prev_frame = input_seq[:, -1]
         outputs    = []
 
         for t in range(pred_len):
+            current_frame = prev_frame.detach()  
 
-            if target_seq is not None:
-                # ---------------------------------------------------------
-                # Training / scheduled sampling.
-                #
-                # Velocity: track(h, target_seq[:, t])
-                #   h was built up to time T_in + t - 1.
-                #   target_seq[:, t] is the true next frame.
-                #   → "where in the GT next frame did each slot go?"
-                #   → accurate velocity, no circular dependency.
-                #
-                # Cell input: teacher forcing decides.
-                #   The cell input does NOT need to be the velocity frame.
-                #   ratio=1 → cell sees GT (stable training signal)
-                #   ratio=0 → cell sees own prediction (closer to inference)
-                # ---------------------------------------------------------
-                v = self._track_velocities(h, target_seq[:, t])
-
-                # Save decoder velocity estimate
-                estimated_velocities.append(v.clone().detach()) 
-
-                if (self.training and
-                        torch.rand(1).item() < teacher_forcing_ratio):
-                    current_frame = target_seq[:, t]
-                else:
-                    current_frame = prev_frame.detach()
-
+            if target_seq is None:
+                v = v_last
             else:
-                # ---------------------------------------------------------
-                # Inference: no target_seq.
-                # Freeze v_last — the last encoder velocity.
-                # Tracking against own predictions reintroduces circular
-                # dependency (corrupted h vs corrupted prediction → bad v).
-                # For constant-velocity data this is exact. For time-varying
-                # motion over the horizon, no better option exists.
-                # ---------------------------------------------------------
-                v             = v_last
-                current_frame = prev_frame.detach()
+                v = self.track_velocities(h, target_seq[:, t])
+                estimated_velocities.append(v.clone().detach()) 
+               
 
-            if return_states:
-                frame_states.append(current_frame.detach())
+
 
             h, c  = self.cell(current_frame, h, c, v)
-            pred  = self.decoder(self._pool_slots(h))
+            pred  = self.decoder(self.pool_slots(h))
             outputs.append(pred)
             prev_frame = pred
 
+                
             if return_states:
                 h_states.append(h.mean(dim=2).detach())
-                c_states.append(c.mean(dim=2).detach())
 
         outputs = torch.stack(outputs, dim=1)
 
@@ -340,9 +301,7 @@ class Seq2SeqMEConvLSTM(nn.Module):
 
         if return_states:
             result.append({
-                "h": torch.stack(h_states, dim=1),        # (B, T_in+pred_len, K, H, W)
-                "c": torch.stack(c_states, dim=1),
-                "frames": torch.stack(frame_states, dim=1),  # (B, T_in+pred_len, C, H, W)
+                "h": torch.stack(h_states, dim=1),  # (B, T_in+pred_len, K, H, W)
             })
 
         if len(result) == 1:

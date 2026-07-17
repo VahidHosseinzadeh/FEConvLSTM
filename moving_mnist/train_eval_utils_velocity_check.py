@@ -3,8 +3,8 @@ from tqdm import tqdm
 import numpy as np
 from torch.utils.data import DataLoader
 from moving_mnist_dataset import FixedVelocityMovingMNIST
-from visualization import log_sequence_predictions, log_sequence_predictions_new, log_state_evolution
-from velocity_metrics import VelocityMetrics, motions_to_true_vel
+from visualization import log_sequence_predictions, log_sequence_predictions_new, log_state_evolution, log_velocity_report
+from velocity_metrics import VelocityMetrics
 
 
 
@@ -16,8 +16,8 @@ def train_epoch_velocity_check(
     criterion,
     device,
     input_frames,
-    teacher_forcing_ratio,
-    grad_clip=None,
+    teacher_forcing_ratio,  # unused: Seq2SeqMEConvLSTM has no teacher forcing.
+    grad_clip=None,         # kept so train.py's shared train_fn(...) call matches train_epoch's signature.
 ):
 
     model.train()
@@ -43,7 +43,6 @@ def train_epoch_velocity_check(
             output_seq, pred_motion, states = model(
                 input_seq,
                 pred_len=pred_len,
-                teacher_forcing_ratio=teacher_forcing_ratio,
                 target_seq=target_seq,
                 return_velocity=True,
                 return_states=True,
@@ -52,7 +51,6 @@ def train_epoch_velocity_check(
             output_seq, pred_motion = model(
                 input_seq,
                 pred_len=pred_len,
-                teacher_forcing_ratio=teacher_forcing_ratio,
                 target_seq=target_seq,
                 return_velocity=True,
             )
@@ -81,15 +79,13 @@ def train_epoch_velocity_check(
             )
             log_state_evolution(
                 states["h"],
-                frames=states["frames"],
                 gt_frames=torch.cat([input_seq, target_seq], dim=1),
-                pred_vel=pred_motion,
-                gt_vel=motions_to_true_vel(gt_motion, pred_motion.size(1)),
                 split_name="train",
                 input_frames=input_frames,
             )
 
     velocity_metrics.report("Training Velocity")
+    log_velocity_report(velocity_metrics.summary(), split_name="train")
 
     return running_loss / len(dataloader.dataset)
 
@@ -128,7 +124,6 @@ def eval_epoch_velocity_check(
                 output_seq, pred_motion, states = model(
                     input_seq,
                     pred_len=pred_len,
-                    teacher_forcing_ratio=0.0,
                     target_seq=target_seq,
                     return_velocity=True,
                     return_states=True,
@@ -137,7 +132,6 @@ def eval_epoch_velocity_check(
                 output_seq, pred_motion = model(
                     input_seq,
                     pred_len=pred_len,
-                    teacher_forcing_ratio=0.0,
                     target_seq=target_seq,
                     return_velocity=True,
                 )
@@ -160,15 +154,13 @@ def eval_epoch_velocity_check(
                 )
                 log_state_evolution(
                     states["h"],
-                    frames=states["frames"],
                     gt_frames=torch.cat([input_seq, target_seq], dim=1),
-                    pred_vel=pred_motion,
-                    gt_vel=motions_to_true_vel(gt_motion, pred_motion.size(1)),
                     split_name=split_name,
                     input_frames=input_frames,
                 )
 
     velocity_metrics.report(f"{split_name} Velocity")
+    log_velocity_report(velocity_metrics.summary(), split_name=split_name, epoch=epoch)
 
     return running_loss / len(dataloader.dataset)
 
@@ -214,7 +206,6 @@ def eval_len_generalization_velocity_check(
                 pred, pred_motion, states = model(
                     inp,
                     pred_len=T,
-                    teacher_forcing_ratio=0.0,
                     return_velocity=True,
                     return_states=True,
                 )
@@ -222,7 +213,6 @@ def eval_len_generalization_velocity_check(
                 pred, pred_motion = model(
                     inp,
                     pred_len=T,
-                    teacher_forcing_ratio=0.0,
                     return_velocity=True,
                 )
 
@@ -248,10 +238,7 @@ def eval_len_generalization_velocity_check(
                 )
                 log_state_evolution(
                     states["h"],
-                    frames=states["frames"],
                     gt_frames=torch.cat([inp, tgt], dim=1),
-                    pred_vel=pred_motion,
-                    gt_vel=motions_to_true_vel(gt_motion, pred_motion.size(1)),
                     split_name="len_gen",
                     subsample_t=subsample_t,
                     input_frames=input_frames,
@@ -267,6 +254,7 @@ def eval_len_generalization_velocity_check(
             pbar.set_postfix({"loss": per_ex_t.mean().item()})
 
     velocity_metrics.report("Length Generalization Velocity")
+    log_velocity_report(velocity_metrics.summary(), split_name="len_gen")
 
     mean = sum_err / n_sequences
     var = sum_err2 / n_sequences - mean ** 2
