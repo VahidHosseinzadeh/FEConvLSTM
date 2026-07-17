@@ -100,15 +100,18 @@ class Seq2SeqMEConvLSTM(nn.Module):
 
     Velocity vs cell-input: two different frames, two different roles
     -----------------------------------------------------------------
+    These must be kept separate or the decoder produces v≈0 at t=0:
+
         velocity frame  : "where did h move TO?" → needs the NEXT frame
         cell input frame: "what new observation do I update h with?"
+                          → teacher forcing controls this
 
-    The one pairing that must NEVER happen is using input_seq[:, -1] for
-    the velocity frame at decoder t=0: h was just built from that exact
-    frame in the encoder, so track(h, input_seq[:, -1]) ≈ 0 (template vs
-    itself) — the same zero-velocity bug as encoder t=0. Using
-    target_seq[:, 0] for both roles is fine: it is the NEXT frame, not
-    the one h was built from.
+    If you use current_frame for both (as in a naive implementation),
+    then at decoder t=0 with no teacher forcing:
+        current_frame = input_seq[:, -1]   (last encoder frame)
+        h was just built from input_seq[:, -1] in the encoder
+        → track(h, input_seq[:, -1]) ≈ 0   (template vs itself)
+    This is the same zero-velocity bug as encoder t=0.
 
     Decoder protocol (training, target_seq available)
     --------------------------------------------------
@@ -117,17 +120,10 @@ class Seq2SeqMEConvLSTM(nn.Module):
         - no assignment problem: each slot queries its own h^k
         - target_seq[:, t] is the true next frame → accurate velocity
 
-    cell input:
-        t == 0 : target_seq[:, 0] — the first decoder step is exactly an
-            encoder step on the first target frame (v = track(h, X_next);
-            h = cell(X_next, warp(h, v))). The alternative — re-feeding
-            input_seq[:, -1] — consumes that frame twice and sits one step
-            behind where v just warped h/c to, which showed up as a
-            one-frame lag in the generated sequence. Note the cell sees
-            the frame the t=0 loss compares against (mild reconstruction
-            shortcut), confined to this single step.
-        t >= 1 : own previous prediction (or GT under optional stochastic
-            teacher forcing, if teacher_forcing_ratio > 0 during training).
+    cell input is controlled by teacher forcing:
+        - ratio=1.0 → cell sees GT frame  (fast, stable training)
+        - ratio=0.0 → cell sees own prediction (harder, closer to inference)
+        - both get the same accurate velocity from GT
 
     Decoder protocol (inference, target_seq is None)
     -------------------------------------------------
@@ -136,9 +132,6 @@ class Seq2SeqMEConvLSTM(nn.Module):
     Correct choice: freeze v_last (last encoder velocity).
     For constant-velocity data (Moving MNIST) this is exact.
     For time-varying velocities, no better option exists without GT.
-    Cell input is input_seq[:, -1] at t=0 (no true next frame to feed —
-    a small train/inference mismatch at that single step, accepted for
-    now) and own predictions after.
     """
 
     def __init__(self,
@@ -308,14 +301,7 @@ class Seq2SeqMEConvLSTM(nn.Module):
                 # Save decoder velocity estimate
                 estimated_velocities.append(v.clone().detach()) 
 
-                if t == 0:
-                    # First decoder step = an encoder step on the first
-                    # target frame: v was tracked against target_seq[:, 0],
-                    # so feed that same frame — aligned with where h/c were
-                    # just warped to — instead of re-feeding input_seq[:, -1]
-                    # (already consumed by the encoder, one step behind).
-                    current_frame = target_seq[:, 0]
-                elif (self.training and
+                if (self.training and
                         torch.rand(1).item() < teacher_forcing_ratio):
                     current_frame = target_seq[:, t]
                 else:
