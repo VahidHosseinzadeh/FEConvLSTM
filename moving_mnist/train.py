@@ -92,6 +92,9 @@ def main():
     parser.add_argument('--teacher_forcing_ratio', type=float, default=0.0, help='Probability of using teacher forcing during training (0.0-1.0)')
     parser.add_argument('--image_size', type=int, default=28)
     parser.add_argument('--v_range', type=int, default=2)
+    parser.add_argument('--pool_type', type=str, default='max', choices=['max', 'mean', 'sum', 'softmax'], help="FE model reduction over velocity channels ('softmax' = temperature-weighted soft max)")
+    parser.add_argument('--pool_temperature', type=float, default=1.0, help="Temperature for --pool_type softmax (higher = closer to max, lower = closer to mean)")
+    parser.add_argument('--velocity_mixing', action='store_true', help='FE model: learnable 3x3 mixing over the velocity lattice each step (lets state hop to neighboring-velocity channels)')
     parser.add_argument('--num_vel_modes', type=int, default=2, help='Number of velocity modes for MEConvLSTM')
     parser.add_argument('--data_v_range', type=int, default=2)
     parser.add_argument('--gen_seq_len', type=int, default=40, help='Sequence length used **only** for length‑generalization evaluation (must be > seq_len)')
@@ -355,7 +358,9 @@ def main():
                 hidden_channels=args.hidden_size,
                 kernel_size=args.kernel_size,
                 v_range=args.v_range,
-                pool_type='max',
+                pool_type=args.pool_type,
+                pool_temperature=args.pool_temperature,
+                velocity_mixing=args.velocity_mixing,
                 decoder_conv_layers=args.decoder_conv_layers
             ).to(device)
     elif args.model == "lstm":
@@ -365,7 +370,9 @@ def main():
                 hidden_channels=args.hidden_size,
                 kernel_size=args.kernel_size,
                 v_range=0,
-                pool_type='max',
+                pool_type=args.pool_type,
+                pool_temperature=args.pool_temperature,
+                velocity_mixing=args.velocity_mixing,
                 decoder_conv_layers=args.decoder_conv_layers
             ).to(device)
     elif args.model == "melstm":
