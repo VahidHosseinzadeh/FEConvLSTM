@@ -1,4 +1,5 @@
 import argparse
+import json
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, random_split, Subset
@@ -13,7 +14,7 @@ import numpy as np
 import random
 import time
 import os
-from train_eval_utils import train_epoch, eval_epoch, eval_len_generalization, eval_velocity_generalization
+from train_eval_utils import train_epoch, eval_epoch, eval_len_generalization, eval_velocity_generalization, ValCurveRecorder
 from velocity_metrics import VelocityMetrics
 
 class MSEPlusL1Loss(nn.Module):
@@ -66,6 +67,47 @@ def log_length_generalization_curve(gen_mean, gen_std, gen_pred_frames, args):
     })
 
 
+def save_len_gen_results(path, gen_mean, gen_std, details, args, epoch):
+    """
+    Persist one run's length-generalization results as .npz so
+    plot_len_gen_comparison.py can combine several runs (models) into one
+    figure with paired per-sequence statistics and qualitative strips.
+    """
+    run = wandb.run
+    payload = dict(
+        mean=gen_mean,
+        std=gen_std,
+        model=args.model,
+        hidden_size=args.hidden_size,
+        gen_input_frames=args.gen_input_frames,
+        gen_seq_len=args.gen_seq_len,
+        train_input_frames=args.input_frames,
+        train_pred_frames=args.seq_len - args.input_frames,
+        epoch=epoch,
+        run_id=str(run.id) if run is not None else "none",
+    )
+    # per_seq_err, per_seq_err_copy_last, strip_*, and (with motion data)
+    # boundary_age all come straight from eval_len_generalization.
+    payload.update(details)
+    np.savez_compressed(path, **payload)
+    print(f"Saved length-generalization results to {path}")
+
+
+def save_vel_gen_results(path, vx, vy, err, args):
+    """Persist the velocity-generalization error grid for offline comparison
+    (plot_vel_gen_comparison.py)."""
+    run = wandb.run
+    np.savez_compressed(
+        path,
+        vx=vx, vy=vy, err=err,
+        model=args.model,
+        hidden_size=args.hidden_size,
+        data_v_range=args.data_v_range,
+        run_id=str(run.id) if run is not None else "none",
+    )
+    print(f"Saved velocity-generalization results to {path}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Train & evaluate RNN models on Moving MNIST")
     parser.add_argument('--root', type=str, default='./data')
@@ -109,6 +151,8 @@ def main():
     parser.add_argument('--wandb_dir', type=str, default='./tmp/', help='Wandb directory')
     parser.add_argument('--wandb_name', type=str, default=None, help='Wandb name')
     parser.add_argument("--check_velocity_predictor",action="store_true",help="Debug the velocity predictor during training/evaluation.")
+    parser.add_argument('--val_curve_interval', type=int, default=25, help='Record validation loss every N training batches for the loss-vs-steps curve (0 = off)')
+    parser.add_argument('--val_curve_size', type=int, default=256, help='Number of fixed validation sequences used for the loss-vs-steps curve')
     args = parser.parse_args()
 
     # --check_velocity_predictor only makes the datasets return motion
@@ -421,8 +465,12 @@ def main():
 
         print("Running length generalization test...")
         gen_test_dataset.reset_rng()   # identical benchmark set every evaluation
-        gen_mean, gen_std = len_gen_fn(model, gen_test_loader, device, args.gen_input_frames, subsample_t=2)
+        gen_mean, gen_std, gen_details = len_gen_fn(model, gen_test_loader, device, args.gen_input_frames, subsample_t=2)
         print(f"Length generalization mean MSE: {gen_mean.mean():.4f}")
+        save_len_gen_results(
+            os.path.join(args.model_save_dir, f"len_gen_{args.model}_{wandb.run.id}.npz"),
+            gen_mean, gen_std, gen_details, args, epoch=0,
+        )
 
         wandb.log({f"len_gen_mean_t{t+1}": gen_mean[t] for t in range(len(gen_mean))})
         wandb.log({f"len_gen_std_t{t+1}":  gen_std[t]  for t in range(len(gen_std))})
@@ -432,6 +480,10 @@ def main():
         if args.run_velocity_generalization:
             print("Running velocity generalization test...")
             vx, vy, err = eval_velocity_generalization(model, device, args)
+            save_vel_gen_results(
+                os.path.join(args.model_save_dir, f"vel_gen_{args.model}_{wandb.run.id}.npz"),
+                vx, vy, err, args,
+            )
             print("Velocity generalization results:")
             for i, vx_i in enumerate(vx):
                 for j, vy_j in enumerate(vy):
@@ -469,16 +521,39 @@ def main():
             patience=args.lr_patience, min_lr=args.lr_min,
         )
 
+    # Fine-grained loss-vs-training-batches curves (fixed val subset,
+    # materialized once — see ValCurveRecorder)
+    curve_recorder = None
+    if args.val_curve_interval > 0:
+        print(f"Materializing {args.val_curve_size} fixed val sequences for the loss curve...")
+        curve_recorder = ValCurveRecorder(
+            val_ds, args.val_curve_size, args.val_curve_interval,
+            args.input_frames, device,
+        )
+
+    history_path = os.path.join(args.model_save_dir, f"history_{args.model}_{wandb.run.id}.json")
+
+    def dump_history(history):
+        payload = {"config": vars(args), "history": history}
+        if curve_recorder is not None:
+            payload.update(curve_recorder.as_dict())
+        with open(history_path, "w") as f:
+            json.dump(payload, f, indent=2)
+
     # Training loop
-    history = {'train_loss': [], 'val_loss': [], 'test_loss': []}
+    history = {'train_loss': [], 'val_loss': [], 'test_loss': [], 'epoch_time_sec': []}
     best_val_losses = float('inf')
-    
+
     for epoch in range(1, args.epochs + 1):
-        train_loss = train_fn(model, train_loader, optimizer, criterion, device, args.input_frames, args.grad_clip)
+        epoch_start = time.time()
+        train_loss = train_fn(model, train_loader, optimizer, criterion, device, args.input_frames, args.grad_clip,
+                              curve_recorder=curve_recorder)
+        epoch_time = time.time() - epoch_start
         val_loss = eval_fn(model, val_loader, criterion, device, args.input_frames, epoch, split_name="val")
         history['train_loss'].append(train_loss)
         history['val_loss'].append(val_loss)
-        print(f"Epoch {epoch}/{args.epochs} | {args.model:^8} | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f}")
+        history['epoch_time_sec'].append(epoch_time)
+        print(f"Epoch {epoch}/{args.epochs} | {args.model:^8} | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | {epoch_time:.1f}s")
 
         if scheduler is not None:
             lr_before = optimizer.param_groups[0]['lr']
@@ -492,8 +567,12 @@ def main():
             "train_loss": train_loss,
             "val_loss": val_loss,
             "lr": optimizer.param_groups[0]['lr'],
+            "epoch_time_sec": epoch_time,
             "epoch": epoch
         })
+
+        # Persist curves incrementally so a killed run still leaves data
+        dump_history(history)
         
         # Save model if it's the best so far
         if val_loss < best_val_losses:
@@ -511,7 +590,11 @@ def main():
             print(f"Test Loss: {test_loss:.4f}")
 
             gen_test_dataset.reset_rng()   # identical benchmark set every evaluation
-            gen_mean, gen_std = len_gen_fn(model, gen_test_loader, device, args.gen_input_frames)
+            gen_mean, gen_std, gen_details = len_gen_fn(model, gen_test_loader, device, args.gen_input_frames)
+            save_len_gen_results(
+                os.path.join(args.model_save_dir, f"len_gen_{args.model}_{wandb.run.id}.npz"),
+                gen_mean, gen_std, gen_details, args, epoch=epoch,
+            )
 
             wandb.log({f"len_gen_mean_t{t+1}": gen_mean[t] for t in range(len(gen_mean))})
             wandb.log({f"len_gen_std_t{t+1}":  gen_std[t]  for t in range(len(gen_std))})
@@ -520,6 +603,10 @@ def main():
             
             if args.run_velocity_generalization:
                 vx, vy, err = eval_velocity_generalization(model, device, args)
+                save_vel_gen_results(
+                    os.path.join(args.model_save_dir, f"vel_gen_{args.model}_{wandb.run.id}.npz"),
+                    vx, vy, err, args,
+                )
 
                 wandb.log({f"vel_gen_err_vx{vx_i}_vy{vy_j}": err[j, i]
                         for i, vx_i in enumerate(vx)
@@ -543,6 +630,10 @@ def main():
                 "test_loss": test_loss,
                 "epoch": epoch
             })
+
+    # Final history dump (also written incrementally after every epoch)
+    dump_history(history)
+    print(f"Saved training history to {history_path}")
 
     # Print final best model paths and test results
     print("\nBest model paths and test results:")

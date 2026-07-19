@@ -1,4 +1,5 @@
 import torch
+import wandb
 from tqdm import tqdm
 import numpy as np
 from torch.utils.data import DataLoader
@@ -58,7 +59,78 @@ def _run_model(model, input_seq, pred_len, target_seq,
     return model(input_seq, pred_len=pred_len), None, None
 
 
-def train_epoch(model, dataloader, optimizer, criterion, device, input_frames, grad_clip=None):
+class ValCurveRecorder:
+    """
+    Fine-grained loss-vs-training-batches curves (paper-style validation
+    curve with a band), recorded during training:
+
+      - training loss of every optimizer step (free, already computed);
+      - every `interval` steps, mean/std of the per-sequence validation
+        loss on a small FIXED set of sequences.
+
+    The val set is materialized into a tensor once at construction: the
+    on-the-fly Moving MNIST datasets resample content on every access, so
+    holding indices fixed is not enough to keep the measured set fixed.
+
+    The per-sequence loss replicates train.py's MSEPlusL1Loss with default
+    weights (MSE + L1). Models are evaluated in honest inference mode
+    (no target_seq), matching eval_epoch.
+    """
+
+    def __init__(self, val_dataset, n_sequences, interval, input_frames,
+                 device, batch_size=64):
+        n = min(n_sequences, len(val_dataset))
+        self.data = torch.stack([val_dataset[i][0] for i in range(n)])
+        self.interval = interval
+        self.input_frames = input_frames
+        self.device = device
+        self.batch_size = batch_size
+        self.step = 0
+        self.train_steps, self.train_losses = [], []
+        self.val_steps, self.val_means, self.val_stds = [], [], []
+
+    @torch.no_grad()
+    def _val_loss(self, model):
+        was_training = model.training
+        model.eval()
+        per_seq = []
+        for s in range(0, self.data.size(0), self.batch_size):
+            seq = self.data[s:s + self.batch_size].to(self.device)
+            inp = seq[:, :self.input_frames]
+            tgt = seq[:, self.input_frames:]
+            pred, _, _ = _run_model(model, inp, tgt.size(1), None, False, False)
+            d = pred - tgt
+            per_seq.append((d.pow(2).mean(dim=(1, 2, 3, 4))
+                            + d.abs().mean(dim=(1, 2, 3, 4))).cpu())
+        if was_training:
+            model.train()
+        per_seq = torch.cat(per_seq)
+        return per_seq.mean().item(), per_seq.std().item()
+
+    def on_batch(self, model, train_loss):
+        self.step += 1
+        self.train_steps.append(self.step)
+        self.train_losses.append(float(train_loss))
+        if self.interval > 0 and self.step % self.interval == 0:
+            m, s = self._val_loss(model)
+            self.val_steps.append(self.step)
+            self.val_means.append(m)
+            self.val_stds.append(s)
+            wandb.log({"val_curve_loss": m, "val_curve_std": s,
+                       "global_batch": self.step})
+
+    def as_dict(self):
+        return {
+            "train_curve": {"step": self.train_steps,
+                            "loss": self.train_losses},
+            "val_curve": {"step": self.val_steps,
+                          "loss_mean": self.val_means,
+                          "loss_std": self.val_stds},
+        }
+
+
+def train_epoch(model, dataloader, optimizer, criterion, device, input_frames, grad_clip=None,
+                curve_recorder=None):
     model.train()
     running_loss = 0.0
     velocity_metrics = VelocityMetrics()
@@ -94,6 +166,9 @@ def train_epoch(model, dataloader, optimizer, criterion, device, input_frames, g
         batch_loss = loss.item()
         running_loss += batch_loss * seq.size(0)
         pbar.set_postfix({"loss": f"{batch_loss:.4f}"})
+
+        if curve_recorder is not None:
+            curve_recorder.on_batch(model, batch_loss)
 
         if i == 0:
             log_sequence_predictions(input_seq, target_seq, output_seq, split_name="train")
@@ -161,24 +236,58 @@ def eval_epoch(model, dataloader, criterion, device, input_frames, epoch, split_
     return running_loss / len(dataloader.dataset)
 
 
-def eval_len_generalization(model, dataloader, device, input_frames, subsample_t=1):
+def eval_len_generalization(model, dataloader, device, input_frames, subsample_t=1,
+                            n_strip_sequences=3):
     """
     Returns:
         mean_err  – numpy array [T]  (MSE at each future step, averaged over test set)
         std_err   – numpy array [T]  (sample‑wise std at each step)
+        details   – dict for offline comparison plots (plot_len_gen_comparison.py):
+            per_seq_err : numpy [N, T]  full per-sequence per-step MSE matrix —
+                enables paired cross-model statistics on a fixed benchmark set
+            per_seq_err_copy_last : numpy [N, T]  same matrix for the
+                copy-last-context-frame baseline (model-free reference line)
+            strip_input / strip_gt / strip_pred : numpy frames of the first
+                n_strip_sequences benchmark sequences, for qualitative strips
+            boundary_age : numpy [N, n_digits], only when the dataset returns
+                motion — frames between each digit's last velocity change and
+                the context/prediction boundary (evidence available to lock
+                onto the frozen velocity). Enables binning decoder error by
+                adaptation time offline.
     """
     model.eval()
     velocity_metrics = VelocityMetrics()
     has_velocity_data = False
     first_pass = True
+    per_seq_chunks = []
+    baseline_chunks = []
+    age_chunks = []
+    strip = {}
 
     with torch.no_grad():
-        n_sequences = 0
         pbar = tqdm(dataloader, desc="Evaluating Length Generalization", leave=False)
         for batch in pbar:
             seq, gt_motion = _unpack_batch(batch, device)
             inp, tgt = seq[:, :input_frames], seq[:, input_frames:]
             T = tgt.size(1)
+
+            # Copy-last-frame baseline: repeat the final context frame.
+            baseline_chunks.append(
+                ((inp[:, -1:] - tgt) ** 2).mean(dim=(2, 3, 4)).detach().cpu()
+            )
+
+            if gt_motion is not None:
+                # Frames between each digit's last velocity change and the
+                # boundary. motions[t] is the step frame t -> t+1; with
+                # freeze_after=input_frames the frozen velocity is
+                # motions[input_frames-2], active since its last change.
+                f = input_frames
+                m = gt_motion[:, :f - 1]                     # steps 0 .. f-2
+                changed = (m[:, 1:] != m[:, :-1]).any(dim=-1)  # (B, f-2, N)
+                idx = torch.arange(1, f - 1, device=changed.device).view(1, -1, 1)
+                t_last = torch.where(changed, idx,
+                                     torch.zeros_like(idx)).amax(dim=1)  # (B, N)
+                age_chunks.append(((f - 1) - t_last).detach().cpu())
 
             is_melstm = isinstance(model, Seq2SeqMEConvLSTM)
             want_velocity = is_melstm and gt_motion is not None
@@ -195,10 +304,16 @@ def eval_len_generalization(model, dataloader, device, input_frames, subsample_t
 
             # MSE per example per timestep  →  [B, T]
             per_ex_t = ((pred - tgt) ** 2).mean(dim=(2, 3, 4))
+            per_seq_chunks.append(per_ex_t.detach().cpu())
+
             if first_pass:
-                sum_err = per_ex_t.sum(dim=0)           # [T]
-                sum_err2 = (per_ex_t ** 2).sum(dim=0)   # [T]
                 first_pass = False
+                n = n_strip_sequences
+                strip = {
+                    "strip_input": inp[:n].detach().cpu().numpy(),
+                    "strip_gt":    tgt[:n].detach().cpu().numpy(),
+                    "strip_pred":  pred[:n].detach().cpu().numpy(),
+                }
 
                 log_sequence_predictions_new(
                     inp, tgt, pred, split_name="len_gen",
@@ -212,21 +327,25 @@ def eval_len_generalization(model, dataloader, device, input_frames, subsample_t
                         subsample_t=subsample_t,
                         input_frames=input_frames,
                     )
-            else:
-                sum_err += per_ex_t.sum(dim=0)
-                sum_err2 += (per_ex_t ** 2).sum(dim=0)
 
-            n_sequences += per_ex_t.size(0)
             pbar.set_postfix({"loss": per_ex_t.mean().item()})
 
     if has_velocity_data:
         velocity_metrics.report("Length Generalization Velocity")
         log_velocity_report(velocity_metrics.summary(), split_name="len_gen")
 
-    mean = sum_err / n_sequences
-    var = sum_err2 / n_sequences - mean ** 2
-    std = torch.sqrt(torch.clamp(var, min=0.0))
-    return mean.cpu().numpy(), std.cpu().numpy()
+    per_seq_err = torch.cat(per_seq_chunks, dim=0).numpy()   # [N, T]
+    mean = per_seq_err.mean(axis=0)
+    std = per_seq_err.std(axis=0)
+
+    details = {
+        "per_seq_err": per_seq_err,
+        "per_seq_err_copy_last": torch.cat(baseline_chunks, dim=0).numpy(),
+        **strip,
+    }
+    if age_chunks:
+        details["boundary_age"] = torch.cat(age_chunks, dim=0).numpy()
+    return mean, std, details
 
 
 def eval_velocity_generalization(model, device, args):
