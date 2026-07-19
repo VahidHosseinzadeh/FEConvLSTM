@@ -130,6 +130,7 @@ class TDMovingMNISTDataset(Dataset):
         self.random    = random
         self.max_tries = max_tries
 
+        self.seed = seed
         self.rng = np.random.RandomState(seed)
 
         # Velocity grid: all integer (vx, vy) within max_speed, zero excluded
@@ -151,6 +152,15 @@ class TDMovingMNISTDataset(Dataset):
     # ------------------------------------------------------------------
     # Dataset interface
     # ------------------------------------------------------------------
+
+    def reset_rng(self):
+        """
+        Rewind the private RandomState to its initial seed. With random=False
+        the RNG is stateful (every __getitem__ advances it), so a fixed
+        benchmark set requires resetting before each full pass — otherwise
+        successive evaluations silently see different sequences.
+        """
+        self.rng = np.random.RandomState(self.seed)
 
     def __len__(self):
         return len(self.mnist)

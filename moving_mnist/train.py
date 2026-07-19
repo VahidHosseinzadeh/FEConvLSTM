@@ -195,6 +195,7 @@ def main():
         smooth_probability=0.8,
 
         motion_difficulty=None,
+        freeze_after=args.input_frames,
 
         min_center_distance=20,
         reject_overlap=True,
@@ -230,6 +231,7 @@ def main():
         smooth_probability=0.8,
 
         motion_difficulty=None,
+        freeze_after=args.input_frames,
 
         min_center_distance=20,
         reject_overlap=True,
@@ -241,12 +243,12 @@ def main():
         transform=None,
         download=True,
 
-        random=True,
-        seed=42,
+        random=False,  # Fixed benchmark set (same idea as gen_test_dataset)
+        seed=123,      # distinct seed so test and len-gen draw different streams
 
         max_tries=300,
     )
-    
+
     gen_test_dataset = TDMovingMNISTDataset(
         root=args.root,
         train=False,
@@ -278,7 +280,7 @@ def main():
         transform=None,
         download=True,
 
-        random=False,  # Fixed sequences for length generalization
+        random=False, 
         seed=42,
         max_tries=300
     )
@@ -302,9 +304,20 @@ def main():
     )
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, **loader_kwargs)
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, **loader_kwargs)
-    test_loader = DataLoader(test_dataset, batch_size=args.batch_size, **loader_kwargs)
+    # persistent_workers=False on purpose for the two fixed benchmark sets:
+    # their seeded RNGs are stateful, and persistent workers would carry
+    # advanced RNG state into the next evaluation (different sequences per
+    # call). Non-persistent workers re-fork from the parent dataset — whose
+    # RNG is reset via reset_rng() before each evaluation — so every pass
+    # sees the identical set.
+    fixed_loader_kwargs = dict(
+        num_workers=args.num_workers,
+        pin_memory=(device.type == 'cuda'),
+        persistent_workers=False,
+    )
+    test_loader = DataLoader(test_dataset, batch_size=args.batch_size, **fixed_loader_kwargs)
     gen_test_loader = DataLoader(gen_test_dataset,
-                                batch_size=args.batch_size, **loader_kwargs)
+                                batch_size=args.batch_size, **fixed_loader_kwargs)
 
 
     print(f"Train size: {len(train_ds)}, Val size: {len(val_ds)}, Test size: {len(test_dataset)}")
@@ -397,6 +410,7 @@ def main():
     if args.evaluate_only:
         print("Running evaluation only...")
         criterion = MSEPlusL1Loss()
+        test_dataset.reset_rng()       # identical benchmark set every evaluation
         test_loss = eval_fn(model, test_loader, criterion, device, args.input_frames, 0, split_name="test")
         print(f"Test Loss: {test_loss:.4f}")
 
@@ -406,6 +420,7 @@ def main():
         })
 
         print("Running length generalization test...")
+        gen_test_dataset.reset_rng()   # identical benchmark set every evaluation
         gen_mean, gen_std = len_gen_fn(model, gen_test_loader, device, args.gen_input_frames, subsample_t=2)
         print(f"Length generalization mean MSE: {gen_mean.mean():.4f}")
 
@@ -489,11 +504,13 @@ def main():
             print(f"Saved new best model for {args.model} at {model_path}")
             
             # Evaluate on test set with best model
+            test_dataset.reset_rng()   # identical benchmark set every evaluation
             test_loss = eval_fn(model, test_loader, criterion, device, args.input_frames, epoch, split_name="test")
 
             history['test_loss'].append(test_loss)
             print(f"Test Loss: {test_loss:.4f}")
 
+            gen_test_dataset.reset_rng()   # identical benchmark set every evaluation
             gen_mean, gen_std = len_gen_fn(model, gen_test_loader, device, args.gen_input_frames)
 
             wandb.log({f"len_gen_mean_t{t+1}": gen_mean[t] for t in range(len(gen_mean))})
