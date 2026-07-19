@@ -215,12 +215,21 @@ class Seq2SeqMEConvLSTM(nn.Module):
                 input_seq,
                 pred_len,
                 target_seq=None,
+                track_decoder_velocity=True,
                 return_velocity=False,
                 return_states=False):
         """
         input_seq : (B, T_in, C, H, W),  T_in >= 2
         pred_len  : int
         target_seq : (B, pred_len, C, H, W) or None
+        track_decoder_velocity : if True (and target_seq is given), decoder
+            velocities are tracked against the true next frame each step
+            (v = track(h, target_seq[:, t])) — the training protocol, and an
+            oracle when used at evaluation. If False, the last encoder
+            velocity is frozen for the whole rollout — the deployable
+            inference behavior — regardless of whether target_seq is given
+            (so velocity metrics/losses can still be computed against a
+            target without leaking its motion into the prediction).
         """
         if not self.batch_first:
             input_seq = input_seq.permute(1, 0, 2, 3, 4)
@@ -251,7 +260,6 @@ class Seq2SeqMEConvLSTM(nn.Module):
                 v = self.track_velocities(h, input_seq[:, t])
 
             h, c   = self.cell(input_seq[:, t], h, c, v)
-            v_last = v
 
             if t > 0:
                 estimated_velocities.append(v.detach())
@@ -264,16 +272,12 @@ class Seq2SeqMEConvLSTM(nn.Module):
         outputs    = []
 
         for t in range(pred_len):
-            current_frame = prev_frame.detach()  
-            
-            if target_seq is None:
-                v = v_last
-            else: 
+            current_frame = prev_frame.detach()
+
+            if target_seq is not None and track_decoder_velocity:
                 v = self.track_velocities(h, target_seq[:, t])
-                estimated_velocities.append(v.clone().detach()) 
-               
-
-
+                estimated_velocities.append(v.clone().detach())
+            # else: v keeps the last encoder estimate (frozen rollout)
 
             h, c  = self.cell(current_frame, h, c, v)
             pred  = self.decoder(self.pool_slots(h))

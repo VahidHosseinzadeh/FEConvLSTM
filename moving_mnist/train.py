@@ -14,8 +14,6 @@ import random
 import time
 import os
 from train_eval_utils import train_epoch, eval_epoch, eval_len_generalization, eval_velocity_generalization
-
-from train_eval_utils_velocity_check import train_epoch_velocity_check, eval_epoch_velocity_check, eval_len_generalization_velocity_check
 from velocity_metrics import VelocityMetrics
 
 class MSEPlusL1Loss(nn.Module):
@@ -113,17 +111,13 @@ def main():
     parser.add_argument("--check_velocity_predictor",action="store_true",help="Debug the velocity predictor during training/evaluation.")
     args = parser.parse_args()
 
-    if args.check_velocity_predictor:
-
-        train_fn = train_epoch_velocity_check
-        eval_fn = eval_epoch_velocity_check
-        len_gen_fn = eval_len_generalization_velocity_check
-
-    else:
-
-        train_fn = train_epoch
-        eval_fn = eval_epoch
-        len_gen_fn = eval_len_generalization
+    # --check_velocity_predictor only makes the datasets return motion
+    # (return_motion=...): the shared train/eval functions detect it in the
+    # batch and add velocity metrics / state visualizations on top of the
+    # identical training procedure.
+    train_fn = train_epoch
+    eval_fn = eval_epoch
+    len_gen_fn = eval_len_generalization
 
 
     # Set seeds for reproducibility

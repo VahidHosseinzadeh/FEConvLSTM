@@ -98,6 +98,7 @@ def log_sequence_predictions_new(
     """
     T = target_seq.shape[1]
     T = T // subsample_t
+    num_samples = min(num_samples, target_seq.shape[0])
 
     # --- iterate over the first num_samples sequences ------------------------
     for idx in range(num_samples):
