@@ -9,14 +9,11 @@ class FEConvLSTMCell(nn.Module):
                  input_channels,
                  hidden_channels,
                  kernel_size=3,
-                 v_range=0,
-                 velocity_mixing=False):
+                 v_range=0):
 
         super().__init__()
 
         self.hidden_channels = hidden_channels
-        self.v_range = v_range
-        self.v_side = 2 * v_range + 1
 
         self.v_list = [
             (vx, vy)
@@ -25,25 +22,6 @@ class FEConvLSTMCell(nn.Module):
         ]
 
         self.num_v = len(self.v_list)
-
-        # Velocity-lattice mixing: each step, state may hop to a NEIGHBORING
-        # velocity channel (|dvx|<=1, |dvy|<=1). Without this, channels never
-        # communicate, so when a digit changes velocity the newly-correct
-        # channel must re-encode it from raw input. With piecewise-smooth
-        # motion (velocity steps to a lattice neighbor), a 3x3 kernel over
-        # the (vx, vy) lattice matches the data's transition prior exactly.
-        # 9 learnable logits -> softmax -> row-renormalized stochastic
-        # transition weights (convex combination: cannot blow up c). Center
-        # logit init 4.0 gives ~0.87 self-weight: ~identity at init, so the
-        # model starts as (nearly) the unmixed FELSTM and learns to open up.
-        self.velocity_mixing = velocity_mixing and self.num_v > 1
-        if self.velocity_mixing:
-            logits = torch.zeros(9)
-            logits[4] = 4.0
-            self.vel_mix_logits = nn.Parameter(logits)
-            self.register_buffer(
-                "_vel_adj", self._build_vel_adjacency(), persistent=False
-            )
 
         padding = kernel_size // 2
 
@@ -93,39 +71,6 @@ class FEConvLSTMCell(nn.Module):
             self._shift_index_cache[key] = idx
         return idx
 
-    def _build_vel_adjacency(self):
-        """
-        (num_v, num_v, 9) one-hot adjacency of the velocity lattice:
-        adj[u, v, k] = 1 iff channel v's velocity equals channel u's velocity
-        plus the k-th offset, k enumerating (dvx, dvy) in {-1,0,1}^2
-        (k = (dvx+1)*3 + (dvy+1), so k=4 is the identity tap). Edge channels
-        simply lack the out-of-range taps; mix_velocity renormalizes rows.
-        """
-        side, num_v = self.v_side, self.num_v
-        adj = torch.zeros(num_v, num_v, 9)
-        for u, (vx, vy) in enumerate(self.v_list):
-            for dvx in (-1, 0, 1):
-                for dvy in (-1, 0, 1):
-                    nvx, nvy = vx + dvx, vy + dvy
-                    if abs(nvx) <= self.v_range and abs(nvy) <= self.v_range:
-                        v = (nvx + self.v_range) * side + (nvy + self.v_range)
-                        k = (dvx + 1) * 3 + (dvy + 1)
-                        adj[u, v, k] = 1.0
-        return adj
-
-    def mix_velocity(self, x):
-        """
-        x : (B, num_v, C, H, W) -> same shape, each channel a convex
-        combination of its 3x3 velocity-lattice neighborhood.
-        """
-        w = torch.softmax(self.vel_mix_logits, dim=0)      # (9,)
-        M = (self._vel_adj * w).sum(dim=-1)                # (num_v, num_v)
-        M = M / M.sum(dim=1, keepdim=True)                 # rows sum to 1
-
-        B, num_v, C, H, W = x.shape
-        out = torch.matmul(M, x.reshape(B, num_v, -1))
-        return out.reshape(B, num_v, C, H, W)
-
     def shift_tensor(self, x):
 
         # x:
@@ -154,12 +99,6 @@ class FEConvLSTMCell(nn.Module):
         # Transport hidden and cell states
         h_shift = self.shift_tensor(h_prev)
         c_shift = self.shift_tensor(c_prev)
-
-        # Optional handoff between neighboring velocity channels (shared
-        # transition kernel for h and c: one motion prior, applied to both)
-        if self.velocity_mixing:
-            h_shift = self.mix_velocity(h_shift)
-            c_shift = self.mix_velocity(c_shift)
 
         # Expand input over velocity channels
         u_expand = (
@@ -245,17 +184,11 @@ class Seq2SeqFEConvLSTM(nn.Module):
                  kernel_size=3,
                  v_range=0,
                  pool_type='max',
-                 pool_temperature=1.0,
-                 velocity_mixing=False,
                  decoder_conv_layers=1):
 
         super().__init__()
 
         self.pool_type = pool_type
-        # Plain attribute (not a Parameter/buffer) so it can be annealed
-        # from the training loop: higher -> closer to max (selective),
-        # lower -> closer to mean (every channel gets gradient).
-        self.pool_temperature = pool_temperature
 
         self.output_channels = (
             output_channels
@@ -267,8 +200,7 @@ class Seq2SeqFEConvLSTM(nn.Module):
             input_channels=input_channels,
             hidden_channels=hidden_channels,
             kernel_size=kernel_size,
-            v_range=v_range,
-            velocity_mixing=velocity_mixing
+            v_range=v_range
         )
 
         self.hidden_channels = hidden_channels
@@ -313,16 +245,6 @@ class Seq2SeqFEConvLSTM(nn.Module):
 
         elif self.pool_type == 'sum':
             return h.sum(dim=1)
-
-        elif self.pool_type == 'softmax':
-            # Smooth, per-pixel/per-feature relaxation of max over the
-            # velocity channels: every channel receives gradient (weighted
-            # by how much it contributes) instead of max's winner-take-all,
-            # which starves the newly-correct channel whenever the true
-            # velocity changes mid-sequence. temperature -> inf recovers
-            # max; -> 0 recovers mean.
-            w = torch.softmax(self.pool_temperature * h, dim=1)
-            return (w * h).sum(dim=1)
 
         else:
             return h.max(dim=1)[0]
