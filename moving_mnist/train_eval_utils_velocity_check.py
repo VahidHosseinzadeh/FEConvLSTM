@@ -16,8 +16,7 @@ def train_epoch_velocity_check(
     criterion,
     device,
     input_frames,
-    teacher_forcing_ratio,  # unused: Seq2SeqMEConvLSTM has no teacher forcing.
-    grad_clip=None,         # kept so train.py's shared train_fn(...) call matches train_epoch's signature.
+    grad_clip=None,
 ):
 
     model.train()

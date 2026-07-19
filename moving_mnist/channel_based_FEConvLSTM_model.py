@@ -1,6 +1,5 @@
 import torch
 import torch.nn as nn
-import random
 
 
 class FEConvLSTMCell(nn.Module):
@@ -252,8 +251,6 @@ class Seq2SeqFEConvLSTM(nn.Module):
     def forward(self,
                 input_seq,
                 pred_len,
-                teacher_forcing_ratio=0.0,
-                target_seq=None,
                 return_hidden=False):
 
         B, T_in, C, H, W = input_seq.shape
@@ -307,15 +304,7 @@ class Seq2SeqFEConvLSTM(nn.Module):
         # Decoder
         for t in range(pred_len):
 
-            if (
-                self.training
-                and target_seq is not None
-                and random.random() < teacher_forcing_ratio
-            ):
-                frame = target_seq[:, t]
-
-            else:
-                frame = prev.detach()
+            frame = prev.detach()
 
             h, c = self.cell(
                 frame,

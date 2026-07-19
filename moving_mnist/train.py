@@ -89,7 +89,6 @@ def main():
     parser.add_argument('--kernel_size', type=int, default=3)
     parser.add_argument('--decoder_conv_layers', type=int, default=4)
     parser.add_argument('--max_train_samples', type=int, default=None, help='Maximum number of training samples to use (default: use all)')
-    parser.add_argument('--teacher_forcing_ratio', type=float, default=0.0, help='Probability of using teacher forcing during training (0.0-1.0)')
     parser.add_argument('--image_size', type=int, default=28)
     parser.add_argument('--v_range', type=int, default=2)
     parser.add_argument('--num_vel_modes', type=int, default=2, help='Number of velocity modes for MEConvLSTM')
@@ -332,7 +331,6 @@ def main():
     print(f"Num layers: {args.num_layers}")
     print(f"Decoder conv layers: {args.decoder_conv_layers}")
     print(f"Kernel size: {args.kernel_size}")
-    print(f"Teacher forcing ratio: {args.teacher_forcing_ratio}")
     print(f"Max train samples: {args.max_train_samples}")
     print(f"Image size: {args.image_size}")
     print(f"Velocity range: {args.v_range}")
@@ -377,6 +375,20 @@ def main():
                 slot_reduce = 'max',
                 decoder_layers = args.decoder_conv_layers
             ).to(device)
+
+    # Parameter count: printed per top-level submodule and stored in the
+    # wandb config so runs of different models are directly comparable.
+    num_params = sum(p.numel() for p in model.parameters())
+    num_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Model parameters ({args.model}): {num_params:,} total, {num_trainable:,} trainable")
+    for name, module in model.named_children():
+        sub = sum(p.numel() for p in module.parameters())
+        if sub > 0:
+            print(f"  {name:<20s} {sub:>12,}")
+    wandb.config.update(
+        {"num_parameters": num_params, "num_trainable_parameters": num_trainable},
+        allow_val_change=True,
+    )
 
     # Load model if specified
     if args.load_model is not None:
@@ -453,7 +465,7 @@ def main():
     best_val_losses = float('inf')
     
     for epoch in range(1, args.epochs + 1):
-        train_loss = train_fn(model, train_loader, optimizer, criterion, device, args.input_frames, args.teacher_forcing_ratio, args.grad_clip)
+        train_loss = train_fn(model, train_loader, optimizer, criterion, device, args.input_frames, args.grad_clip)
         val_loss = eval_fn(model, val_loader, criterion, device, args.input_frames, epoch, split_name="val")
         history['train_loss'].append(train_loss)
         history['val_loss'].append(val_loss)

@@ -104,10 +104,10 @@ class Seq2SeqMEConvLSTM(nn.Module):
 
         velocity frame  : "where did h move TO?" → needs the NEXT frame
         cell input frame: "what new observation do I update h with?"
-                          → teacher forcing controls this
+                          → always the previous frame / own prediction
 
     If you use current_frame for both (as in a naive implementation),
-    then at decoder t=0 with no teacher forcing:
+    then at decoder t=0:
         current_frame = input_seq[:, -1]   (last encoder frame)
         h was just built from input_seq[:, -1] in the encoder
         → track(h, input_seq[:, -1]) ≈ 0   (template vs itself)
@@ -120,10 +120,8 @@ class Seq2SeqMEConvLSTM(nn.Module):
         - no assignment problem: each slot queries its own h^k
         - target_seq[:, t] is the true next frame → accurate velocity
 
-    cell input is controlled by teacher forcing:
-        - ratio=1.0 → cell sees GT frame  (fast, stable training)
-        - ratio=0.0 → cell sees own prediction (harder, closer to inference)
-        - both get the same accurate velocity from GT
+    cell input is always the model's own previous prediction
+    (input_seq[:, -1] at t=0) — no teacher forcing.
 
     Decoder protocol (inference, target_seq is None)
     -------------------------------------------------
@@ -222,13 +220,7 @@ class Seq2SeqMEConvLSTM(nn.Module):
         """
         input_seq : (B, T_in, C, H, W),  T_in >= 2
         pred_len  : int
-        teacher_forcing_ratio : float in [0, 1]
         target_seq : (B, pred_len, C, H, W) or None
-        return_states : if True, also return the per-timestep channel-mean
-            h map (the exact h.mean(dim=2) reduction track_velocities
-            correlates against), one entry per encoder *and* decoder step,
-            stacked to (B, T_in + pred_len, K, H, W). For inspection/logging
-            only — detached, no effect on training.
         """
         if not self.batch_first:
             input_seq = input_seq.permute(1, 0, 2, 3, 4)
@@ -273,10 +265,10 @@ class Seq2SeqMEConvLSTM(nn.Module):
 
         for t in range(pred_len):
             current_frame = prev_frame.detach()  
-
+            
             if target_seq is None:
                 v = v_last
-            else:
+            else: 
                 v = self.track_velocities(h, target_seq[:, t])
                 estimated_velocities.append(v.clone().detach()) 
                

@@ -6,7 +6,7 @@ from moving_mnist_dataset import FixedVelocityMovingMNIST
 from visualization import log_sequence_predictions, log_sequence_predictions_new
 
 
-def train_epoch(model, dataloader, optimizer, criterion, device, input_frames, teacher_forcing_ratio, grad_clip=None):
+def train_epoch(model, dataloader, optimizer, criterion, device, input_frames, grad_clip=None):
     model.train()
     running_loss = 0.0
     pbar = tqdm(dataloader, desc="Training", leave=False)
@@ -16,12 +16,10 @@ def train_epoch(model, dataloader, optimizer, criterion, device, input_frames, t
         target_seq = seq[:, input_frames:]
         pred_len = target_seq.size(1)
 
-        optimizer.zero_grad() 
+        optimizer.zero_grad()
         output_seq = model(
             input_seq,
             pred_len=pred_len,
-            teacher_forcing_ratio=teacher_forcing_ratio,
-            target_seq=target_seq
         )  # (B, pred_len, C, H, W)
         loss = criterion(output_seq, target_seq)
         loss.backward()
@@ -57,8 +55,6 @@ def eval_epoch(model, dataloader, criterion, device, input_frames, epoch, split_
             output_seq = model(
                 input_seq,
                 pred_len=pred_len,
-                teacher_forcing_ratio=0.0,
-                target_seq=target_seq
             )
             loss = criterion(output_seq, target_seq)
             batch_loss = loss.item()
@@ -87,7 +83,7 @@ def eval_len_generalization(model, dataloader, device, input_frames, subsample_t
             seq = seq.to(device)
             inp, tgt = seq[:, :input_frames], seq[:, input_frames:]
             T = tgt.size(1)
-            pred = model(inp, pred_len=T, teacher_forcing_ratio=0.0)
+            pred = model(inp, pred_len=T)
 
             # MSE per example per timestep  →  [B, T]
             per_ex_t = ((pred - tgt)**2).mean(dim=(2, 3, 4))  # assume (B,T,C,H,W)
@@ -156,7 +152,7 @@ def eval_velocity_generalization(model, device, args):
                 for seq, _ in batch_pbar:
                     seq = seq.to(device)
                     inp, tgt = seq[:, :args.input_frames], seq[:, args.input_frames:]
-                    pred = model(inp, pred_len=tgt.size(1), teacher_forcing_ratio=0.0)
+                    pred = model(inp, pred_len=tgt.size(1))
                     mse = crit(pred, tgt).mean(dim=(2, 3, 4))  # [B, T]
                     batch_mse = mse.mean().item()
                     mse_sum += batch_mse * mse.size(0)
