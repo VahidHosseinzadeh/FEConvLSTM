@@ -133,6 +133,28 @@ class ValCurveRecorder:
                           "loss_std": self.val_stds},
         }
 
+    def state_dict(self):
+        """Full state for crash-resume, including the materialized val data
+        (regenerating it on resume would silently switch the measured set)."""
+        return {
+            "data": self.data,
+            "step": self.step,
+            "train_steps": self.train_steps,
+            "train_losses": self.train_losses,
+            "val_steps": self.val_steps,
+            "val_means": self.val_means,
+            "val_stds": self.val_stds,
+        }
+
+    def load_state_dict(self, state):
+        self.data = state["data"]
+        self.step = state["step"]
+        self.train_steps = list(state["train_steps"])
+        self.train_losses = list(state["train_losses"])
+        self.val_steps = list(state["val_steps"])
+        self.val_means = list(state["val_means"])
+        self.val_stds = list(state["val_stds"])
+
 
 def train_epoch(model, dataloader, optimizer, criterion, device, input_frames, grad_clip=None,
                 curve_recorder=None):

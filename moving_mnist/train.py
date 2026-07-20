@@ -160,6 +160,10 @@ def main():
     parser.add_argument('--len_gen_every', type=int, default=0,
                         help='Also run length-generalization every N epochs regardless of val improvement '
                              '(0 = only on new best val). Saves to a separate *_latest.npz')
+    parser.add_argument('--resume', type=str, default=None,
+                        help='Path to a checkpoint_*.pth written during a previous run: restores model, '
+                             'optimizer, scheduler, epoch, best-val, loss curves, and continues the same '
+                             'wandb run. (Unlike --load_model, which loads best weights only.)')
     args = parser.parse_args()
 
     # --check_velocity_predictor only makes the datasets return motion
@@ -180,12 +184,21 @@ def main():
     # Create model save directory if it doesn't exist
     os.makedirs(args.model_save_dir, exist_ok=True)
 
+    # Load the resume checkpoint before wandb.init so the original run
+    # (and its id-based file names) can be continued.
+    resume_ckpt = None
+    if args.resume is not None:
+        print(f"Loading resume checkpoint from {args.resume}")
+        resume_ckpt = torch.load(args.resume, map_location='cpu')
+
     # Initialize wandb
-    wandb.init(entity=args.wandb_entity, 
-               project=args.wandb_project, 
+    wandb.init(entity=args.wandb_entity,
+               project=args.wandb_project,
                dir=args.wandb_dir,
                config=vars(args),
-               name=args.wandb_name)
+               name=args.wandb_name,
+               id=resume_ckpt["run_id"] if resume_ckpt else None,
+               resume="allow" if resume_ckpt else None)
 
     assert args.input_frames < args.seq_len, "input_frames must be less than seq_len"
     assert args.gen_input_frames < args.gen_seq_len, "gen_input_frames must be less than gen_seq_len"
@@ -550,8 +563,23 @@ def main():
     # Training loop
     history = {'train_loss': [], 'val_loss': [], 'test_loss': [], 'epoch_time_sec': []}
     best_val_losses = float('inf')
+    start_epoch = 1
+    checkpoint_path = os.path.join(args.model_save_dir, f"checkpoint_{args.model}_{wandb.run.id}.pth")
 
-    for epoch in range(1, args.epochs + 1):
+    if resume_ckpt is not None:
+        model.load_state_dict(resume_ckpt["model_state"])
+        optimizer.load_state_dict(resume_ckpt["optimizer_state"])
+        if scheduler is not None and resume_ckpt.get("scheduler_state") is not None:
+            scheduler.load_state_dict(resume_ckpt["scheduler_state"])
+        best_val_losses = resume_ckpt["best_val_losses"]
+        history = resume_ckpt["history"]
+        if curve_recorder is not None and resume_ckpt.get("curve_recorder") is not None:
+            curve_recorder.load_state_dict(resume_ckpt["curve_recorder"])
+        start_epoch = resume_ckpt["epoch"] + 1
+        print(f"Resumed from epoch {resume_ckpt['epoch']} "
+              f"(continuing at {start_epoch}) | best val so far: {best_val_losses:.4f}")
+
+    for epoch in range(start_epoch, args.epochs + 1):
         epoch_start = time.time()
         train_loss = train_fn(model, train_loader, optimizer, criterion, device, args.input_frames, args.grad_clip,
                               curve_recorder=curve_recorder)
@@ -670,6 +698,23 @@ def main():
                 gen_mean, gen_std, gen_details, args, epoch=epoch,
             )
             wandb.log({"len_gen_mean_over_time_latest": gen_mean.mean(), "epoch": epoch})
+
+        # Full resume checkpoint (model + optimizer + scheduler + curves),
+        # written atomically so a crash mid-save can't corrupt the file.
+        ckpt = {
+            "epoch": epoch,
+            "model_state": model.state_dict(),
+            "optimizer_state": optimizer.state_dict(),
+            "scheduler_state": scheduler.state_dict() if scheduler is not None else None,
+            "best_val_losses": best_val_losses,
+            "history": history,
+            "curve_recorder": curve_recorder.state_dict() if curve_recorder is not None else None,
+            "run_id": wandb.run.id,
+            "args": vars(args),
+        }
+        tmp_path = checkpoint_path + ".tmp"
+        torch.save(ckpt, tmp_path)
+        os.replace(tmp_path, checkpoint_path)
 
     # Final history dump (also written incrementally after every epoch)
     dump_history(history)
