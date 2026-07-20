@@ -25,7 +25,7 @@ def _unpack_batch(batch, device):
 
 
 def _run_model(model, input_seq, pred_len, target_seq,
-               want_velocity, want_states):
+               want_velocity, want_states, track_decoder_velocity=None):
     """
     Single call site for every model type.
 
@@ -34,17 +34,22 @@ def _run_model(model, input_seq, pred_len, target_seq,
     frame (v = track(h, target_seq[:, t])). Without it the model silently
     runs in inference mode (last encoder velocity frozen for the whole
     rollout — garbage early in training) and learning stalls.
-    In eval() mode we pass track_decoder_velocity=False instead: honest
-    deployable inference (frozen velocity), while target_seq stays unused.
+
+    track_decoder_velocity=None (default) picks the protocol by phase:
+    training -> tracked (required, see above); eval -> frozen (honest
+    deployable inference). Pass True explicitly for the oracle eval
+    (GT-tracked decoder velocities), e.g. via --eval_velocity_mode.
 
     Returns (output_seq, pred_motion_or_None, states_or_None).
     """
     if isinstance(model, Seq2SeqMEConvLSTM):
+        if track_decoder_velocity is None:
+            track_decoder_velocity = model.training
         result = model(
             input_seq,
             pred_len=pred_len,
             target_seq=target_seq,
-            track_decoder_velocity=model.training,
+            track_decoder_velocity=track_decoder_velocity,
             return_velocity=want_velocity,
             return_states=want_states,
         )
@@ -187,8 +192,18 @@ def train_epoch(model, dataloader, optimizer, criterion, device, input_frames, g
     return running_loss / len(dataloader.dataset)
 
 
-def eval_epoch(model, dataloader, criterion, device, input_frames, epoch, split_name):
+def eval_epoch(model, dataloader, criterion, device, input_frames, epoch, split_name,
+               decoder_velocity_mode="frozen"):
+    """
+    decoder_velocity_mode : "frozen" (default) — honest deployable inference,
+        the last encoder velocity rolls the whole horizon; velocity metrics
+        then cover encoder steps only. "tracked" — oracle protocol: MELSTM's
+        decoder velocities are tracked against the true next frames (upper
+        bound; the gap to "frozen" isolates velocity-estimation error from
+        rendering error).
+    """
     model.eval()
+    track = decoder_velocity_mode == "tracked"
     running_loss = 0.0
     velocity_metrics = VelocityMetrics()
     has_velocity_data = False
@@ -206,7 +221,8 @@ def eval_epoch(model, dataloader, criterion, device, input_frames, epoch, split_
             want_states = want_velocity and i == 0
 
             output_seq, pred_motion, states = _run_model(
-                model, input_seq, pred_len, target_seq, want_velocity, want_states
+                model, input_seq, pred_len, target_seq, want_velocity, want_states,
+                track_decoder_velocity=True if track else None,
             )
             loss = criterion(output_seq, target_seq)
             batch_loss = loss.item()
@@ -214,8 +230,6 @@ def eval_epoch(model, dataloader, criterion, device, input_frames, epoch, split_
             pbar.set_postfix({"loss": f"{batch_loss:.4f}"})
 
             if want_velocity:
-                # eval runs with track_decoder_velocity=False, so these are
-                # encoder velocities only (decoder rolls out frozen).
                 velocity_metrics.update(pred_motion, gt_motion)
                 has_velocity_data = True
 

@@ -153,6 +153,13 @@ def main():
     parser.add_argument("--check_velocity_predictor",action="store_true",help="Debug the velocity predictor during training/evaluation.")
     parser.add_argument('--val_curve_interval', type=int, default=25, help='Record validation loss every N training batches for the loss-vs-steps curve (0 = off)')
     parser.add_argument('--val_curve_size', type=int, default=256, help='Number of fixed validation sequences used for the loss-vs-steps curve')
+    parser.add_argument('--eval_velocity_mode', choices=['frozen', 'tracked', 'both'], default='frozen',
+                        help="MELSTM decoder velocity at evaluation: 'frozen' = honest inference (default, drives scheduler/selection); "
+                             "'tracked' = oracle GT-tracked eval drives scheduler/selection; "
+                             "'both' = select on frozen but also log val_tracked_loss each epoch")
+    parser.add_argument('--len_gen_every', type=int, default=0,
+                        help='Also run length-generalization every N epochs regardless of val improvement '
+                             '(0 = only on new best val). Saves to a separate *_latest.npz')
     args = parser.parse_args()
 
     # --check_velocity_predictor only makes the datasets return motion
@@ -550,33 +557,51 @@ def main():
                               curve_recorder=curve_recorder)
         epoch_time = time.time() - epoch_start
         val_loss = eval_fn(model, val_loader, criterion, device, args.input_frames, epoch, split_name="val")
+
+        # Oracle (GT-tracked decoder velocity) validation: measures the model
+        # without velocity-estimation drift; the gap to val_loss isolates
+        # velocity error from rendering error. MELSTM-only effect.
+        val_tracked_loss = None
+        if args.eval_velocity_mode in ('tracked', 'both'):
+            val_tracked_loss = eval_fn(model, val_loader, criterion, device, args.input_frames, epoch,
+                                       split_name="val_tracked", decoder_velocity_mode="tracked")
+
+        # Metric driving the scheduler / best-model selection / len-gen gating
+        selection_val = val_tracked_loss if args.eval_velocity_mode == 'tracked' else val_loss
+
         history['train_loss'].append(train_loss)
         history['val_loss'].append(val_loss)
         history['epoch_time_sec'].append(epoch_time)
-        print(f"Epoch {epoch}/{args.epochs} | {args.model:^8} | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | {epoch_time:.1f}s")
+        tracked_str = f" | Val (tracked): {val_tracked_loss:.4f}" if val_tracked_loss is not None else ""
+        print(f"Epoch {epoch}/{args.epochs} | {args.model:^8} | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f}{tracked_str} | {epoch_time:.1f}s")
 
         if scheduler is not None:
             lr_before = optimizer.param_groups[0]['lr']
-            scheduler.step(val_loss)
+            scheduler.step(selection_val)
             lr_after = optimizer.param_groups[0]['lr']
             if lr_after < lr_before:
                 print(f"  LR reduced: {lr_before:.2e} -> {lr_after:.2e}")
 
         # Log metrics to wandb
-        wandb.log({
+        log_payload = {
             "train_loss": train_loss,
             "val_loss": val_loss,
             "lr": optimizer.param_groups[0]['lr'],
             "epoch_time_sec": epoch_time,
             "epoch": epoch
-        })
+        }
+        if val_tracked_loss is not None:
+            log_payload["val_tracked_loss"] = val_tracked_loss
+        wandb.log(log_payload)
 
         # Persist curves incrementally so a killed run still leaves data
         dump_history(history)
         
         # Save model if it's the best so far
-        if val_loss < best_val_losses:
-            best_val_losses = val_loss
+        ran_len_gen_this_epoch = False
+        if selection_val < best_val_losses:
+            best_val_losses = selection_val
+            ran_len_gen_this_epoch = True
             model_filename = f"{args.model}_best_model_{wandb.run.id}.pth"
             model_path = os.path.join(args.model_save_dir, model_filename)
             torch.save(model.state_dict(), model_path)
@@ -630,6 +655,21 @@ def main():
                 "test_loss": test_loss,
                 "epoch": epoch
             })
+
+        # Periodic length generalization, decoupled from val improvement:
+        # with honest (frozen-velocity) validation the selection metric can
+        # saturate while the model keeps improving, which would otherwise
+        # starve the len-gen monitoring. Saves to *_latest.npz so it never
+        # overwrites the best-checkpoint results.
+        if (args.len_gen_every > 0 and epoch % args.len_gen_every == 0
+                and not ran_len_gen_this_epoch):
+            gen_test_dataset.reset_rng()   # identical benchmark set every evaluation
+            gen_mean, gen_std, gen_details = len_gen_fn(model, gen_test_loader, device, args.gen_input_frames)
+            save_len_gen_results(
+                os.path.join(args.model_save_dir, f"len_gen_{args.model}_{wandb.run.id}_latest.npz"),
+                gen_mean, gen_std, gen_details, args, epoch=epoch,
+            )
+            wandb.log({"len_gen_mean_over_time_latest": gen_mean.mean(), "epoch": epoch})
 
     # Final history dump (also written incrementally after every epoch)
     dump_history(history)
