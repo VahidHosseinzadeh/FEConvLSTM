@@ -1,4 +1,5 @@
 import argparse
+import copy
 import json
 import torch
 import torch.nn as nn
@@ -588,17 +589,39 @@ def main():
     checkpoint_path = os.path.join(args.model_save_dir, f"checkpoint_{args.model}_{wandb.run.id}.pth")
 
     if resume_ckpt is not None:
-        model.load_state_dict(resume_ckpt["model_state"])
-        optimizer.load_state_dict(resume_ckpt["optimizer_state"])
-        if scheduler is not None and resume_ckpt.get("scheduler_state") is not None:
-            scheduler.load_state_dict(resume_ckpt["scheduler_state"])
-        best_val_losses = resume_ckpt["best_val_losses"]
-        history = resume_ckpt["history"]
-        if curve_recorder is not None and resume_ckpt.get("curve_recorder") is not None:
-            curve_recorder.load_state_dict(resume_ckpt["curve_recorder"])
-        start_epoch = resume_ckpt["epoch"] + 1
-        print(f"Resumed from epoch {resume_ckpt['epoch']} "
-              f"(continuing at {start_epoch}) | best val so far: {best_val_losses:.4f}")
+        # A checkpoint from a run with different settings (hidden_size,
+        # decoder_conv_layers, ...) has incompatible tensor shapes.
+        # load_state_dict copies matching-shape params in place BEFORE
+        # raising on the mismatched ones, so on failure the model can be
+        # left partially mutated -- snapshot first and restore on error,
+        # so an incompatible resume checkpoint can never crash the job or
+        # silently corrupt a fresh model. It just starts fresh instead,
+        # loudly, so you notice and can clean up the stale checkpoint.
+        fresh_model_state = copy.deepcopy(model.state_dict())
+        try:
+            model.load_state_dict(resume_ckpt["model_state"])
+            optimizer.load_state_dict(resume_ckpt["optimizer_state"])
+            if scheduler is not None and resume_ckpt.get("scheduler_state") is not None:
+                scheduler.load_state_dict(resume_ckpt["scheduler_state"])
+            best_val_losses = resume_ckpt["best_val_losses"]
+            history = resume_ckpt["history"]
+            if curve_recorder is not None and resume_ckpt.get("curve_recorder") is not None:
+                curve_recorder.load_state_dict(resume_ckpt["curve_recorder"])
+            start_epoch = resume_ckpt["epoch"] + 1
+            print(f"Resumed from epoch {resume_ckpt['epoch']} "
+                  f"(continuing at {start_epoch}) | best val so far: {best_val_losses:.4f}")
+        except RuntimeError as e:
+            model.load_state_dict(fresh_model_state)   # undo any partial copy
+            optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+            if args.use_lr_scheduler:
+                scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                    optimizer, mode='min', factor=args.lr_factor,
+                    patience=args.lr_patience, min_lr=args.lr_min,
+                )
+            print(f"WARNING: --resume checkpoint at {args.resume} is incompatible "
+                  f"with the current settings (hidden_size/decoder_conv_layers/...) "
+                  f"and was ignored -- starting fresh instead:\n{e}")
+            print(f"Delete the stale file to silence this: rm {args.resume}")
 
     for epoch in range(start_epoch, args.epochs + 1):
         epoch_start = time.time()
