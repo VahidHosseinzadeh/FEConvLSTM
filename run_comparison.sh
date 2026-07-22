@@ -28,7 +28,12 @@ INPUT_FRAMES=10    # training context; pred = SEQ_LEN - INPUT_FRAMES = 10
 GEN_INPUT=10       # = INPUT_FRAMES so len-gen isolates horizon only
 GEN_SEQ_LEN=75     # 65 predicted frames in the len-gen benchmark (6.5x trained horizon)
 IMAGE=36
-EPOCHS=30
+EPOCHS=80          # generous shared ceiling; early stopping (below) ends lstm/melstm
+                   # well before this once converged. felstm's real limit is wall-clock,
+                   # not this number.
+MIN_EPOCHS=30      # no early stop before this many epochs (gives the LR scheduler,
+                   # patience=5, room to cut LR at least once first)
+EARLY_STOP_PATIENCE=15   # ~2-3 LR reductions' worth of chances before giving up
 SEED=42
 SAVE_DIR=./fernn/movmnist
 
@@ -36,7 +41,8 @@ COMMON="--data_v_range 2 --hidden_size $HIDDEN --decoder_conv_layers $DEC_LAYERS
   --batch_size $BATCH --grad_clip 1.0 --data_seed $SEED --model_seed $SEED \
   --image_size $IMAGE --seq_len $SEQ_LEN --input_frames $INPUT_FRAMES \
   --gen_input_frames $GEN_INPUT --gen_seq_len $GEN_SEQ_LEN \
-  --lr 1e-3 --use_lr_scheduler --epochs $EPOCHS --num_workers 4 \
+  --lr 1e-3 --use_lr_scheduler --epochs $EPOCHS --min_epochs $MIN_EPOCHS \
+  --early_stop_patience $EARLY_STOP_PATIENCE --num_workers 4 \
   --check_velocity_predictor --len_gen_every 3 \
   --model_save_dir $SAVE_DIR --wandb_project FEConvLSTM"
 

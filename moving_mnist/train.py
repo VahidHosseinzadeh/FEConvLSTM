@@ -1,6 +1,7 @@
 import argparse
 import copy
 import json
+import shutil
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, random_split, Subset
@@ -118,7 +119,12 @@ def main():
     parser.add_argument('--batch_size', type=int, default=128)
     parser.add_argument('--num_workers', type=int, default=4, help='DataLoader worker processes (0 = load on the main process, no parallelism)')
     parser.add_argument('--epochs', type=int, default=50)
-    parser.add_argument('--min_epochs', type=int, default=50, help='Minimum number of epochs to train')
+    parser.add_argument('--min_epochs', type=int, default=50, help='Minimum number of epochs before early stopping can trigger (no effect unless --early_stop_patience > 0)')
+    parser.add_argument('--early_stop_patience', type=int, default=0,
+                        help='Stop once --min_epochs has passed and the selection val loss has not '
+                             'improved for this many consecutive epochs (0 = disabled, always run to '
+                             '--epochs). Lets each model in a comparison train to its own convergence '
+                             'instead of everyone sharing one epoch count sized for the cheapest model.')
     parser.add_argument('--lr', type=float, default=1e-3)
     parser.add_argument('--use_lr_scheduler', action='store_true', help='Enable ReduceLROnPlateau: cuts LR when val_loss stops improving')
     parser.add_argument('--lr_patience', type=int, default=5, help='Epochs with no val_loss improvement before cutting LR (only with --use_lr_scheduler)')
@@ -590,6 +596,7 @@ def main():
     # Training loop
     history = {'train_loss': [], 'val_loss': [], 'test_loss': [], 'epoch_time_sec': []}
     best_val_losses = float('inf')
+    epochs_since_improve = 0
     start_epoch = 1
     checkpoint_path = os.path.join(args.model_save_dir, f"checkpoint_{args.model}_{wandb.run.id}.pth")
 
@@ -609,6 +616,7 @@ def main():
             if scheduler is not None and resume_ckpt.get("scheduler_state") is not None:
                 scheduler.load_state_dict(resume_ckpt["scheduler_state"])
             best_val_losses = resume_ckpt["best_val_losses"]
+            epochs_since_improve = resume_ckpt.get("epochs_since_improve", 0)
             history = resume_ckpt["history"]
             if curve_recorder is not None and resume_ckpt.get("curve_recorder") is not None:
                 curve_recorder.load_state_dict(resume_ckpt["curve_recorder"])
@@ -617,6 +625,7 @@ def main():
                   f"(continuing at {start_epoch}) | best val so far: {best_val_losses:.4f}")
         except RuntimeError as e:
             model.load_state_dict(fresh_model_state)   # undo any partial copy
+            epochs_since_improve = 0
             optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
             if args.use_lr_scheduler:
                 scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -680,6 +689,7 @@ def main():
         ran_len_gen_this_epoch = False
         if selection_val < best_val_losses:
             best_val_losses = selection_val
+            epochs_since_improve = 0
             ran_len_gen_this_epoch = True
             model_filename = f"{args.model}_best_model_{wandb.run.id}.pth"
             model_path = os.path.join(args.model_save_dir, model_filename)
@@ -736,6 +746,8 @@ def main():
                 "test_loss": test_loss,
                 "epoch": epoch
             })
+        else:
+            epochs_since_improve += 1
 
         # Periodic length generalization, decoupled from val improvement:
         # with honest (frozen-velocity) validation the selection metric can
@@ -761,6 +773,7 @@ def main():
             "optimizer_state": optimizer.state_dict(),
             "scheduler_state": scheduler.state_dict() if scheduler is not None else None,
             "best_val_losses": best_val_losses,
+            "epochs_since_improve": epochs_since_improve,
             "history": history,
             "curve_recorder": curve_recorder.state_dict() if curve_recorder is not None else None,
             "run_id": wandb.run.id,
@@ -769,6 +782,13 @@ def main():
         tmp_path = checkpoint_path + ".tmp"
         torch.save(ckpt, tmp_path)
         os.replace(tmp_path, checkpoint_path)
+
+        if (args.early_stop_patience > 0 and epoch >= args.min_epochs
+                and epochs_since_improve >= args.early_stop_patience):
+            print(f"Early stopping at epoch {epoch}: no improvement for "
+                  f"{epochs_since_improve} epochs (patience={args.early_stop_patience}, "
+                  f"min_epochs={args.min_epochs}).")
+            break
 
     # Final history dump (also written incrementally after every epoch)
     dump_history(history)
@@ -780,6 +800,19 @@ def main():
     model_path = os.path.join(args.model_save_dir, model_filename)
     test_loss = history['test_loss'][-1] if history['test_loss'] else None
     print(f"{args.model}: {model_path} | Test Loss: {test_loss:.4f}" if test_loss is not None else f"{args.model}: {model_path} | Test Loss: N/A")
+
+    # Stable, run-id-free copy of the best model's weights -- the one file to
+    # point at for "the trained felstm/melstm/lstm parameters," without
+    # needing to know this run's wandb id. Overwritten by any later run of
+    # the same --model; the run-id-named file above is untouched and still
+    # gives full per-run traceability if you ever need it.
+    if os.path.exists(model_path):
+        clean_path = os.path.join(args.model_save_dir, f"{args.model}_best.pth")
+        shutil.copy(model_path, clean_path)
+        print(f"Best model parameters (stable name): {clean_path}")
+    else:
+        print(f"WARNING: no best-model checkpoint found at {model_path} "
+              f"(val loss never improved?) -- no stable-name copy made.")
 
     # All --epochs completed (not just this Slurm submission's walltime
     # slice): marks the run as finished so submit_comparison.sbatch's
