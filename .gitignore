@@ -79,6 +79,6 @@ Thumbs.db
 .claude/
 _mnist/
 CLAUDE.md
-run_comparison.sh
-submit_comparison.sbatch
+# run_comparison.sh
+# submit_comparison.sbatch
 submit_jupyter.sbatch

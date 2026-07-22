@@ -753,5 +753,12 @@ def main():
     test_loss = history['test_loss'][-1] if history['test_loss'] else None
     print(f"{args.model}: {model_path} | Test Loss: {test_loss:.4f}" if test_loss is not None else f"{args.model}: {model_path} | Test Loss: N/A")
 
+    # All --epochs completed (not just this Slurm submission's walltime
+    # slice): marks the run as finished so submit_comparison.sbatch's
+    # self-chaining knows to stop resubmitting.
+    done_path = os.path.join(args.model_save_dir, f"DONE_{args.model}_{wandb.run.id}.flag")
+    open(done_path, "w").close()
+    print(f"Training complete ({args.epochs} epochs) — wrote {done_path}")
+
 if __name__ == '__main__':
     main()
