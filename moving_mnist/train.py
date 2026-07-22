@@ -576,7 +576,12 @@ def main():
     history_path = os.path.join(args.model_save_dir, f"history_{args.model}_{wandb.run.id}.json")
 
     def dump_history(history):
-        payload = {"config": vars(args), "history": history}
+        payload = {
+            "config": vars(args),
+            "history": history,
+            "num_parameters": num_params,
+            "num_trainable_parameters": num_trainable,
+        }
         if curve_recorder is not None:
             payload.update(curve_recorder.as_dict())
         with open(history_path, "w") as f:
