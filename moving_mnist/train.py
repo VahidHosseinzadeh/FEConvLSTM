@@ -133,6 +133,20 @@ def main():
     parser.add_argument('--v_range', type=int, default=2)
     parser.add_argument('--num_vel_modes', type=int, default=2, help='Number of velocity modes for MEConvLSTM')
     parser.add_argument('--data_v_range', type=int, default=2)
+    parser.add_argument('--motion_mode', choices=['constant', 'piecewise', 'stochastic'], default='piecewise',
+                        help="How digit velocity evolves over time: 'constant' = fixed for the whole "
+                             "sequence; 'piecewise' = held for a random --min_segment..--max_segment window "
+                             "then changes (--p_change has no effect in this mode); 'stochastic' = --p_change "
+                             "chance of changing at every single step.")
+    parser.add_argument('--transition_mode', choices=['uniform', 'smooth'], default='smooth',
+                        help="What the new velocity is when a change happens: 'uniform' = uniformly random "
+                             "pick from the whole velocity grid; 'smooth' = with probability "
+                             "--smooth_probability, step to a neighboring velocity (vx and vy each change by "
+                             "at most 1) instead of an unrelated jump.")
+    parser.add_argument('--min_segment', type=int, default=3, help='motion_mode=piecewise: minimum frames before a velocity change')
+    parser.add_argument('--max_segment', type=int, default=6, help='motion_mode=piecewise: maximum frames before a velocity change')
+    parser.add_argument('--p_change', type=float, default=0.25, help='motion_mode=stochastic only: per-step probability of a velocity change (no effect in piecewise mode)')
+    parser.add_argument('--smooth_probability', type=float, default=0.8, help='transition_mode=smooth only: probability a change is a neighbor step rather than a uniform jump')
     parser.add_argument('--gen_seq_len', type=int, default=40, help='Sequence length used **only** for length‑generalization evaluation (must be > seq_len)')
     parser.add_argument('--data_seed', type=int, default=42, help='Random seed for dataset splitting')
     parser.add_argument('--model_seed', type=int, default=None, help='Random seed for model initialization (default: random)')
@@ -254,14 +268,14 @@ def main():
         image_size=args.image_size,
         max_speed=args.data_v_range,
 
-        motion_mode="piecewise",
-        transition_mode="smooth",
+        motion_mode=args.motion_mode,
+        transition_mode=args.transition_mode,
 
-        min_segment=3,
-        max_segment=6,
+        min_segment=args.min_segment,
+        max_segment=args.max_segment,
 
-        p_change=0.25,
-        smooth_probability=0.8,
+        p_change=args.p_change,
+        smooth_probability=args.smooth_probability,
 
         motion_difficulty=None,
         freeze_after=args.input_frames,
@@ -290,14 +304,14 @@ def main():
         image_size=args.image_size,
         max_speed=args.data_v_range,
 
-        motion_mode="piecewise",
-        transition_mode="smooth",
+        motion_mode=args.motion_mode,
+        transition_mode=args.transition_mode,
 
-        min_segment=3,
-        max_segment=6,
+        min_segment=args.min_segment,
+        max_segment=args.max_segment,
 
-        p_change=0.25,
-        smooth_probability=0.8,
+        p_change=args.p_change,
+        smooth_probability=args.smooth_probability,
 
         motion_difficulty=None,
         freeze_after=args.input_frames,
@@ -326,14 +340,14 @@ def main():
         image_size=args.image_size,
         max_speed=args.data_v_range,
 
-        motion_mode="piecewise",
-        transition_mode="smooth",
+        motion_mode=args.motion_mode,
+        transition_mode=args.transition_mode,
 
-        min_segment=3,
-        max_segment=6,
+        min_segment=args.min_segment,
+        max_segment=args.max_segment,
 
-        p_change=0.25,
-        smooth_probability=0.8,
+        p_change=args.p_change,
+        smooth_probability=args.smooth_probability,
 
         motion_difficulty=None,
 
