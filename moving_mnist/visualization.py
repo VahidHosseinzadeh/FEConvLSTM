@@ -157,6 +157,8 @@ def log_state_evolution(
     num_samples=3,
     subsample_t=1,
     input_frames=None,
+    motion=None,
+    v_list=None,
 ):
     """
     Visualise the per-slot channel-mean h maps over time — the exact
@@ -169,7 +171,17 @@ def log_state_evolution(
     gt_frames  : (B, T, C, H, W), the true frame at each step, e.g.
         torch.cat([input_seq, target_seq], dim=1).
     input_frames : if given, decoder timesteps (t >= input_frames) are
-        labelled in a different colour to mark the encoder/decoder boundary.
+        labelled in a different colour to mark the encoder/decoder boundary;
+        also the length of the input window used to select slots below.
+    motion, v_list : optional, together select which of the K slots to draw
+        instead of all of them. FEConvLSTM has one slot per (vx, vy)
+        candidate on a dense grid (K can be dozens for a large v_range) --
+        showing all of them is unreadable, so instead we show only the
+        slots whose velocity is actually taken by some digit at some point
+        in the input window (the first input_frames steps), matched against
+        v_list = model.cell.v_list. motion is (B, T, N, 2) GT per-digit
+        velocity (frame t -> t+1). Leave both None (default, e.g. for
+        MEConvLSTM's few learned slots) to show every slot as before.
     """
     B, T, K, H, W = h_states.shape
     num_samples = min(num_samples, B)
@@ -177,13 +189,27 @@ def log_state_evolution(
 
     T_shown = max(1, T // subsample_t)
     has_gt_frames = gt_frames is not None
-
-    rows = K + int(has_gt_frames)
-    gt_row = K
+    select_slots = motion is not None and v_list is not None
+    v_index = {tuple(v): k for k, v in enumerate(v_list)} if select_slots else None
 
     for idx in indices:
         h_sample = h_states[idx].detach().cpu()   # (T, K, H, W)
         gt_sample = gt_frames[idx].detach().cpu() if has_gt_frames else None   # (T, C, H, W)
+
+        if select_slots:
+            window = motion[idx, :input_frames].reshape(-1, 2).tolist()
+            observed = {tuple(int(x) for x in v) for v in window}
+            slot_idx = sorted(v_index[v] for v in observed if v in v_index)
+            if not slot_idx:
+                slot_idx = list(range(K))  # no grid match -- fall back to showing all
+            h_sample = h_sample[:, slot_idx]
+            slot_labels = [f"v={v_list[k]}" for k in slot_idx]
+        else:
+            slot_labels = [f"h slot{k}" for k in range(K)]
+
+        rows_k = h_sample.shape[1]
+        rows = rows_k + int(has_gt_frames)
+        gt_row = rows_k
 
         fig, axes = plt.subplots(
             rows, T_shown,
@@ -197,7 +223,7 @@ def log_state_evolution(
             is_decoder = input_frames is not None and t >= input_frames
             title_color = "crimson" if is_decoder else "black"
 
-            for k in range(K):
+            for k in range(rows_k):
                 v = h_sample[t, k]
                 vmax = v.abs().max().clamp(min=1e-8).item()
                 axes[k, tt].imshow(v, cmap="coolwarm", vmin=-vmax, vmax=vmax)
@@ -211,8 +237,8 @@ def log_state_evolution(
 
             axes[0, tt].set_title(f"t={t}", fontsize=8, color=title_color)
 
-        for k in range(K):
-            axes[k, 0].text(-0.4, 0.5, f"h slot{k}", rotation=90,
+        for k in range(rows_k):
+            axes[k, 0].text(-0.4, 0.5, slot_labels[k], rotation=90,
                              va="center", ha="center", fontsize=8,
                              transform=axes[k, 0].transAxes)
         if has_gt_frames:

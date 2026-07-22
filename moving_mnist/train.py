@@ -150,7 +150,12 @@ def main():
     parser.add_argument('--wandb_project', type=str, default="FERNN", help='Wandb project')
     parser.add_argument('--wandb_dir', type=str, default='./tmp/', help='Wandb directory')
     parser.add_argument('--wandb_name', type=str, default=None, help='Wandb name')
-    parser.add_argument("--check_velocity_predictor",action="store_true",help="Debug the velocity predictor during training/evaluation.")
+    parser.add_argument("--check_velocity_predictor",action="store_true",help="MELSTM only: debug the velocity predictor during training/evaluation.")
+    parser.add_argument("--show_h_state", action="store_true",
+                         help="FELSTM only: log the per-(vx,vy) candidate h-slot maps "
+                              "(filtered to velocities actually observed in the input "
+                              "window) to wandb. Independent of --check_velocity_predictor, "
+                              "which is MELSTM's velocity-tracker debug flag.")
     parser.add_argument('--val_curve_interval', type=int, default=25, help='Record validation loss every N training batches for the loss-vs-steps curve (0 = off)')
     parser.add_argument('--val_curve_size', type=int, default=256, help='Number of fixed validation sequences used for the loss-vs-steps curve')
     parser.add_argument('--eval_velocity_mode', choices=['frozen', 'tracked', 'both'], default='frozen',
@@ -265,7 +270,7 @@ def main():
         reject_overlap=True,
         require_distinct_velocities=True,
 
-        return_motion=args.check_velocity_predictor,
+        return_motion=args.check_velocity_predictor or args.show_h_state,
         return_positions=False,
 
         transform=None,
@@ -301,7 +306,7 @@ def main():
         reject_overlap=True,
         require_distinct_velocities=True,
 
-        return_motion=args.check_velocity_predictor,
+        return_motion=args.check_velocity_predictor or args.show_h_state,
         return_positions=False,
 
         transform=None,
@@ -338,7 +343,7 @@ def main():
         reject_overlap=True,
         require_distinct_velocities=True,
 
-        return_motion=args.check_velocity_predictor,
+        return_motion=args.check_velocity_predictor or args.show_h_state,
         return_positions=False,
 
         transform=None,
@@ -475,7 +480,8 @@ def main():
         print("Running evaluation only...")
         criterion = MSEPlusL1Loss()
         test_dataset.reset_rng()       # identical benchmark set every evaluation
-        test_loss = eval_fn(model, test_loader, criterion, device, args.input_frames, 0, split_name="test")
+        test_loss = eval_fn(model, test_loader, criterion, device, args.input_frames, 0, split_name="test",
+                            show_h_state=args.show_h_state)
         print(f"Test Loss: {test_loss:.4f}")
 
         wandb.log({
@@ -485,7 +491,8 @@ def main():
 
         print("Running length generalization test...")
         gen_test_dataset.reset_rng()   # identical benchmark set every evaluation
-        gen_mean, gen_std, gen_details = len_gen_fn(model, gen_test_loader, device, args.gen_input_frames, subsample_t=2)
+        gen_mean, gen_std, gen_details = len_gen_fn(model, gen_test_loader, device, args.gen_input_frames, subsample_t=2,
+                                                    show_h_state=args.show_h_state)
         print(f"Length generalization mean MSE: {gen_mean.mean():.4f}")
         save_len_gen_results(
             os.path.join(args.model_save_dir, f"len_gen_{args.model}_{wandb.run.id}.npz"),
@@ -582,9 +589,10 @@ def main():
     for epoch in range(start_epoch, args.epochs + 1):
         epoch_start = time.time()
         train_loss = train_fn(model, train_loader, optimizer, criterion, device, args.input_frames, args.grad_clip,
-                              curve_recorder=curve_recorder)
+                              curve_recorder=curve_recorder, show_h_state=args.show_h_state)
         epoch_time = time.time() - epoch_start
-        val_loss = eval_fn(model, val_loader, criterion, device, args.input_frames, epoch, split_name="val")
+        val_loss = eval_fn(model, val_loader, criterion, device, args.input_frames, epoch, split_name="val",
+                           show_h_state=args.show_h_state)
 
         # Oracle (GT-tracked decoder velocity) validation: measures the model
         # without velocity-estimation drift; the gap to val_loss isolates
@@ -592,7 +600,8 @@ def main():
         val_tracked_loss = None
         if args.eval_velocity_mode in ('tracked', 'both'):
             val_tracked_loss = eval_fn(model, val_loader, criterion, device, args.input_frames, epoch,
-                                       split_name="val_tracked", decoder_velocity_mode="tracked")
+                                       split_name="val_tracked", decoder_velocity_mode="tracked",
+                                       show_h_state=args.show_h_state)
 
         # Metric driving the scheduler / best-model selection / len-gen gating
         selection_val = val_tracked_loss if args.eval_velocity_mode == 'tracked' else val_loss
@@ -637,13 +646,15 @@ def main():
             
             # Evaluate on test set with best model
             test_dataset.reset_rng()   # identical benchmark set every evaluation
-            test_loss = eval_fn(model, test_loader, criterion, device, args.input_frames, epoch, split_name="test")
+            test_loss = eval_fn(model, test_loader, criterion, device, args.input_frames, epoch, split_name="test",
+                                show_h_state=args.show_h_state)
 
             history['test_loss'].append(test_loss)
             print(f"Test Loss: {test_loss:.4f}")
 
             gen_test_dataset.reset_rng()   # identical benchmark set every evaluation
-            gen_mean, gen_std, gen_details = len_gen_fn(model, gen_test_loader, device, args.gen_input_frames)
+            gen_mean, gen_std, gen_details = len_gen_fn(model, gen_test_loader, device, args.gen_input_frames,
+                                                        show_h_state=args.show_h_state)
             save_len_gen_results(
                 os.path.join(args.model_save_dir, f"len_gen_{args.model}_{wandb.run.id}.npz"),
                 gen_mean, gen_std, gen_details, args, epoch=epoch,
@@ -692,7 +703,8 @@ def main():
         if (args.len_gen_every > 0 and epoch % args.len_gen_every == 0
                 and not ran_len_gen_this_epoch):
             gen_test_dataset.reset_rng()   # identical benchmark set every evaluation
-            gen_mean, gen_std, gen_details = len_gen_fn(model, gen_test_loader, device, args.gen_input_frames)
+            gen_mean, gen_std, gen_details = len_gen_fn(model, gen_test_loader, device, args.gen_input_frames,
+                                                        show_h_state=args.show_h_state)
             save_len_gen_results(
                 os.path.join(args.model_save_dir, f"len_gen_{args.model}_{wandb.run.id}_latest.npz"),
                 gen_mean, gen_std, gen_details, args, epoch=epoch,

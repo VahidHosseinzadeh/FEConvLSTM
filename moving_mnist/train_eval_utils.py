@@ -12,6 +12,7 @@ from visualization import (
 )
 from velocity_metrics import VelocityMetrics
 from velocity_model_based_MEConvLSTM_model import Seq2SeqMEConvLSTM
+from channel_based_FEConvLSTM_model import Seq2SeqFEConvLSTM
 
 
 def _unpack_batch(batch, device):
@@ -61,7 +62,39 @@ def _run_model(model, input_seq, pred_len, target_seq,
         states = result.pop(0) if want_states else None
         return output_seq, pred_motion, states
 
+    if isinstance(model, Seq2SeqFEConvLSTM):
+        # FEConvLSTM has no explicit velocity readout (want_velocity is
+        # always False for it, see _velocity_flags) -- it only exposes
+        # h_states, one channel-mean map per (vx, vy) candidate slot.
+        if not want_states:
+            return model(input_seq, pred_len=pred_len), None, None
+        output_seq, states = model(input_seq, pred_len=pred_len, return_states=True)
+        return output_seq, None, states
+
     return model(input_seq, pred_len=pred_len), None, None
+
+
+def _velocity_flags(model, gt_motion, show_h_state=False):
+    """
+    want_velocity : True only for Seq2SeqMEConvLSTM, whenever gt_motion is
+        available (--check_velocity_predictor). Returns an explicit tracked
+        (vx, vy) per slot to score against gt_motion.
+    want_states   : gates the log_state_evolution h_states plot, and is
+        deliberately NOT a single shared flag across model types:
+          MEConvLSTM  -- tied to want_velocity/--check_velocity_predictor.
+              This plot exists to debug the velocity tracker, so it travels
+              with the flag that turns the tracker's own debug output on.
+          FEConvLSTM  -- independent --show_h_state flag. FELSTM has no
+              velocity predictor to debug -- it shows the raw per-(vx,vy)
+              candidate slots instead, which isn't conceptually part of
+              "the velocity predictor".
+    Callers still AND want_states with their own "first batch only" gate.
+    """
+    is_melstm = isinstance(model, Seq2SeqMEConvLSTM)
+    is_felstm = isinstance(model, Seq2SeqFEConvLSTM)
+    want_velocity = is_melstm and gt_motion is not None
+    want_states = want_velocity or (is_felstm and show_h_state and gt_motion is not None)
+    return want_velocity, want_states
 
 
 class ValCurveRecorder:
@@ -157,7 +190,7 @@ class ValCurveRecorder:
 
 
 def train_epoch(model, dataloader, optimizer, criterion, device, input_frames, grad_clip=None,
-                curve_recorder=None):
+                curve_recorder=None, show_h_state=False):
     model.train()
     running_loss = 0.0
     velocity_metrics = VelocityMetrics()
@@ -170,9 +203,8 @@ def train_epoch(model, dataloader, optimizer, criterion, device, input_frames, g
         target_seq = seq[:, input_frames:]
         pred_len = target_seq.size(1)
 
-        is_melstm = isinstance(model, Seq2SeqMEConvLSTM)
-        want_velocity = is_melstm and gt_motion is not None
-        want_states = want_velocity and i == 0
+        want_velocity, want_states = _velocity_flags(model, gt_motion, show_h_state)
+        want_states = want_states and i == 0
 
         optimizer.zero_grad()
         output_seq, pred_motion, states = _run_model(
@@ -205,6 +237,8 @@ def train_epoch(model, dataloader, optimizer, criterion, device, input_frames, g
                     gt_frames=torch.cat([input_seq, target_seq], dim=1),
                     split_name="train",
                     input_frames=input_frames,
+                    motion=gt_motion,
+                    v_list=model.cell.v_list if isinstance(model, Seq2SeqFEConvLSTM) else None,
                 )
 
     if has_velocity_data:
@@ -215,7 +249,7 @@ def train_epoch(model, dataloader, optimizer, criterion, device, input_frames, g
 
 
 def eval_epoch(model, dataloader, criterion, device, input_frames, epoch, split_name,
-               decoder_velocity_mode="frozen"):
+               decoder_velocity_mode="frozen", show_h_state=False):
     """
     decoder_velocity_mode : "frozen" (default) — honest deployable inference,
         the last encoder velocity rolls the whole horizon; velocity metrics
@@ -238,9 +272,8 @@ def eval_epoch(model, dataloader, criterion, device, input_frames, epoch, split_
             target_seq = seq[:, input_frames:]
             pred_len = target_seq.size(1)
 
-            is_melstm = isinstance(model, Seq2SeqMEConvLSTM)
-            want_velocity = is_melstm and gt_motion is not None
-            want_states = want_velocity and i == 0
+            want_velocity, want_states = _velocity_flags(model, gt_motion, show_h_state)
+            want_states = want_states and i == 0
 
             output_seq, pred_motion, states = _run_model(
                 model, input_seq, pred_len, target_seq, want_velocity, want_states,
@@ -263,6 +296,8 @@ def eval_epoch(model, dataloader, criterion, device, input_frames, epoch, split_
                         gt_frames=torch.cat([input_seq, target_seq], dim=1),
                         split_name=split_name,
                         input_frames=input_frames,
+                        motion=gt_motion,
+                        v_list=model.cell.v_list if isinstance(model, Seq2SeqFEConvLSTM) else None,
                     )
 
     if has_velocity_data:
@@ -273,7 +308,7 @@ def eval_epoch(model, dataloader, criterion, device, input_frames, epoch, split_
 
 
 def eval_len_generalization(model, dataloader, device, input_frames, subsample_t=1,
-                            n_strip_sequences=3):
+                            n_strip_sequences=3, show_h_state=False):
     """
     Returns:
         mean_err  – numpy array [T]  (MSE at each future step, averaged over test set)
@@ -325,9 +360,8 @@ def eval_len_generalization(model, dataloader, device, input_frames, subsample_t
                                      torch.zeros_like(idx)).amax(dim=1)  # (B, N)
                 age_chunks.append(((f - 1) - t_last).detach().cpu())
 
-            is_melstm = isinstance(model, Seq2SeqMEConvLSTM)
-            want_velocity = is_melstm and gt_motion is not None
-            want_states = want_velocity and first_pass
+            want_velocity, want_states = _velocity_flags(model, gt_motion, show_h_state)
+            want_states = want_states and first_pass
 
             # target_seq=None: length generalization is pure rollout.
             pred, pred_motion, states = _run_model(
@@ -362,6 +396,8 @@ def eval_len_generalization(model, dataloader, device, input_frames, subsample_t
                         split_name="len_gen",
                         subsample_t=subsample_t,
                         input_frames=input_frames,
+                        motion=gt_motion,
+                        v_list=model.cell.v_list if isinstance(model, Seq2SeqFEConvLSTM) else None,
                     )
 
             pbar.set_postfix({"loss": per_ex_t.mean().item()})

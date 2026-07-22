@@ -251,7 +251,7 @@ class Seq2SeqFEConvLSTM(nn.Module):
     def forward(self,
                 input_seq,
                 pred_len,
-                return_hidden=False):
+                return_states=False):
 
         B, T_in, C, H, W = input_seq.shape
 
@@ -264,27 +264,7 @@ class Seq2SeqFEConvLSTM(nn.Module):
             device
         )
 
-        if return_hidden:
-
-            encoder_hidden = torch.zeros(
-                B,
-                T_in,
-                self.num_v,
-                self.hidden_channels,
-                H,
-                W,
-                device=device
-            )
-
-            decoder_hidden = torch.zeros(
-                B,
-                pred_len,
-                self.num_v,
-                self.hidden_channels,
-                H,
-                W,
-                device=device
-            )
+        h_states = [] if return_states else None
 
         # Encoder
         for t in range(T_in):
@@ -294,8 +274,8 @@ class Seq2SeqFEConvLSTM(nn.Module):
                 (h, c)
             )
 
-            if return_hidden:
-                encoder_hidden[:, t] = h.detach()
+            if return_states:
+                h_states.append(h.mean(dim=2).detach())
 
         prev = input_seq[:, -1]
 
@@ -311,8 +291,8 @@ class Seq2SeqFEConvLSTM(nn.Module):
                 (h, c)
             )
 
-            if return_hidden:
-                decoder_hidden[:, t] = h.detach()
+            if return_states:
+                h_states.append(h.mean(dim=2).detach())
 
             feat = self.pool_velocity(h)
 
@@ -324,7 +304,11 @@ class Seq2SeqFEConvLSTM(nn.Module):
 
         outputs = torch.stack(outputs, dim=1)
 
-        if return_hidden:
-            return outputs, encoder_hidden, decoder_hidden
+        if return_states:
+            # (B, T_in+pred_len, num_v, H, W) -- one channel-mean map per
+            # candidate (vx, vy) slot, same reduction/layout as
+            # Seq2SeqMEConvLSTM's return_states so the two share a plotting
+            # path (see log_state_evolution).
+            return outputs, {"h": torch.stack(h_states, dim=1)}
 
         return outputs
