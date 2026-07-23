@@ -814,6 +814,18 @@ def main():
         print(f"WARNING: no best-model checkpoint found at {model_path} "
               f"(val loss never improved?) -- no stable-name copy made.")
 
+    # The periodic len-gen snapshot (--len_gen_every) exists only to watch
+    # progress mid-training when the honest val metric saturates -- once
+    # training is truly done, the best-checkpoint len_gen_<model>_<id>.npz
+    # above supersedes it. Removing it here keeps exactly one len-gen file
+    # per finished run instead of two, so len_gen_<model>_*.npz globs match
+    # cleanly for plot_len_gen_comparison.py.
+    latest_len_gen_path = os.path.join(
+        args.model_save_dir, f"len_gen_{args.model}_{wandb.run.id}_latest.npz")
+    if os.path.exists(latest_len_gen_path):
+        os.remove(latest_len_gen_path)
+        print(f"Removed periodic len-gen snapshot (superseded): {latest_len_gen_path}")
+
     # All --epochs completed (not just this Slurm submission's walltime
     # slice): marks the run as finished so submit_comparison.sbatch's
     # self-chaining knows to stop resubmitting.
