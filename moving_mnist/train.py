@@ -207,8 +207,17 @@ def main():
     np.random.seed(args.data_seed)
     random.seed(args.data_seed)
 
-    # Create model save directory if it doesn't exist
-    os.makedirs(args.model_save_dir, exist_ok=True)
+    # Output layout under --model_save_dir:
+    #   models/     the actual trained weights (*_best.pth, *_best_model_<id>.pth)
+    #   results/    plot-script inputs (history_*.json, len_gen_*.npz, vel_gen_*.npz)
+    #   run_state/  internal recovery machinery, not meant to be opened by hand
+    #               (checkpoint_*.pth, DONE_*.flag, .resubmit_count_*)
+    models_dir = os.path.join(args.model_save_dir, "models")
+    results_dir = os.path.join(args.model_save_dir, "results")
+    run_state_dir = os.path.join(args.model_save_dir, "run_state")
+    os.makedirs(models_dir, exist_ok=True)
+    os.makedirs(results_dir, exist_ok=True)
+    os.makedirs(run_state_dir, exist_ok=True)
 
     # Load the resume checkpoint before wandb.init so the original run
     # (and its id-based file names) can be continued.
@@ -516,7 +525,7 @@ def main():
                                                     show_h_state=args.show_h_state)
         print(f"Length generalization mean MSE: {gen_mean.mean():.4f}")
         save_len_gen_results(
-            os.path.join(args.model_save_dir, f"len_gen_{args.model}_{wandb.run.id}.npz"),
+            os.path.join(results_dir, f"len_gen_{args.model}_{wandb.run.id}.npz"),
             gen_mean, gen_std, gen_details, args, epoch=0,
         )
 
@@ -529,7 +538,7 @@ def main():
             print("Running velocity generalization test...")
             vx, vy, err = eval_velocity_generalization(model, device, args)
             save_vel_gen_results(
-                os.path.join(args.model_save_dir, f"vel_gen_{args.model}_{wandb.run.id}.npz"),
+                os.path.join(results_dir, f"vel_gen_{args.model}_{wandb.run.id}.npz"),
                 vx, vy, err, args,
             )
             print("Velocity generalization results:")
@@ -579,7 +588,7 @@ def main():
             args.input_frames, device,
         )
 
-    history_path = os.path.join(args.model_save_dir, f"history_{args.model}_{wandb.run.id}.json")
+    history_path = os.path.join(results_dir, f"history_{args.model}_{wandb.run.id}.json")
 
     def dump_history(history):
         payload = {
@@ -598,7 +607,7 @@ def main():
     best_val_losses = float('inf')
     epochs_since_improve = 0
     start_epoch = 1
-    checkpoint_path = os.path.join(args.model_save_dir, f"checkpoint_{args.model}_{wandb.run.id}.pth")
+    checkpoint_path = os.path.join(run_state_dir, f"checkpoint_{args.model}_{wandb.run.id}.pth")
 
     if resume_ckpt is not None:
         # A checkpoint from a run with different settings (hidden_size,
@@ -692,10 +701,10 @@ def main():
             epochs_since_improve = 0
             ran_len_gen_this_epoch = True
             model_filename = f"{args.model}_best_model_{wandb.run.id}.pth"
-            model_path = os.path.join(args.model_save_dir, model_filename)
+            model_path = os.path.join(models_dir, model_filename)
             torch.save(model.state_dict(), model_path)
             print(f"Saved new best model for {args.model} at {model_path}")
-            
+
             # Evaluate on test set with best model
             test_dataset.reset_rng()   # identical benchmark set every evaluation
             test_loss = eval_fn(model, test_loader, criterion, device, args.input_frames, epoch, split_name="test",
@@ -708,7 +717,7 @@ def main():
             gen_mean, gen_std, gen_details = len_gen_fn(model, gen_test_loader, device, args.gen_input_frames,
                                                         show_h_state=args.show_h_state)
             save_len_gen_results(
-                os.path.join(args.model_save_dir, f"len_gen_{args.model}_{wandb.run.id}.npz"),
+                os.path.join(results_dir, f"len_gen_{args.model}_{wandb.run.id}.npz"),
                 gen_mean, gen_std, gen_details, args, epoch=epoch,
             )
 
@@ -720,7 +729,7 @@ def main():
             if args.run_velocity_generalization:
                 vx, vy, err = eval_velocity_generalization(model, device, args)
                 save_vel_gen_results(
-                    os.path.join(args.model_save_dir, f"vel_gen_{args.model}_{wandb.run.id}.npz"),
+                    os.path.join(results_dir, f"vel_gen_{args.model}_{wandb.run.id}.npz"),
                     vx, vy, err, args,
                 )
 
@@ -760,7 +769,7 @@ def main():
             gen_mean, gen_std, gen_details = len_gen_fn(model, gen_test_loader, device, args.gen_input_frames,
                                                         show_h_state=args.show_h_state)
             save_len_gen_results(
-                os.path.join(args.model_save_dir, f"len_gen_{args.model}_{wandb.run.id}_latest.npz"),
+                os.path.join(results_dir, f"len_gen_{args.model}_{wandb.run.id}_latest.npz"),
                 gen_mean, gen_std, gen_details, args, epoch=epoch,
             )
             wandb.log({"len_gen_mean_over_time_latest": gen_mean.mean(), "epoch": epoch})
@@ -797,7 +806,7 @@ def main():
     # Print final best model paths and test results
     print("\nBest model paths and test results:")
     model_filename = f"{args.model}_best_model_{wandb.run.id}.pth"
-    model_path = os.path.join(args.model_save_dir, model_filename)
+    model_path = os.path.join(models_dir, model_filename)
     test_loss = history['test_loss'][-1] if history['test_loss'] else None
     print(f"{args.model}: {model_path} | Test Loss: {test_loss:.4f}" if test_loss is not None else f"{args.model}: {model_path} | Test Loss: N/A")
 
@@ -807,7 +816,7 @@ def main():
     # the same --model; the run-id-named file above is untouched and still
     # gives full per-run traceability if you ever need it.
     if os.path.exists(model_path):
-        clean_path = os.path.join(args.model_save_dir, f"{args.model}_best.pth")
+        clean_path = os.path.join(models_dir, f"{args.model}_best.pth")
         shutil.copy(model_path, clean_path)
         print(f"Best model parameters (stable name): {clean_path}")
     else:
@@ -821,7 +830,7 @@ def main():
     # per finished run instead of two, so len_gen_<model>_*.npz globs match
     # cleanly for plot_len_gen_comparison.py.
     latest_len_gen_path = os.path.join(
-        args.model_save_dir, f"len_gen_{args.model}_{wandb.run.id}_latest.npz")
+        results_dir, f"len_gen_{args.model}_{wandb.run.id}_latest.npz")
     if os.path.exists(latest_len_gen_path):
         os.remove(latest_len_gen_path)
         print(f"Removed periodic len-gen snapshot (superseded): {latest_len_gen_path}")
@@ -829,7 +838,7 @@ def main():
     # All --epochs completed (not just this Slurm submission's walltime
     # slice): marks the run as finished so submit_comparison.sbatch's
     # self-chaining knows to stop resubmitting.
-    done_path = os.path.join(args.model_save_dir, f"DONE_{args.model}_{wandb.run.id}.flag")
+    done_path = os.path.join(run_state_dir, f"DONE_{args.model}_{wandb.run.id}.flag")
     open(done_path, "w").close()
     print(f"Training complete ({args.epochs} epochs) — wrote {done_path}")
 

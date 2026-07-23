@@ -7,8 +7,13 @@
 # One model per invocation (one tmux session each): lstm | felstm | melstm.
 # Auto-resumes from the newest matching checkpoint_*.pth if a previous
 # attempt crashed. If you CHANGE any setting below, delete the stale
-# checkpoints first (rm fernn/movmnist/checkpoint_<model>_*.pth) so the run
-# starts fresh instead of resuming an old configuration.
+# checkpoints first (rm experiments/run_state/checkpoint_<model>_*.pth) so
+# the run starts fresh instead of resuming an old configuration.
+#
+# Output layout under $SAVE_DIR (see train.py):
+#   models/     the actual trained weights
+#   results/    plot-script inputs (history/len_gen/vel_gen)
+#   run_state/  internal recovery machinery (checkpoints, DONE flags)
 
 set -e
 MODEL=${1:?usage: bash run_comparison.sh lstm|felstm|melstm}
@@ -35,7 +40,7 @@ MIN_EPOCHS=30      # no early stop before this many epochs (gives the LR schedul
                    # patience=5, room to cut LR at least once first)
 EARLY_STOP_PATIENCE=15   # ~2-3 LR reductions' worth of chances before giving up
 SEED=42
-SAVE_DIR=./fernn/movmnist
+SAVE_DIR=./experiments
 
 COMMON="--data_v_range 2 --hidden_size $HIDDEN --decoder_conv_layers $DEC_LAYERS \
   --batch_size $BATCH --grad_clip 1.0 --data_seed $SEED --model_seed $SEED \
@@ -66,7 +71,7 @@ case $MODEL in
 esac
 
 # ---- auto-resume after a crash --------------------------------------------
-CKPT=$(ls -t $SAVE_DIR/checkpoint_${MODEL}_*.pth 2>/dev/null | head -1)
+CKPT=$(ls -t $SAVE_DIR/run_state/checkpoint_${MODEL}_*.pth 2>/dev/null | head -1)
 RESUME=""
 if [ -n "$CKPT" ]; then
   echo ">>> Found checkpoint $CKPT — resuming this run."
@@ -77,7 +82,7 @@ if [ -n "$CKPT" ]; then
   # find it, wrongly conclude "already finished," and silently stop
   # resubmitting if this run later gets cut off by the 24h wall clock.
   # train.py writes a fresh one if/when this run genuinely completes again.
-  rm -f $SAVE_DIR/DONE_${MODEL}_*.flag
+  rm -f $SAVE_DIR/run_state/DONE_${MODEL}_*.flag
 fi
 
 # expandable_segments: reduces allocator fragmentation on long runs (the

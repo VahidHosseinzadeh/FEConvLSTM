@@ -32,7 +32,7 @@
 #
 # If you change any run_comparison.sh setting after a partial run, delete
 # the stale checkpoints first:
-#   rm -f fernn/movmnist/checkpoint_*.pth fernn/movmnist/DONE_*.flag
+#   rm -f experiments/run_state/checkpoint_*.pth experiments/run_state/DONE_*.flag
 # — otherwise auto-resume will try to load an old, incompatible checkpoint
 # and crash (caught by the logic below, but wastes a submission).
 
@@ -44,20 +44,21 @@
 #SBATCH --output=slurm_%x_%j.log
 
 MODEL=${1:?usage: sbatch submit_comparison.sbatch lstm|felstm|melstm}
-SAVE_DIR=./fernn/movmnist   # must match run_comparison.sh's SAVE_DIR
+SAVE_DIR=./experiments   # must match run_comparison.sh's SAVE_DIR
+RUN_STATE_DIR="${SAVE_DIR}/run_state"
 
 TIME_LIMIT_SEC=$((24 * 3600))
 NEAR_LIMIT_SEC=$((TIME_LIMIT_SEC - 15 * 60))   # within 15 min of the wall = plausible timeout
 MAX_RESUBMITS=8                                # hard backstop regardless of the heuristic above
 
-RESUBMIT_COUNT_FILE="${SAVE_DIR}/.resubmit_count_${MODEL}"
+RESUBMIT_COUNT_FILE="${RUN_STATE_DIR}/.resubmit_count_${MODEL}"
 RESUBMIT_COUNT=$(cat "$RESUBMIT_COUNT_FILE" 2>/dev/null || echo 0)
 
 START_TS=$(date +%s)
 bash run_comparison.sh "$MODEL"
 ELAPSED=$(( $(date +%s) - START_TS ))
 
-if ls ${SAVE_DIR}/DONE_${MODEL}_*.flag >/dev/null 2>&1; then
+if ls ${RUN_STATE_DIR}/DONE_${MODEL}_*.flag >/dev/null 2>&1; then
   echo ">>> Training complete for $MODEL — not resubmitting."
   rm -f "$RESUBMIT_COUNT_FILE"
 
