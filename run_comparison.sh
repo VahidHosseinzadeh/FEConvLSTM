@@ -26,7 +26,7 @@ DEC_LAYERS=2       # hidden decoder blocks (total convs = this + 1); ~37k extra 
 SEQ_LEN=20
 INPUT_FRAMES=10    # training context; pred = SEQ_LEN - INPUT_FRAMES = 10
 GEN_INPUT=10       # = INPUT_FRAMES so len-gen isolates horizon only
-GEN_SEQ_LEN=75     # 65 predicted frames in the len-gen benchmark (6.5x trained horizon)
+GEN_SEQ_LEN=100     # 65 predicted frames in the len-gen benchmark (6.5x trained horizon)
 IMAGE=36
 EPOCHS=80          # generous shared ceiling; early stopping (below) ends lstm/melstm
                    # well before this once converged. felstm's real limit is wall-clock,

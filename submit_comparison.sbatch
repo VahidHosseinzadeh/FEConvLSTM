@@ -3,23 +3,23 @@
 # Slurm keeps it running independent of your SSH connection — no tmux needed.
 #
 # Usage (from the repo root):
-#   sbatch --job-name=melstm submit_comparison.sbatch melstm
-#   sbatch --job-name=felstm submit_comparison.sbatch felstm
-#   sbatch --job-name=lstm   submit_comparison.sbatch lstm
+  # sbatch --job-name=melstm submit_comparison.sbatch melstm
+  # sbatch --job-name=felstm submit_comparison.sbatch felstm
+  # sbatch --job-name=lstm   submit_comparison.sbatch lstm
 #
 # Monitor:
 #   squeue -u $USER
-#   wandb — training progress, per-epoch prints, and any crash traceback all
-#   show up there (Logs tab), since wandb captures stdout/stderr by default.
+#   wandb — training progress, per-epoch prints, and the melstm velocity
+#   report all show up there (Logs tab).
+#   tail -f slurm_<job-name>_<jobid>.log — same content, locally.
 #
-# slurm_<job-name>_<jobid>.log still exists, but only for THIS script's own
-# few-lines-per-job orchestration messages below (crash-vs-timeout judgment,
-# resubmission attempt count) — not training output, which is redirected
-# away entirely (run_comparison.sh's actual training run) since wandb
-# already has it. One gap this creates: if a crash happens before wandb.init
-# succeeds (rare — e.g. a bad argument, a wandb auth/network problem), it
-# won't be visible in wandb OR this log. If that ever matters more than a
-# clean log, drop the "> /dev/null 2>&1" below to get it back.
+# NOTE: training output is NOT redirected to /dev/null (a previous version
+# of this script did that, reasoning wandb's console capture would still
+# work independently -- it doesn't: wandb's stdout capture apparently
+# depends on the underlying file descriptor still being live, so sending it
+# to /dev/null before Python even starts silently broke the wandb Logs tab
+# too, not just the local file). So slurm_%x_%j.log does contain the full
+# training output again, not just this script's own orchestration messages.
 #
 # Innovator's GPU partition caps walltime at 24h, likely well under a full
 # ~30-epoch run (especially felstm). This script self-chains ONLY when the
@@ -54,7 +54,7 @@ RESUBMIT_COUNT_FILE="${SAVE_DIR}/.resubmit_count_${MODEL}"
 RESUBMIT_COUNT=$(cat "$RESUBMIT_COUNT_FILE" 2>/dev/null || echo 0)
 
 START_TS=$(date +%s)
-bash run_comparison.sh "$MODEL" > /dev/null 2>&1   # training output: wandb only, not a file
+bash run_comparison.sh "$MODEL"
 ELAPSED=$(( $(date +%s) - START_TS ))
 
 if ls ${SAVE_DIR}/DONE_${MODEL}_*.flag >/dev/null 2>&1; then
@@ -67,9 +67,9 @@ elif [ "$ELAPSED" -ge "$NEAR_LIMIT_SEC" ] && [ "$RESUBMIT_COUNT" -lt "$MAX_RESUB
   sbatch --job-name="$SLURM_JOB_NAME" "$0" "$MODEL"
 
 elif [ "$RESUBMIT_COUNT" -ge "$MAX_RESUBMITS" ]; then
-  echo ">>> Hit the $MAX_RESUBMITS-resubmission cap without finishing — stopping. Check this model's wandb run for why it's stuck (not just slow)."
+  echo ">>> Hit the $MAX_RESUBMITS-resubmission cap without finishing — stopping. Check this model's wandb run (or slurm_${SLURM_JOB_NAME}_*.log) for why it's stuck (not just slow)."
 
 else
   echo ">>> Exited after only ${ELAPSED}s (well under the time limit) — this looks like a crash, not a timeout. NOT resubmitting."
-  echo ">>> Check this model's wandb run (Logs tab) for the real error before resubmitting by hand."
+  echo ">>> Check this model's wandb run (Logs tab) or slurm_${SLURM_JOB_NAME}_*.log for the real error before resubmitting by hand."
 fi
