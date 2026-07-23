@@ -84,4 +84,4 @@ fi
 # "reserved but unallocated" growth in the OOM report)
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
-python moving_mnist/train.py $COMMON $EXTRA $RESUME 2>&1 | tee -a train_${MODEL}.log
+python moving_mnist/train.py $COMMON $EXTRA $RESUME

@@ -196,7 +196,7 @@ def train_epoch(model, dataloader, optimizer, criterion, device, input_frames, g
     velocity_metrics = VelocityMetrics()
     has_velocity_data = False
 
-    pbar = tqdm(dataloader, desc="Training", leave=False)
+    pbar = tqdm(dataloader, desc="Training", leave=False, disable=True)
     for i, batch in enumerate(pbar):
         seq, gt_motion = _unpack_batch(batch, device)   # (B, seq_len, C, H, W)
         input_seq = seq[:, :input_frames]
@@ -265,7 +265,7 @@ def eval_epoch(model, dataloader, criterion, device, input_frames, epoch, split_
     has_velocity_data = False
 
     with torch.no_grad():
-        pbar = tqdm(dataloader, desc="Evaluating", leave=False)
+        pbar = tqdm(dataloader, desc="Evaluating", leave=False, disable=True)
         for i, batch in enumerate(pbar):
             seq, gt_motion = _unpack_batch(batch, device)
             input_seq = seq[:, :input_frames]
@@ -336,7 +336,7 @@ def eval_len_generalization(model, dataloader, device, input_frames, subsample_t
     strip = {}
 
     with torch.no_grad():
-        pbar = tqdm(dataloader, desc="Evaluating Length Generalization", leave=False)
+        pbar = tqdm(dataloader, desc="Evaluating Length Generalization", leave=False, disable=True)
         for batch in pbar:
             seq, gt_motion = _unpack_batch(batch, device)
             inp, tgt = seq[:, :input_frames], seq[:, input_frames:]
@@ -435,7 +435,7 @@ def eval_velocity_generalization(model, device, args):
     crit = torch.nn.MSELoss(reduction='none')
     model.eval()
 
-    vel_pbar = tqdm(total=len(vy_vals)*len(vx_vals), desc="Evaluating Velocity Generalization", leave=False)
+    vel_pbar = tqdm(total=len(vy_vals)*len(vx_vals), desc="Evaluating Velocity Generalization", leave=False, disable=True)
     for iy, vy in enumerate(vy_vals):
         for ix, vx in enumerate(vx_vals):
             vel_pbar.set_postfix({"vx": vx, "vy": vy})
@@ -452,7 +452,7 @@ def eval_velocity_generalization(model, device, args):
 
             mse_sum, n_seen = 0.0, 0
             with torch.no_grad():
-                batch_pbar = tqdm(loader, desc=f"vx={vx}, vy={vy}", leave=False)
+                batch_pbar = tqdm(loader, desc=f"vx={vx}, vy={vy}", leave=False, disable=True)
                 for seq, _ in batch_pbar:
                     seq = seq.to(device)
                     inp, tgt = seq[:, :args.input_frames], seq[:, args.input_frames:]
