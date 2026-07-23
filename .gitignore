@@ -82,3 +82,4 @@ CLAUDE.md
 # run_comparison.sh
 # submit_comparison.sbatch
 submit_jupyter.sbatch
+experiments/

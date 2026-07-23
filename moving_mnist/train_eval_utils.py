@@ -190,8 +190,17 @@ class ValCurveRecorder:
 
 
 def train_epoch(model, dataloader, optimizer, criterion, device, input_frames, grad_clip=None,
-                curve_recorder=None, show_h_state=False):
+                curve_recorder=None, show_h_state=False, decoder_velocity_mode="tracked"):
+    """
+    decoder_velocity_mode : "tracked" (default) — MELSTM's decoder velocities
+        are tracked against the true next frame every step, the protocol the
+        phase-correlation slots need to receive a learning signal at all.
+        "frozen" freezes the last encoder velocity for the whole rollout,
+        the same protocol used at frozen eval/inference -- trains h to be
+        robust to that regime instead of only ever seeing oracle tracking.
+    """
     model.train()
+    track_decoder_velocity = decoder_velocity_mode == "tracked"
     running_loss = 0.0
     velocity_metrics = VelocityMetrics()
     has_velocity_data = False
@@ -208,7 +217,8 @@ def train_epoch(model, dataloader, optimizer, criterion, device, input_frames, g
 
         optimizer.zero_grad()
         output_seq, pred_motion, states = _run_model(
-            model, input_seq, pred_len, target_seq, want_velocity, want_states
+            model, input_seq, pred_len, target_seq, want_velocity, want_states,
+            track_decoder_velocity=track_decoder_velocity,
         )
         loss = criterion(output_seq, target_seq)
         loss.backward()

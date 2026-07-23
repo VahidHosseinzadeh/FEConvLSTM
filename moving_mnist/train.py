@@ -183,6 +183,19 @@ def main():
                         help="MELSTM decoder velocity at evaluation: 'frozen' = honest inference (default, drives scheduler/selection); "
                              "'tracked' = oracle GT-tracked eval drives scheduler/selection; "
                              "'both' = select on frozen but also log val_tracked_loss each epoch")
+    parser.add_argument('--train_velocity_mode', choices=['tracked', 'frozen'], default='tracked',
+                        help="MELSTM decoder velocity during training: 'tracked' (default, previous hardcoded "
+                             "behavior) tracks against the true next frame every decoder step -- required for "
+                             "the phase-correlation slots to get any learning signal; 'frozen' freezes the last "
+                             "encoder velocity for the whole rollout, the same protocol used at frozen eval/"
+                             "inference, so h learns to be robust to it instead of only ever seeing oracle tracking.")
+    parser.add_argument('--velocity_subpixel', action='store_true',
+                        help='MELSTM: refine PhaseCorrelation peaks with parabolic (quadratic) sub-pixel '
+                             'interpolation instead of raw whole-pixel argmax (default: off).')
+    parser.add_argument('--velocity_max_disp', type=int, default=None,
+                        help='MELSTM: restrict PhaseCorrelation peak search to +/- this many pixels (e.g. match '
+                             '--data_v_range) instead of the full periodic correlation surface, so noise cannot '
+                             'produce an out-of-range velocity. Default: unrestricted (previous behavior).')
     parser.add_argument('--len_gen_every', type=int, default=0,
                         help='Also run length-generalization every N epochs regardless of val improvement '
                              '(0 = only on new best val). Saves to a separate *_latest.npz')
@@ -479,7 +492,11 @@ def main():
                 kernel_size=args.kernel_size,
                 n_slots= args.num_vel_modes,
                 slot_reduce = 'max',
-                decoder_layers = args.decoder_conv_layers
+                decoder_layers = args.decoder_conv_layers,
+                phase_corr_kwargs={
+                    'subpixel': args.velocity_subpixel,
+                    'max_disp': args.velocity_max_disp,
+                },
             ).to(device)
 
     # Parameter count: printed per top-level submodule and stored in the
@@ -649,7 +666,8 @@ def main():
     for epoch in range(start_epoch, args.epochs + 1):
         epoch_start = time.time()
         train_loss = train_fn(model, train_loader, optimizer, criterion, device, args.input_frames, args.grad_clip,
-                              curve_recorder=curve_recorder, show_h_state=args.show_h_state)
+                              curve_recorder=curve_recorder, show_h_state=args.show_h_state,
+                              decoder_velocity_mode=args.train_velocity_mode)
         epoch_time = time.time() - epoch_start
         val_loss = eval_fn(model, val_loader, criterion, device, args.input_frames, epoch, split_name="val",
                            show_h_state=args.show_h_state)
