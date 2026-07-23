@@ -71,6 +71,13 @@ RESUME=""
 if [ -n "$CKPT" ]; then
   echo ">>> Found checkpoint $CKPT — resuming this run."
   RESUME="--resume $CKPT"
+  # A DONE flag here would be stale: it means an EARLIER completion (e.g. at
+  # a lower --epochs cap before you raised it), not that this resumed run is
+  # done. Without clearing it, submit_comparison.sbatch's chain-check would
+  # find it, wrongly conclude "already finished," and silently stop
+  # resubmitting if this run later gets cut off by the 24h wall clock.
+  # train.py writes a fresh one if/when this run genuinely completes again.
+  rm -f $SAVE_DIR/DONE_${MODEL}_*.flag
 fi
 
 # expandable_segments: reduces allocator fragmentation on long runs (the
