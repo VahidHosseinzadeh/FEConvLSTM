@@ -32,6 +32,15 @@ GRID_COLOR = "#d9d8d4"
 
 
 def load_runs(paths, labels):
+    if labels and len(paths) != len(labels):
+        raise SystemExit(
+            f"{len(paths)} files matched but {len(labels)} --labels given -- "
+            f"a glob like len_gen_lstm_*.npz almost certainly matched leftover "
+            f"files from an old/crashed run, not just the current one. Files:\n  "
+            + "\n  ".join(paths)
+            + "\nCheck timestamps (ls -la) and pass exact filenames instead of "
+              "a wildcard, or archive the stale ones first."
+        )
     runs = []
     for i, p in enumerate(paths):
         d = np.load(p, allow_pickle=False)

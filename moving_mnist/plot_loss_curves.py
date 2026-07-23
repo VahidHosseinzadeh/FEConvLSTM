@@ -59,6 +59,17 @@ def main():
     ap.add_argument("--dpi", type=int, default=200)
     args = ap.parse_args()
 
+    if args.labels and len(args.history_files) != len(args.labels):
+        raise SystemExit(
+            f"{len(args.history_files)} files matched but {len(args.labels)} --labels "
+            f"given (one label per FILE, repeat a label to group seeds) -- a glob like "
+            f"history_lstm_*.json almost certainly matched leftover files from an "
+            f"old/crashed run, not just the current one. Files:\n  "
+            + "\n  ".join(args.history_files)
+            + "\nCheck timestamps (ls -la) and pass exact filenames instead of a "
+              "wildcard, or archive the stale ones first."
+        )
+
     # group files by label (same label = seeds of one model)
     groups = {}
     for i, path in enumerate(args.history_files):

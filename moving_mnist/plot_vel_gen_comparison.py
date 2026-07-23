@@ -38,6 +38,16 @@ def main():
     ap.add_argument("--dpi", type=int, default=200)
     args = ap.parse_args()
 
+    if args.labels and len(args.npz_files) != len(args.labels):
+        raise SystemExit(
+            f"{len(args.npz_files)} files matched but {len(args.labels)} --labels "
+            f"given -- a glob like vel_gen_lstm_*.npz almost certainly matched "
+            f"leftover files from an old/crashed run, not just the current one. Files:\n  "
+            + "\n  ".join(args.npz_files)
+            + "\nCheck timestamps (ls -la) and pass exact filenames instead of a "
+              "wildcard, or archive the stale ones first."
+        )
+
     runs = []
     for i, p in enumerate(args.npz_files):
         d = np.load(p, allow_pickle=False)
