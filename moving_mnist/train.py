@@ -69,6 +69,18 @@ def log_length_generalization_curve(gen_mean, gen_std, gen_pred_frames, args):
     })
 
 
+def train_freeze_prob_for_epoch(epoch, warmup_epochs, ramp_epochs, max_prob):
+    """
+    MELSTM decoder-velocity freeze schedule: 0 through warmup_epochs (pure
+    tracked, lets the K slots specialize onto separate digits), then ramps
+    linearly to max_prob over the next ramp_epochs, then holds at max_prob.
+    """
+    if max_prob <= 0 or epoch <= warmup_epochs:
+        return 0.0
+    t = min(1.0, (epoch - warmup_epochs) / max(1, ramp_epochs))
+    return t * max_prob
+
+
 def save_len_gen_results(path, gen_mean, gen_std, details, args, epoch):
     """
     Persist one run's length-generalization results as .npz so
@@ -183,12 +195,21 @@ def main():
                         help="MELSTM decoder velocity at evaluation: 'frozen' = honest inference (default, drives scheduler/selection); "
                              "'tracked' = oracle GT-tracked eval drives scheduler/selection; "
                              "'both' = select on frozen but also log val_tracked_loss each epoch")
-    parser.add_argument('--train_velocity_mode', choices=['tracked', 'frozen'], default='tracked',
-                        help="MELSTM decoder velocity during training: 'tracked' (default, previous hardcoded "
-                             "behavior) tracks against the true next frame every decoder step -- required for "
-                             "the phase-correlation slots to get any learning signal; 'frozen' freezes the last "
-                             "encoder velocity for the whole rollout, the same protocol used at frozen eval/"
-                             "inference, so h learns to be robust to it instead of only ever seeing oracle tracking.")
+    parser.add_argument('--train_freeze_warmup_epochs', type=int, default=10,
+                        help="MELSTM: epochs of pure tracked decoder velocity (freeze_prob=0) before the frozen-"
+                             "probability ramp begins. Lets the K velocity slots specialize onto separate digits "
+                             "first -- training with frozen decoder velocity from scratch collapses them onto a "
+                             "single digit, since the reconstruction loss only exists on decoder output and "
+                             "freezing removes the only per-step signal that differentiates the slots there.")
+    parser.add_argument('--train_freeze_ramp_epochs', type=int, default=20,
+                        help="MELSTM: epochs over which the per-batch frozen-decoder-velocity probability ramps "
+                             "linearly from 0 to --train_freeze_max_prob, starting right after "
+                             "--train_freeze_warmup_epochs.")
+    parser.add_argument('--train_freeze_max_prob', type=float, default=0.5,
+                        help="MELSTM: frozen-probability reached at the end of the ramp, then held for the rest "
+                             "of training. Exposes h to the same stale-velocity rollout it faces at frozen eval/"
+                             "length-generalization, instead of only ever seeing oracle-tracked training. "
+                             "0.0 = pure tracked for the whole run (old hardcoded behavior).")
     parser.add_argument('--velocity_subpixel', action='store_true',
                         help='MELSTM: refine PhaseCorrelation peaks with parabolic (quadratic) sub-pixel '
                              'interpolation instead of raw whole-pixel argmax (default: off).')
@@ -665,9 +686,12 @@ def main():
 
     for epoch in range(start_epoch, args.epochs + 1):
         epoch_start = time.time()
+        train_freeze_prob = train_freeze_prob_for_epoch(
+            epoch, args.train_freeze_warmup_epochs, args.train_freeze_ramp_epochs, args.train_freeze_max_prob
+        )
         train_loss = train_fn(model, train_loader, optimizer, criterion, device, args.input_frames, args.grad_clip,
                               curve_recorder=curve_recorder, show_h_state=args.show_h_state,
-                              decoder_velocity_mode=args.train_velocity_mode)
+                              freeze_prob=train_freeze_prob)
         epoch_time = time.time() - epoch_start
         val_loss = eval_fn(model, val_loader, criterion, device, args.input_frames, epoch, split_name="val",
                            show_h_state=args.show_h_state)
@@ -688,7 +712,8 @@ def main():
         history['val_loss'].append(val_loss)
         history['epoch_time_sec'].append(epoch_time)
         tracked_str = f" | Val (tracked): {val_tracked_loss:.4f}" if val_tracked_loss is not None else ""
-        print(f"Epoch {epoch}/{args.epochs} | {args.model:^8} | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f}{tracked_str} | {epoch_time:.1f}s")
+        freeze_str = f" | Freeze prob: {train_freeze_prob:.2f}" if train_freeze_prob > 0 else ""
+        print(f"Epoch {epoch}/{args.epochs} | {args.model:^8} | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f}{tracked_str}{freeze_str} | {epoch_time:.1f}s")
 
         if scheduler is not None:
             lr_before = optimizer.param_groups[0]['lr']
@@ -703,6 +728,7 @@ def main():
             "val_loss": val_loss,
             "lr": optimizer.param_groups[0]['lr'],
             "epoch_time_sec": epoch_time,
+            "train_freeze_prob": train_freeze_prob,
             "epoch": epoch
         }
         if val_tracked_loss is not None:

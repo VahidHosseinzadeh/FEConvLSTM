@@ -1,3 +1,4 @@
+import random
 import torch
 import wandb
 from tqdm import tqdm
@@ -190,17 +191,21 @@ class ValCurveRecorder:
 
 
 def train_epoch(model, dataloader, optimizer, criterion, device, input_frames, grad_clip=None,
-                curve_recorder=None, show_h_state=False, decoder_velocity_mode="tracked"):
+                curve_recorder=None, show_h_state=False, freeze_prob=0.0):
     """
-    decoder_velocity_mode : "tracked" (default) — MELSTM's decoder velocities
-        are tracked against the true next frame every step, the protocol the
-        phase-correlation slots need to receive a learning signal at all.
-        "frozen" freezes the last encoder velocity for the whole rollout,
-        the same protocol used at frozen eval/inference -- trains h to be
-        robust to that regime instead of only ever seeing oracle tracking.
+    freeze_prob : per-batch probability in [0, 1] that MELSTM's decoder
+        velocity is frozen (last encoder velocity held for the whole
+        rollout, the eval/inference protocol) instead of tracked against the
+        true next frame. 0.0 (default) = always tracked -- the protocol the
+        K velocity slots need to specialize onto separate digits in the
+        first place, since the reconstruction loss only exists on decoder
+        output and freezing removes the only per-step signal that
+        differentiates the slots there. Ramp this up gradually (see
+        train.py's --train_freeze_* args) only after that specialization has
+        had time to emerge -- freeze_prob=1.0 from scratch collapses the
+        slots onto a single digit.
     """
     model.train()
-    track_decoder_velocity = decoder_velocity_mode == "tracked"
     running_loss = 0.0
     velocity_metrics = VelocityMetrics()
     has_velocity_data = False
@@ -214,6 +219,8 @@ def train_epoch(model, dataloader, optimizer, criterion, device, input_frames, g
 
         want_velocity, want_states = _velocity_flags(model, gt_motion, show_h_state)
         want_states = want_states and i == 0
+
+        track_decoder_velocity = random.random() >= freeze_prob
 
         optimizer.zero_grad()
         output_seq, pred_motion, states = _run_model(
