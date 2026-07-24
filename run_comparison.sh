@@ -87,18 +87,7 @@ case $MODEL in
   melstm)
     # eval_velocity_mode both: honest val drives selection, oracle val logged
     # alongside (velocity-vs-rendering decomposition). MELSTM-only effect.
-    #
-    # train_freeze_*: pure tracked for the first 15 epochs so the 2 velocity
-    # slots specialize onto separate digits first (training with frozen
-    # decoder velocity from scratch collapses them onto a single digit --
-    # the reconstruction loss only exists on decoder output, and freezing
-    # removes the only per-step signal that differentiates the slots there).
-    # Then ramp to 50% frozen by epoch 30 (= MIN_EPOCHS) and hold, so h gets
-    # real exposure to the stale-velocity rollout it faces at frozen eval /
-    # length-generalization instead of only ever seeing oracle tracking.
-    EXTRA=(--model melstm --num_vel_modes 2 --eval_velocity_mode both \
-           --train_freeze_warmup_epochs 15 --train_freeze_ramp_epochs 15 --train_freeze_max_prob 0.5 \
-           --wandb_name "melstm_h${HIDDEN}_s${SEED}") ;;
+    EXTRA=(--model melstm --num_vel_modes 2 --eval_velocity_mode both --wandb_name "melstm_h${HIDDEN}_s${SEED}") ;;
   *)
     echo "unknown model: $MODEL"; exit 1 ;;
 esac

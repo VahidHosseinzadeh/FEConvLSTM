@@ -1,4 +1,3 @@
-import random
 import torch
 import wandb
 from tqdm import tqdm
@@ -191,20 +190,7 @@ class ValCurveRecorder:
 
 
 def train_epoch(model, dataloader, optimizer, criterion, device, input_frames, grad_clip=None,
-                curve_recorder=None, show_h_state=False, freeze_prob=0.0):
-    """
-    freeze_prob : per-batch probability in [0, 1] that MELSTM's decoder
-        velocity is frozen (last encoder velocity held for the whole
-        rollout, the eval/inference protocol) instead of tracked against the
-        true next frame. 0.0 (default) = always tracked -- the protocol the
-        K velocity slots need to specialize onto separate digits in the
-        first place, since the reconstruction loss only exists on decoder
-        output and freezing removes the only per-step signal that
-        differentiates the slots there. Ramp this up gradually (see
-        train.py's --train_freeze_* args) only after that specialization has
-        had time to emerge -- freeze_prob=1.0 from scratch collapses the
-        slots onto a single digit.
-    """
+                curve_recorder=None, show_h_state=False):
     model.train()
     running_loss = 0.0
     velocity_metrics = VelocityMetrics()
@@ -220,12 +206,9 @@ def train_epoch(model, dataloader, optimizer, criterion, device, input_frames, g
         want_velocity, want_states = _velocity_flags(model, gt_motion, show_h_state)
         want_states = want_states and i == 0
 
-        track_decoder_velocity = random.random() >= freeze_prob
-
         optimizer.zero_grad()
         output_seq, pred_motion, states = _run_model(
-            model, input_seq, pred_len, target_seq, want_velocity, want_states,
-            track_decoder_velocity=track_decoder_velocity,
+            model, input_seq, pred_len, target_seq, want_velocity, want_states
         )
         loss = criterion(output_seq, target_seq)
         loss.backward()
