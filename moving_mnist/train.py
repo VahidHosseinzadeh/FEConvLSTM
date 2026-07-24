@@ -183,13 +183,6 @@ def main():
                         help="MELSTM decoder velocity at evaluation: 'frozen' = honest inference (default, drives scheduler/selection); "
                              "'tracked' = oracle GT-tracked eval drives scheduler/selection; "
                              "'both' = select on frozen but also log val_tracked_loss each epoch")
-    parser.add_argument('--velocity_subpixel', action='store_true',
-                        help='MELSTM: refine PhaseCorrelation peaks with parabolic (quadratic) sub-pixel '
-                             'interpolation instead of raw whole-pixel argmax (default: off).')
-    parser.add_argument('--velocity_max_disp', type=int, default=None,
-                        help='MELSTM: restrict PhaseCorrelation peak search to +/- this many pixels (e.g. match '
-                             '--data_v_range) instead of the full periodic correlation surface, so noise cannot '
-                             'produce an out-of-range velocity. Default: unrestricted (previous behavior).')
     parser.add_argument('--len_gen_every', type=int, default=0,
                         help='Also run length-generalization every N epochs regardless of val improvement '
                              '(0 = only on new best val). Saves to a separate *_latest.npz')
@@ -486,11 +479,7 @@ def main():
                 kernel_size=args.kernel_size,
                 n_slots= args.num_vel_modes,
                 slot_reduce = 'max',
-                decoder_layers = args.decoder_conv_layers,
-                phase_corr_kwargs={
-                    'subpixel': args.velocity_subpixel,
-                    'max_disp': args.velocity_max_disp,
-                },
+                decoder_layers = args.decoder_conv_layers
             ).to(device)
 
     # Parameter count: printed per top-level submodule and stored in the
