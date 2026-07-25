@@ -440,8 +440,6 @@ def main():
         print(f"  patience={args.lr_patience}  factor={args.lr_factor}  min_lr={args.lr_min}")
     print(f"Model: {args.model}")
     print(f"Hidden size: {args.hidden_size}")
-    print(f"Decoder hidden size: {args.decoder_hidden_size or args.hidden_size}"
-          f"{'' if args.decoder_hidden_size else ' (= hidden_size)'}")
     print(f"Num layers: {args.num_layers}")
     print(f"Decoder conv layers: {args.decoder_conv_layers}")
     print(f"Kernel size: {args.kernel_size}")
@@ -468,8 +466,7 @@ def main():
                 kernel_size=args.kernel_size,
                 v_range=args.v_range,
                 pool_type='max',
-                decoder_conv_layers=args.decoder_conv_layers,
-                decoder_channels=args.decoder_hidden_size
+                decoder_conv_layers=args.decoder_conv_layers
             ).to(device)
     elif args.model == "lstm":
         assert args.v_range == 0, "v_range must be 0 for grnn"
@@ -479,8 +476,7 @@ def main():
                 kernel_size=args.kernel_size,
                 v_range=0,
                 pool_type='max',
-                decoder_conv_layers=args.decoder_conv_layers,
-                decoder_channels=args.decoder_hidden_size
+                decoder_conv_layers=args.decoder_conv_layers
             ).to(device)
     elif args.model == "melstm":
         model = Seq2SeqMEConvLSTM(
@@ -489,8 +485,7 @@ def main():
                 kernel_size=args.kernel_size,
                 n_slots= args.num_vel_modes,
                 slot_reduce = 'max',
-                decoder_layers = args.decoder_conv_layers,
-                decoder_channels=args.decoder_hidden_size
+                decoder_layers = args.decoder_conv_layers
             ).to(device)
 
     # Parameter count: printed per top-level submodule and stored in the

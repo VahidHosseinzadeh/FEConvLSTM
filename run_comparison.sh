@@ -19,26 +19,38 @@ set -e
 MODEL=${1:?usage: bash run_comparison.sh lstm|felstm|melstm}
 
 # ---- shared settings: MUST be identical across the three runs -------------
-HIDDEN=64          # cheap: felstm's cost scales ~quadratically in hidden on top of its
+HIDDEN=32          # cheap: felstm's cost scales ~quadratically in hidden on top of its
                    # existing 25x multiplier, so this matters far more for wall-clock
                    # than 45 or 64 would. Already validated training (melstm) at this size.
-BATCH=32           # extrapolated ~25GB at hidden=32/seq_len=20, from the 74.71GB
-                   # measurement at hidden=64/batch=32/seq_len=30 (activations scale
-                   # ~linearly in both hidden and seq_len). Comfortable margin — still
-                   # worth a quick probe once, not a real OOM risk at this size.
-DEC_LAYERS=2       # hidden decoder blocks (total convs = this + 1); ~37k extra params
+
+BATCH=32           # ~62GB for felstm at the settings below, on the 80GB A100 (~75GB
+                   # usable after CUDA context + fragmentation). Calibrated from the
+                   # real 74.71GB measurement at hidden=64/batch=32/seq_len=30 --
+                   # activations scale ~linearly in batch, hidden and seq_len, so that
+                   # config sat right at the ceiling and OOM'd; seq_len=25 pulls it back.
+DEC_LAYERS=1       # hidden decoder blocks (total convs = this + 1); ~37k extra params
                    # vs 1 layer, negligible next to the ~150k-param cell — not a real cost.
-SEQ_LEN=20
-INPUT_FRAMES=10    # training context; pred = SEQ_LEN - INPUT_FRAMES = 10
-GEN_INPUT=10       # = INPUT_FRAMES so len-gen isolates horizon only
+DEC_HIDDEN=32     # decoder conv width, independent of HIDDEN (which sets the recurrent
+                   # cell width). Cheap to raise: the recurrent state is carried on every
+                   # velocity copy at every timestep and kept for BPTT, while the decoder
+                   # runs once per predicted frame on the already-pooled map -- 128 costs
+                   # ~1GB here vs ~62GB for the encoder. Set to "$HIDDEN" for the old
+                   # behavior (decoder width tied to the cell width).
+SEQ_LEN=25
+INPUT_FRAMES=15    # training context; pred = SEQ_LEN - INPUT_FRAMES = 10
+GEN_INPUT=15       # = INPUT_FRAMES so len-gen isolates horizon only: evaluating at a
+                   # context length the model never trained on is itself OOD (it hits
+                   # felstm hardest -- every wrong-velocity copy drifts for the extra
+                   # steps), which shows up as inflated error from the very first
+                   # predicted frame rather than as a horizon effect.
 GEN_SEQ_LEN=100    # 90 predicted frames in the len-gen benchmark (9x trained horizon)
 IMAGE=36
-EPOCHS=100          # generous shared ceiling; early stopping (below) ends lstm/melstm
+EPOCHS=50          # generous shared ceiling; early stopping (below) ends lstm/melstm
                    # well before this once converged. felstm's real limit is wall-clock,
                    # not this number.
-MIN_EPOCHS=30      # no early stop before this many epochs (gives the LR scheduler,
+MIN_EPOCHS=40      # no early stop before this many epochs (gives the LR scheduler,
                    # patience=5, room to cut LR at least once first)
-EARLY_STOP_PATIENCE=25   # ~2-3 LR reductions' worth of chances before giving up
+EARLY_STOP_PATIENCE=0   # ~2-3 LR reductions' worth of chances before giving up
 SEED=42
 SAVE_DIR=./experiments
 
@@ -51,6 +63,7 @@ SAVE_DIR=./experiments
 COMMON=(
   --data_v_range 2
   --hidden_size "$HIDDEN"
+  --decoder_hidden_size "$DEC_HIDDEN"
   --decoder_conv_layers "$DEC_LAYERS"
   --batch_size "$BATCH"
   --grad_clip 1.0
