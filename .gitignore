@@ -83,3 +83,4 @@ CLAUDE.md
 # submit_comparison.sbatch
 submit_jupyter.sbatch
 experiments/
+archive/
