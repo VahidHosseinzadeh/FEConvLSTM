@@ -132,6 +132,12 @@ def main():
     parser.add_argument('--lr_min', type=float, default=1e-6, help='Floor below which LR will not be reduced further (only with --use_lr_scheduler)')
     parser.add_argument('--model', choices=['lstm', 'felstm', 'melstm'], default='felstm')
     parser.add_argument('--hidden_size', type=int, default=128)
+    parser.add_argument('--decoder_hidden_size', type=int, default=None,
+                        help='Width of the decoder conv stack, independent of --hidden_size (which sets the '
+                             'recurrent cell width). Default: None = same as --hidden_size (previous behavior). '
+                             'Much cheaper to raise than --hidden_size: the recurrent state is carried per '
+                             'velocity slot/channel at every timestep and kept for BPTT, while the decoder runs '
+                             'once per predicted frame on the already-pooled map.')
     parser.add_argument('--num_layers', type=int, default=1)
     parser.add_argument('--kernel_size', type=int, default=3)
     parser.add_argument('--decoder_conv_layers', type=int, default=4)
@@ -434,6 +440,8 @@ def main():
         print(f"  patience={args.lr_patience}  factor={args.lr_factor}  min_lr={args.lr_min}")
     print(f"Model: {args.model}")
     print(f"Hidden size: {args.hidden_size}")
+    print(f"Decoder hidden size: {args.decoder_hidden_size or args.hidden_size}"
+          f"{'' if args.decoder_hidden_size else ' (= hidden_size)'}")
     print(f"Num layers: {args.num_layers}")
     print(f"Decoder conv layers: {args.decoder_conv_layers}")
     print(f"Kernel size: {args.kernel_size}")
@@ -460,7 +468,8 @@ def main():
                 kernel_size=args.kernel_size,
                 v_range=args.v_range,
                 pool_type='max',
-                decoder_conv_layers=args.decoder_conv_layers
+                decoder_conv_layers=args.decoder_conv_layers,
+                decoder_channels=args.decoder_hidden_size
             ).to(device)
     elif args.model == "lstm":
         assert args.v_range == 0, "v_range must be 0 for grnn"
@@ -470,7 +479,8 @@ def main():
                 kernel_size=args.kernel_size,
                 v_range=0,
                 pool_type='max',
-                decoder_conv_layers=args.decoder_conv_layers
+                decoder_conv_layers=args.decoder_conv_layers,
+                decoder_channels=args.decoder_hidden_size
             ).to(device)
     elif args.model == "melstm":
         model = Seq2SeqMEConvLSTM(
@@ -479,7 +489,8 @@ def main():
                 kernel_size=args.kernel_size,
                 n_slots= args.num_vel_modes,
                 slot_reduce = 'max',
-                decoder_layers = args.decoder_conv_layers
+                decoder_layers = args.decoder_conv_layers,
+                decoder_channels=args.decoder_hidden_size
             ).to(device)
 
     # Parameter count: printed per top-level submodule and stored in the

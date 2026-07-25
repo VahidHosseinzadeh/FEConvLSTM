@@ -140,6 +140,7 @@ class Seq2SeqMEConvLSTM(nn.Module):
                  kernel_size=3,
                  slot_reduce='max',
                  decoder_layers=1,
+                 decoder_channels=None,
                  bias=True,
                  batch_first=True,
                  phase_corr_kwargs=None):
@@ -150,6 +151,13 @@ class Seq2SeqMEConvLSTM(nn.Module):
         self.hidden_channels = hidden_channels
         self.slot_reduce     = slot_reduce
         output_channels      = output_channels or input_channels
+        # Decoder width is independent of the recurrent width: the cell's
+        # hidden_channels is carried per slot across every timestep (and
+        # kept for BPTT), the decoder runs once per predicted frame on the
+        # already slot-pooled (B, hidden, H, W) map. None keeps them equal
+        # (previous behavior, and what existing checkpoints were built at).
+        decoder_channels     = decoder_channels or hidden_channels
+        self.decoder_channels = decoder_channels
 
         pc_kw = phase_corr_kwargs or {}
 
@@ -160,11 +168,13 @@ class Seq2SeqMEConvLSTM(nn.Module):
                                    kernel_size, bias)
 
         layers = []
+        in_ch = hidden_channels
         for _ in range(decoder_layers):
-            layers += [nn.Conv2d(hidden_channels, hidden_channels,
+            layers += [nn.Conv2d(in_ch, decoder_channels,
                                  3, padding=1, padding_mode='circular', bias=True),
                        nn.ReLU()]
-        layers += [nn.Conv2d(hidden_channels, output_channels,
+            in_ch = decoder_channels
+        layers += [nn.Conv2d(in_ch, output_channels,
                              3, padding=1, padding_mode='circular', bias=True)]
         self.decoder = nn.Sequential(*layers)
 

@@ -183,7 +183,8 @@ class Seq2SeqFEConvLSTM(nn.Module):
                  kernel_size=3,
                  v_range=0,
                  pool_type='max',
-                 decoder_conv_layers=1):
+                 decoder_conv_layers=1,
+                 decoder_channels=None):
 
         super().__init__()
 
@@ -194,6 +195,19 @@ class Seq2SeqFEConvLSTM(nn.Module):
             if output_channels is not None
             else input_channels
         )
+
+        # Decoder width is independent of the recurrent width: the cell's
+        # hidden_channels is carried on every one of the num_v velocity
+        # copies at every timestep (and kept for BPTT), the decoder runs
+        # once per predicted frame on the already velocity-pooled
+        # (B, hidden, H, W) map. None keeps them equal (previous behavior,
+        # and what existing checkpoints were built at).
+        decoder_channels = (
+            decoder_channels
+            if decoder_channels is not None
+            else hidden_channels
+        )
+        self.decoder_channels = decoder_channels
 
         self.cell = FEConvLSTMCell(
             input_channels=input_channels,
@@ -206,13 +220,14 @@ class Seq2SeqFEConvLSTM(nn.Module):
         self.num_v = self.cell.num_v
 
         decoder = []
+        in_ch = hidden_channels
 
         for _ in range(decoder_conv_layers):
 
             decoder += [
                 nn.Conv2d(
-                    hidden_channels,
-                    hidden_channels,
+                    in_ch,
+                    decoder_channels,
                     kernel_size=3,
                     padding=1,
                     padding_mode='circular',
@@ -220,10 +235,11 @@ class Seq2SeqFEConvLSTM(nn.Module):
                 ),
                 nn.ReLU()
             ]
+            in_ch = decoder_channels
 
         decoder += [
             nn.Conv2d(
-                hidden_channels,
+                in_ch,
                 self.output_channels,
                 kernel_size=3,
                 padding=1,
