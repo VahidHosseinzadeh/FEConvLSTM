@@ -15,6 +15,41 @@ from velocity_model_based_MEConvLSTM_model import Seq2SeqMEConvLSTM
 from channel_based_FEConvLSTM_model import Seq2SeqFEConvLSTM
 
 
+def build_model(cfg):
+    """Construct the model a run config describes.
+
+    Accepts either the argparse Namespace used during training or the config
+    dict stored in history_<model>_<runid>.json, so offline evaluation
+    (motion_generalization.py) rebuilds exactly the architecture that was
+    trained instead of re-specifying the hyperparameters by hand.
+    """
+    get = cfg.get if isinstance(cfg, dict) else (lambda k, d=None: getattr(cfg, k, d))
+
+    name = get("model")
+    hidden = get("hidden_size")
+    kernel = get("kernel_size", 3)
+    dec_layers = get("decoder_conv_layers", 1)
+    # None/absent means "decoder width follows the cell width"
+    dec_channels = get("decoder_hidden_size") or hidden
+
+    if name in ("felstm", "lstm"):
+        v_range = get("v_range", 0) if name == "felstm" else 0
+        if name == "lstm":
+            assert get("v_range", 0) == 0, "v_range must be 0 for lstm"
+        return Seq2SeqFEConvLSTM(
+            input_channels=1, hidden_channels=hidden, kernel_size=kernel,
+            v_range=v_range, pool_type="max",
+            decoder_conv_layers=dec_layers, decoder_channels=dec_channels)
+
+    if name == "melstm":
+        return Seq2SeqMEConvLSTM(
+            input_channels=1, hidden_channels=hidden, kernel_size=kernel,
+            n_slots=get("num_vel_modes", 2), slot_reduce="max",
+            decoder_layers=dec_layers, decoder_channels=dec_channels)
+
+    raise ValueError(f"unknown model {name!r}")
+
+
 def _unpack_batch(batch, device):
     """
     Datasets yield (seq, label) or, with return_motion=True, (seq, label,

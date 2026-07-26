@@ -16,7 +16,8 @@ import numpy as np
 import random
 import time
 import os
-from train_eval_utils import train_epoch, eval_epoch, eval_len_generalization, eval_velocity_generalization, ValCurveRecorder
+from train_eval_utils import (train_epoch, eval_epoch, eval_len_generalization,
+                             eval_velocity_generalization, ValCurveRecorder, build_model)
 from velocity_metrics import VelocityMetrics
 
 class MSEPlusL1Loss(nn.Module):
@@ -459,34 +460,9 @@ def main():
     np.random.seed(args.model_seed)
     random.seed(args.model_seed)
     
-    if args.model == "felstm":
-        model = Seq2SeqFEConvLSTM(
-                input_channels=1,
-                hidden_channels=args.hidden_size,
-                kernel_size=args.kernel_size,
-                v_range=args.v_range,
-                pool_type='max',
-                decoder_conv_layers=args.decoder_conv_layers
-            ).to(device)
-    elif args.model == "lstm":
-        assert args.v_range == 0, "v_range must be 0 for grnn"
-        model = Seq2SeqFEConvLSTM(
-                input_channels=1,
-                hidden_channels=args.hidden_size,
-                kernel_size=args.kernel_size,
-                v_range=0,
-                pool_type='max',
-                decoder_conv_layers=args.decoder_conv_layers
-            ).to(device)
-    elif args.model == "melstm":
-        model = Seq2SeqMEConvLSTM(
-                input_channels=1,
-                hidden_channels=args.hidden_size,
-                kernel_size=args.kernel_size,
-                n_slots= args.num_vel_modes,
-                slot_reduce = 'max',
-                decoder_layers = args.decoder_conv_layers
-            ).to(device)
+    # Single construction path shared with motion_generalization.py, so an
+    # offline evaluation cannot rebuild a different architecture than was trained.
+    model = build_model(args).to(device)
 
     # Parameter count: printed per top-level submodule and stored in the
     # wandb config so runs of different models are directly comparable.

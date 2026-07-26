@@ -84,3 +84,5 @@ CLAUDE.md
 submit_jupyter.sbatch
 experiments/
 archive/
+cluster_runs/
+figures/
