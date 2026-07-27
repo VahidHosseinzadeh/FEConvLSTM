@@ -16,6 +16,22 @@ class TDMovingMNISTDataset(Dataset):
     "constant"    : velocity is fixed for the whole sequence.
     "piecewise"   : velocity held for a random segment, then updated.
     "stochastic"  : velocity changes with probability p_change each step.
+    "accelerate"  : each digit gets a constant acceleration vector; every
+                    min_segment..max_segment steps the velocity is incremented
+                    by it and clipped to the grid, so |v| ramps rather than
+                    jumping. Unlike the other modes the velocity sequence is
+                    systematic, not a random walk -- use it to test motion whose
+                    *magnitude* changes over the context. transition_mode,
+                    smooth_probability and p_change are unused here.
+
+    Which parameters apply to which mode
+    ------------------------------------
+        min_segment/max_segment : piecewise, accelerate
+        p_change                : stochastic only
+        transition_mode         : piecewise, stochastic
+        smooth_probability      : only when transition_mode == "smooth"
+                                  ("smooth" with probability 0.0 is exactly
+                                   equivalent to "uniform")
 
     All modes support freeze_after (see below).
 
@@ -366,11 +382,21 @@ class TDMovingMNISTDataset(Dataset):
             # freeze_after has no extra effect here but is applied uniformly
             return self._apply_freeze(motions)
 
-        # Piecewise / stochastic: evolve step by step
+        # Piecewise / stochastic / accelerate: evolve step by step
         segment_remaining = [
             self._randint(self.min_segment, self.max_segment + 1)
             for _ in range(N)
         ]
+        # accelerate mode: sign per digit, +1 to speed up (|v| ramps outward
+        # toward max_speed) or -1 to slow down. Randomly signed acceleration
+        # would largely cancel across digits and leave |v| almost flat, which
+        # is not what this mode is for.
+        #
+        # Drawn ONLY in accelerate mode: self._choice advances the RNG, so
+        # sampling it unconditionally would shift the random stream for every
+        # other mode and silently change previously-generated fixed benchmarks.
+        accel_sign = ([self._choice([+1, +1, -1]) for _ in range(N)]
+                      if self.motion_mode == "accelerate" else None)
 
         for t in range(1, T):
             for i in range(N):
@@ -389,10 +415,26 @@ class TDMovingMNISTDataset(Dataset):
                     if self._random() < self.p_change:
                         new_v = self._update_velocity(current)
 
+                elif self.motion_mode == "accelerate":
+                    segment_remaining[i] -= 1
+                    if segment_remaining[i] <= 0:
+                        s = accel_sign[i]
+                        # step each component away from (s=+1) or toward (s=-1)
+                        # zero, so the SPEED ramps rather than the direction
+                        # wandering
+                        step = lambda c: c + s * (1 if c >= 0 else -1)
+                        cand = (min(max(step(current[0]), -self.max_speed), self.max_speed),
+                                min(max(step(current[1]), -self.max_speed), self.max_speed))
+                        # (0, 0) is not on the velocity grid; hold instead of stopping
+                        new_v = current if cand == (0, 0) else cand
+                        segment_remaining[i] = self._randint(
+                            self.min_segment, self.max_segment + 1
+                        )
+
                 else:
                     raise ValueError(
-                        f"Unknown motion_mode '{self.motion_mode}'. "
-                        f"Choose from 'constant', 'piecewise', 'stochastic'."
+                        f"Unknown motion_mode '{self.motion_mode}'. Choose from "
+                        f"'constant', 'piecewise', 'stochastic', 'accelerate'."
                     )
 
                 motions[t, i, 0] = new_v[0]
@@ -403,12 +445,22 @@ class TDMovingMNISTDataset(Dataset):
 
     def _apply_freeze(self, motions):
         """
-        If freeze_after is set, overwrite motions[freeze_after:] with the
-        velocity at step freeze_after - 1.
+        Freeze the velocity from step freeze_after - 1 onward, using the value
+        at step freeze_after - 2:
 
-        This implements the two-phase trajectory:
-            phase 1  (steps 0 .. freeze_after-1): time-varying
-            phase 2  (steps freeze_after .. T-1): constant
+            motions[freeze_after - 1 :] = motions[freeze_after - 2]
+
+        Two-phase trajectory, for freeze_after = f:
+            phase 1  (steps 0 .. f-2)   : time-varying
+            phase 2  (steps f-1 .. T-1) : constant
+
+        Note the indices: with f = input_frames the context is frames
+        0 .. f-1, whose transitions are motions[0 .. f-2]. Freezing from f-1
+        with the value from f-2 therefore makes the velocity that governs the
+        ENTIRE rollout identical to the last transition visible in the context.
+        That is deliberate -- it is what lets a decoder that freezes its last
+        encoder velocity match the ground-truth continuation exactly, instead
+        of having to guess a value it was never shown.
         """
         if self.freeze_after is None:
             return motions

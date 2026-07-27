@@ -43,21 +43,47 @@ from time_dependent_moving_mnist_dataset import TDMovingMNISTDataset
 from train_eval_utils import build_model
 
 # --------------------------------------------------------------------------
-# Motion presets. Fields override the run's own training-motion config; any
-# key not listed keeps the trained value, so "training" is the reference.
+# Motion presets. Each dict lists ONLY the fields it changes; anything absent
+# keeps the run's own trained value, so "as_trained" is the reference.
+#
+# Only parameters the chosen motion_mode actually reads are listed, because the
+# generator ignores the rest and listing them suggests an effect that does not
+# exist:
+#     min_segment/max_segment : piecewise, accelerate
+#     p_change                : stochastic only
+#     transition_mode         : piecewise, stochastic
+#     smooth_probability      : only when transition_mode == "smooth"
+#                               ("smooth" at probability 0.0 == "uniform")
+#
+# Every preset keeps freeze_after = gen_input_frames, so the ROLLOUT is always
+# constant-velocity extrapolation. The presets vary two independent things:
+#   (a) how hard the frozen velocity is to INFER from the context
+#   (b) how large that velocity is, i.e. whether an enumerated model can
+#       represent it at all
 # --------------------------------------------------------------------------
 MOTION_PRESETS = {
-    "training":        {},                                   # as trained/evaluated
-    # ---- (a) harder to infer the velocity that gets frozen ----------------
-    "ctx_constant":    dict(motion_mode="constant"),
-    "ctx_jumpy":       dict(transition_mode="uniform", smooth_probability=0.0),
-    "ctx_late_change": dict(min_segment=1, max_segment=2),
-    "ctx_churn":       dict(motion_mode="stochastic", transition_mode="uniform",
-                            p_change=0.6, smooth_probability=0.0),
-    # ---- (b) harder to extrapolate: magnitude of the frozen velocity ------
-    "speed_1":         dict(data_v_range=1),
-    "speed_3":         dict(data_v_range=3),
-    "speed_4":         dict(data_v_range=4),
+    "as_trained":         {},                    # reference: the trained distribution
+
+    # ---- (a) inference difficulty, magnitude held at the trained range ----
+    "static_velocity":    dict(motion_mode="constant"),
+    "abrupt_jumps":       dict(transition_mode="uniform"),
+    "change_at_boundary": dict(min_segment=1, max_segment=2),
+    "rapid_changes":      dict(motion_mode="stochastic", transition_mode="uniform",
+                               p_change=0.6),
+
+    # ---- (b) magnitude, context behaviour held as trained ----------------
+    "slow_v1":            dict(data_v_range=1),
+    "fast_v3":            dict(data_v_range=3),
+    "fast_v4":            dict(data_v_range=4),
+
+    # ---- crossed: large velocity that is trivial to infer -----------------
+    # Separates "the velocity is unrepresentable" from "the velocity is hard to
+    # read off the context" -- constant context removes the inference problem
+    # entirely while keeping the magnitude far outside a |v| <= 2 lattice.
+    "fast_v4_static":     dict(motion_mode="constant", data_v_range=4),
+
+    # ---- changing speed: |v| ramps toward the extremes during the context --
+    "accelerating_v4":    dict(motion_mode="accelerate", data_v_range=4),
 }
 
 
