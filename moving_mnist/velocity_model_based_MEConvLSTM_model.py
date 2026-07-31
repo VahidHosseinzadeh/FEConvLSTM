@@ -70,42 +70,25 @@ class MEConvLSTMCell(nn.Module):
                           padding_mode="border", align_corners=True)
         return x.view(B, K, C, H, W)
 
-    def encode_input_template(self, x):
+    def encode_input(self, x):
         """
-        The frame seen through this cell's own input kernels, reduced to the
-        single channel phase correlation actually consumes. No new parameters.
+        Input-side half of the gate convolution — the frame seen through this
+        cell's own kernels, with no extra parameters.
 
         self.conv runs on cat([x, h], dim=1), so its weight splits along the
         in-channel axis into an x-block [:, :input_dim] and an h-block
-        [:, input_dim:]. The x-block is exactly the filters the cell applies
-        to a frame.
+        [:, input_dim:]. Slicing the x-block gives exactly the filters the
+        cell applies to a frame. Bias is deliberately dropped: it is a
+        per-channel constant, i.e. a pure DC term, and after the
+        phase-correlation magnitude normalisation the DC bin only adds a
+        shift-independent offset to the correlation surface (it cannot move
+        the peak), so carrying it buys nothing.
 
-        Why the weight is averaged instead of the feature map: the tracker
-        needs mean over gate channels of conv(x, W_x), and convolution is
-        linear in its weights, so
-
-            mean_c conv(x, W_x)  ==  conv(x, mean_c W_x)
-
-        Folding the mean into the kernel first is the same number to float
-        rounding, but it convolves once into (B, 1, H, W) instead of building
-        a (B, 4*hidden, H, W) map only to collapse it -- ~4*hidden times less
-        work and memory. Measured at the run_comparison.sh config (hidden=32,
-        36x36, B=32): 4.7 ms -> 0.07 ms per call, which takes tracking from
-        ~4% of a training step down to unmeasurable. Note what this says
-        about the design: the tracker is a *single* learned 3x3 filter, the
-        mean of all 4*hidden gate kernels.
-
-        Bias is deliberately dropped: it is a per-channel constant, i.e. a
-        pure DC term, and after the phase-correlation magnitude normalisation
-        the DC bin only adds a shift-independent offset to the correlation
-        surface (it cannot move the peak), so carrying it buys nothing.
-
-        x : (B, C, H, W) -> (B, 1, H, W)
+        x : (B, C, H, W) -> (B, 4 * hidden_dim, H, W)
         """
-        w = self.conv.weight[:, :self.input_dim].mean(dim=0, keepdim=True)
         ph, pw = self.conv.padding
         x = F.pad(x, (pw, pw, ph, ph), mode="circular")   # match conv's padding_mode
-        return F.conv2d(x, w)
+        return F.conv2d(x, self.conv.weight[:, :self.input_dim])
 
     def forward(self, x, h, c, u):
         B, K, Ch, H, W = h.shape
@@ -232,9 +215,9 @@ class Seq2SeqMEConvLSTM(nn.Module):
 
         h lives in the cell's feature space, the raw frame does not, so the
         frame is first pushed through the cell's own input kernels
-        (cell.encode_input_template — the x-block of the gate conv, no new
-        weights). Both operands are then channel-means of the same learned
-        feature space, which is what phase correlation compares.
+        (cell.encode_input — the x-block of the gate conv, no new weights).
+        Both operands are then channel-means of the same learned feature
+        space, which is what phase correlation compares.
 
         h     : (B, K, Ch, H, W)
         frame : (B, C,  H,  W)
@@ -245,11 +228,10 @@ class Seq2SeqMEConvLSTM(nn.Module):
         h_tmpl = h.mean(dim=2).reshape(B * K, 1, H, W)
 
         with torch.no_grad():
-            # Encode once on B items, then repeat across slots: every slot sees
-            # the same frame, only the h template differs. PhaseCorrelation
-            # collapses channels with mean(dim=1) anyway, so both operands are
-            # already single-channel by the time they reach it.
-            f_enc = self.cell.encode_input_template(frame)
+            # PhaseCorrelation collapses channels with mean(dim=1) as its first
+            # op, so reducing here is identical — and avoids materialising the
+            # (B*K, 4*hidden, H, W) copy that expanding first would cost.
+            f_enc = self.cell.encode_input(frame).mean(dim=1, keepdim=True)
             f_rep = (f_enc.unsqueeze(1)
                           .expand(B, K, 1, H, W)
                           .reshape(B * K, 1, H, W))
