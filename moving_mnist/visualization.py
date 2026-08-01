@@ -272,24 +272,40 @@ def log_velocity_report(summary, split_name="train", epoch=None):
     if summary is None:
         return
 
-    table = wandb.Table(columns=["t", "acc_pct", "mean_l2", "correct", "total"])
+    # acc_pct is the per-timestep (stepwise) assignment -- the estimator at
+    # time t on its own. acc_pct_seq is the sequence-locked assignment kept
+    # alongside it; their difference (binding_loss) is accuracy lost purely
+    # to the slot->digit binding disagreeing across time. See VelocityMetrics.
+    table = wandb.Table(columns=["t", "acc_pct", "acc_pct_seq", "binding_loss",
+                                 "mean_l2", "mean_l2_seq", "correct", "total"])
     for t in range(summary["T"]):
         table.add_data(
             t + 1,
+            summary["per_t_acc_stepwise"][t],
             summary["per_t_acc"][t],
+            summary["per_t_binding_loss"][t],
+            summary["per_t_l2_stepwise"][t],
             summary["per_t_l2"][t],
-            summary["per_t_correct"][t],
+            summary["per_t_correct_stepwise"][t],
             summary["per_t_total"][t],
         )
 
     log_dict = {
         f"{split_name}_vel_table"       : table,
-        f"{split_name}_vel_overall_acc" : summary["overall_acc"],
-        f"{split_name}_vel_overall_l2"  : summary["overall_l2"],
-        f"{split_name}_vel_encoder_acc" : summary["encoder_acc"],
-        f"{split_name}_vel_decoder_acc" : summary["decoder_acc"],
-        f"{split_name}_vel_last_step_acc": summary["last_step_acc"],
-        f"{split_name}_vel_last_step_l2" : summary["last_step_l2"],
+        # primary: per-timestep assignment
+        f"{split_name}_vel_overall_acc" : summary["overall_acc_stepwise"],
+        f"{split_name}_vel_overall_l2"  : summary["overall_l2_stepwise"],
+        f"{split_name}_vel_encoder_acc" : summary["encoder_acc_stepwise"],
+        f"{split_name}_vel_decoder_acc" : summary["decoder_acc_stepwise"],
+        f"{split_name}_vel_last_step_acc": summary["last_step_acc_stepwise"],
+        f"{split_name}_vel_last_step_l2" : summary["last_step_l2_stepwise"],
+        # the bootstrap step (t=1) is parameter-free: on a fixed eval set this
+        # must be flat across epochs. If it is not, the metric is at fault.
+        f"{split_name}_vel_bootstrap_acc": summary["per_t_acc_stepwise"][0],
+        # sequence-locked, kept for continuity with earlier runs
+        f"{split_name}_vel_overall_acc_seq" : summary["overall_acc"],
+        f"{split_name}_vel_encoder_acc_seq" : summary["encoder_acc"],
+        f"{split_name}_vel_decoder_acc_seq" : summary["decoder_acc"],
     }
     if epoch is not None:
         log_dict["epoch"] = epoch

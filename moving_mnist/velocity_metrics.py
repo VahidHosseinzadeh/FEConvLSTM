@@ -186,72 +186,109 @@ class VelocityMetrics:
     K-N slots are simply never selected for that item. When K == N this
     reduces to exactly the original full-permutation behaviour.
 
-    Metrics reported per time step
-    --------------------------------
-    acc_assigned  : % of (batch, digit) pairs correctly predicted,
-                    under the best global permutation per batch item.
-    acc_any       : % of time steps where at least one permutation
-                    achieves a perfect (B-wide) match — upper bound.
-    mean_l2       : mean L2 error under best-assignment permutation.
+    Two accuracies, and why both exist
+    -----------------------------------
+    The slots carry no inherent digit identity, so any score needs a
+    slot->digit assignment. WHEN that assignment is chosen changes what is
+    being measured:
+
+    stepwise (per_t_acc_stepwise, the primary number)
+        A separate assignment per (sequence, timestep). Answers "at time t,
+        did the model produce the right SET of velocities?" — the estimator
+        at time t, isolated. Nothing another timestep does can move it, so
+        on a fixed evaluation set a parameter-free step (t=1, the phase
+        correlation bootstrap) is CONSTANT across epochs. If this number
+        moves, the estimator really changed.
+
+    sequence-locked (per_t_acc, the previous behaviour)
+        One assignment per sequence, chosen to maximise matches summed over
+        all T timesteps, then applied to every step. Answers "given the
+        model's overall slot->digit binding, was step t right?" A step that
+        was estimated perfectly still scores 0 here if the other T-1 steps
+        voted for the opposite binding — so this number moves with training
+        even for steps that contain no learned parameters at all.
+
+    per_t_binding_loss = stepwise - locked isolates that effect: it is the
+    accuracy lost purely to the binding disagreeing across time. Large and
+    growing means slots are swapping identity mid-sequence, which is a real
+    finding about the tracker, just not one about the estimate at time t.
+
+    mean_l2 is reported under each assignment (per_t_l2_stepwise, per_t_l2).
     """
 
     def __init__(self):
         self.reset()
 
     def reset(self):
-        self.correct   = None   # (T,) correct predictions under best assignment
-        self.total     = None   # (T,) total predictions
-        self.l2_sum    = None   # (T,) sum of L2 errors under best assignment
-        self.examples  = {}     # first error per time step, for debugging
-        self._T        = None
+        self.correct    = None  # (T,) correct under the SEQUENCE-LOCKED assignment
+        self.total      = None  # (T,) total predictions
+        self.l2_sum     = None  # (T,) sum of L2 under the sequence-locked assignment
+        self.correct_sw = None  # (T,) correct under the STEPWISE assignment
+        self.l2_sum_sw  = None  # (T,) sum of L2 under the stepwise assignment
+        self.examples   = {}    # first error per time step, for debugging
+        self._T         = None
 
     # ------------------------------------------------------------------
     # Assignment matching
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _best_assignment(pred_vel, true_vel):
+    def _perm_matches(pred_vel, true_vel):
         """
-        For each batch item find the length-N ordered selection of K slots
-        (which N of the K slots, and in what order they line up against the
-        N digits) that maximises the number of correct velocity predictions
-        across all T time steps. itertools.permutations(range(K), N) gives
-        exactly this: all injective maps from digit-position to slot-index.
-        When K == N it's the usual set of full permutations.
+        Match table for EVERY candidate slot->digit assignment at once.
 
-        pred_vel : (B, T, K, 2)  float
-        true_vel : (B, T, N, 2)  long / float
-        returns  : matched_pred (B, T, N, 2), best_perms (B, N) long
-                   -- best_perms[b, n] is the slot index matched to digit n
+        itertools.permutations(range(K), N) enumerates all injective maps
+        from digit-position to slot-index (when K == N, the usual full
+        permutations). Evaluating them all up front is what lets the two
+        accuracies below (sequence-locked and stepwise) be derived from one
+        shared computation instead of two searches.
+
+        pred_vel : (B, T, K, 2) float
+        true_vel : (B, T, N, 2) float
+        returns  : match (P, B, T, N) bool -- match[p, b, t, n] is True when
+                   the slot that permutation p assigns to digit n predicts
+                   digit n's velocity exactly (after rounding),
+                   perms (P, N) long
         """
         B, T, K, _ = pred_vel.shape
-        N           = true_vel.shape[2]
+        N          = true_vel.shape[2]
         assert K >= N, f"n_slots ({K}) must be >= num_digits ({N})"
 
-        all_perms   = list(_permutations(range(K), N))
-        matched     = torch.zeros(B, T, N, 2, dtype=pred_vel.dtype)
-        best_perms  = torch.zeros(B, N, dtype=torch.long)
+        perms  = torch.tensor(list(_permutations(range(K), N)), dtype=torch.long)
+        pred_r = torch.round(pred_vel)
 
-        pred_r = torch.round(pred_vel)   # (B, T, K, 2)
-        true_f = true_vel.float()        # (B, T, N, 2)
+        match = torch.stack([
+            (pred_r[:, :, p, :] == true_vel).all(dim=-1)      # (B, T, N)
+            for p in perms.tolist()
+        ], dim=0)
+        return match, perms
 
-        for b in range(B):
-            best_count = -1
-            best_p     = list(range(N))
+    @staticmethod
+    def _gather_perm(pred_vel, sel):
+        """pred_vel (B,T,K,2) + sel (B,T,N) slot indices -> (B,T,N,2)."""
+        B, T, N = sel.shape
+        return torch.gather(pred_vel, 2, sel.unsqueeze(-1).expand(B, T, N, 2))
 
-            for perm in all_perms:
-                # select+reorder N of the K slots: (T, N, 2)
-                p_pred  = pred_r[b, :, perm, :]
-                # count exact (vx, vy) matches across all (t, n)
-                count   = (p_pred == true_vel[b].float()).all(dim=-1).sum().item()
-                if count > best_count:
-                    best_count = count
-                    best_p     = list(perm)
+    @classmethod
+    def _best_assignment(cls, pred_vel, true_vel):
+        """
+        Sequence-locked assignment: ONE permutation per batch item, the one
+        maximising correct predictions summed over all T time steps.
 
-            best_perms[b] = torch.tensor(best_p, dtype=torch.long)
-            matched[b]    = pred_vel[b, :, best_p, :]
+        Kept as a standalone entry point (same signature and return values as
+        before) for external callers; update() derives it from _perm_matches.
 
-        return matched, best_perms
+        returns : matched_pred (B, T, N, 2), best_perms (B, N) long
+        """
+        match, perms = cls._perm_matches(pred_vel, true_vel)
+        B, T = pred_vel.shape[:2]
+        N    = true_vel.shape[2]
+        # argmax takes the FIRST maximum, matching the original loop's
+        # strict `count > best_count` tie-break (identity permutation wins).
+        best = match.sum(dim=(2, 3)).argmax(dim=0)            # (B,)
+        sel  = perms[best]                                    # (B, N)
+        matched = cls._gather_perm(pred_vel, sel.unsqueeze(1).expand(B, T, N))
+        return matched, sel
 
     # ------------------------------------------------------------------
     # Update
@@ -270,39 +307,66 @@ class VelocityMetrics:
         true_vel = true_vel[:, :T]
         B, T, K, _ = pred_vel.shape
 
+        N = true_vel.shape[2]
+
         if self._T is None:
-            self._T     = T
-            self.correct = torch.zeros(T, dtype=torch.long)
-            self.total   = torch.zeros(T, dtype=torch.long)
-            self.l2_sum  = torch.zeros(T)
+            self._T         = T
+            self.correct    = torch.zeros(T, dtype=torch.long)
+            self.total      = torch.zeros(T, dtype=torch.long)
+            self.l2_sum     = torch.zeros(T)
+            self.correct_sw = torch.zeros(T, dtype=torch.long)
+            self.l2_sum_sw  = torch.zeros(T)
 
-        # ---- best-assignment matching --------------------------------
-        matched, best_perms = self._best_assignment(pred_vel, true_vel)
-        # matched: (B, T, N, 2) — slots reordered to best match digits
+        match, perms = self._perm_matches(pred_vel, true_vel)     # (P,B,T,N)
+        bx = torch.arange(B)
 
-        pred_r = torch.round(matched)                            # (B, T, N, 2)
-        match  = (pred_r == true_vel).all(dim=-1)               # (B, T, N) bool
-        l2     = torch.norm(matched - true_vel, dim=-1)         # (B, T, N)
+        # ---- sequence-locked: ONE permutation per sequence ------------
+        # "Given the model's overall slot->digit binding, was step t right?"
+        # A step can be scored wrong here purely because the binding chosen
+        # by the OTHER T-1 steps disagrees with it.
+        seq_best   = match.sum(dim=(2, 3)).argmax(dim=0)           # (B,)
+        seq_sel    = perms[seq_best].unsqueeze(1).expand(B, T, N)  # (B,T,N)
+        matched    = self._gather_perm(pred_vel, seq_sel)
+        match_seq  = match[seq_best, bx]                           # (B,T,N)
+        l2_seq     = torch.norm(matched - true_vel, dim=-1)
+
+        # ---- stepwise: one permutation per (sequence, TIME STEP) ------
+        # "At step t, taken on its own, was the right SET of velocities
+        # produced?" This is the one that isolates the estimator at time t:
+        # it cannot be dragged around by what other timesteps did, so a
+        # parameter-free step (t=1 bootstrap) stays flat across epochs on a
+        # fixed evaluation set.
+        step_best  = match.sum(dim=3).argmax(dim=0)                # (B,T)
+        step_sel   = perms[step_best]                              # (B,T,N)
+        matched_sw = self._gather_perm(pred_vel, step_sel)
+        match_sw   = match[step_best, bx[:, None], torch.arange(T)[None, :]]
+        l2_sw      = torch.norm(matched_sw - true_vel, dim=-1)
 
         for t in range(T):
-            self.correct[t] += match[:, t].sum().item()
-            self.total[t]   += match[:, t].numel()
-            self.l2_sum[t]  += l2[:, t].sum().item()
+            self.correct[t]    += match_seq[:, t].sum().item()
+            self.total[t]      += match_seq[:, t].numel()
+            self.l2_sum[t]     += l2_seq[:, t].sum().item()
+            self.correct_sw[t] += match_sw[:, t].sum().item()
+            self.l2_sum_sw[t]  += l2_sw[:, t].sum().item()
 
-            # Store first incorrect (B,N) entry for debugging
+            # First incorrect (b, n) entry for debugging. Keyed off the
+            # STEPWISE match: that is the primary number in report(), so the
+            # example shown has to be an example of *that* being wrong --
+            # otherwise the printed line is a step the estimator got right
+            # and only the sequence-wide binding disagreed with.
             if t not in self.examples:
-                bad = (~match[:, t]).nonzero(as_tuple=False)
+                bad = (~match_sw[:, t]).nonzero(as_tuple=False)
                 if len(bad) > 0:
                     b, n = bad[0, 0].item(), bad[0, 1].item()
-                    perm = best_perms[b].tolist()
                     self.examples[t] = {
                         "batch"       : b,
                         "digit"       : n,
-                        "best_perm"   : perm,
+                        "step_perm"   : step_sel[b, t].tolist(),
+                        "seq_perm"    : seq_sel[b, t].tolist(),
                         "pred_float"  : tuple(round(x, 2) for x in
-                                              matched[b, t, n].tolist()),
+                                              matched_sw[b, t, n].tolist()),
                         "pred_round"  : tuple(int(x) for x in
-                                              pred_r[b, t, n].tolist()),
+                                              torch.round(matched_sw[b, t, n]).tolist()),
                         "true"        : tuple(int(x) for x in
                                               true_vel[b, t, n].tolist()),
                     }
@@ -335,6 +399,20 @@ class VelocityMetrics:
         encoder_acc = 100.0 * self.correct[:half].sum().item() / enc_total
         decoder_acc = 100.0 * self.correct[half:].sum().item() / dec_total
 
+        # Stepwise (per-timestep assignment) counterparts. Same denominators.
+        per_t_acc_sw = (100.0 * self.correct_sw.float() / per_t_total).tolist()
+        per_t_l2_sw  = (self.l2_sum_sw / per_t_total).tolist()
+        overall_acc_sw = 100.0 * self.correct_sw.sum().item() / overall_total
+        overall_l2_sw  = self.l2_sum_sw.sum().item() / overall_total
+        encoder_acc_sw = 100.0 * self.correct_sw[:half].sum().item() / enc_total
+        decoder_acc_sw = 100.0 * self.correct_sw[half:].sum().item() / dec_total
+
+        # How much of the sequence-locked score is lost purely to the
+        # slot->digit binding disagreeing across time, rather than to a bad
+        # velocity estimate. Non-negative by construction: the stepwise
+        # assignment is free to pick the locked one at every step.
+        per_t_binding_loss = [a - b for a, b in zip(per_t_acc_sw, per_t_acc)]
+
         return {
             "T"             : self._T,
             "per_t_acc"     : per_t_acc,
@@ -347,6 +425,17 @@ class VelocityMetrics:
             "decoder_acc"   : decoder_acc,
             "last_step_acc" : per_t_acc[-1],
             "last_step_l2"  : per_t_l2[-1],
+            # ---- stepwise assignment (isolates the estimator at each t) --
+            "per_t_acc_stepwise"     : per_t_acc_sw,
+            "per_t_l2_stepwise"      : per_t_l2_sw,
+            "per_t_correct_stepwise" : self.correct_sw.tolist(),
+            "overall_acc_stepwise"   : overall_acc_sw,
+            "overall_l2_stepwise"    : overall_l2_sw,
+            "encoder_acc_stepwise"   : encoder_acc_sw,
+            "decoder_acc_stepwise"   : decoder_acc_sw,
+            "last_step_acc_stepwise" : per_t_acc_sw[-1],
+            "last_step_l2_stepwise"  : per_t_l2_sw[-1],
+            "per_t_binding_loss"     : per_t_binding_loss,
         }
 
     def report(self, title="Velocity Report"):
@@ -359,13 +448,21 @@ class VelocityMetrics:
         print("=" * 100)
         print(title)
         print(
-            "  Accuracy is computed under the best per-sequence slot→digit "
-            "assignment (best N-of-K slot selection, K>=N).\n"
-            "  t=2 near-zero is structural: both slots have identical hidden "
-            "states after t=1 (warp(0,v)=0)."
+            "  acc%      : slot→digit assignment chosen AT EACH STEP — how good the\n"
+            "              velocity estimate at time t is, on its own. Read this one.\n"
+            "  acc%(seq) : one assignment per sequence, chosen across all timesteps.\n"
+            "              Lower whenever a step's own binding disagrees with the rest\n"
+            "              of the sequence; it mixes estimate quality with binding\n"
+            "              consistency, so it can move even for a parameter-free step.\n"
+            "  bind      : acc% - acc%(seq), i.e. how much is lost purely to the\n"
+            "              binding disagreeing across time (never negative).\n"
+            "  t=2 low is structural: both slots have identical hidden states after\n"
+            "  t=1 (warp(0,v)=0), so they report one velocity and can match at most\n"
+            "  one of the N digits."
         )
         print("=" * 100)
-        print(f"{'t':>4}  {'acc%':>8}  {'mean_L2':>8}  {'correct/total':>15}  note")
+        print(f"{'t':>4}  {'acc%':>8}  {'acc%(seq)':>10}  {'bind':>6}  "
+              f"{'mean_L2':>8}  {'L2(seq)':>8}  {'correct/total':>15}  note")
         print("-" * 100)
 
         for t in range(s["T"]):
@@ -373,29 +470,37 @@ class VelocityMetrics:
             if t == 1:   # printed as t=2, first track call
                 note = "← slot degeneracy (both slots identical at this step)"
 
-            row = (f"{t+1:>4}  {s['per_t_acc'][t]:>8.2f}  {s['per_t_l2'][t]:>8.3f}"
-                   f"  {s['per_t_correct'][t]:>7}/{s['per_t_total'][t]:<7}  {note}")
+            row = (f"{t+1:>4}  {s['per_t_acc_stepwise'][t]:>8.2f}  "
+                   f"{s['per_t_acc'][t]:>10.2f}  "
+                   f"{s['per_t_binding_loss'][t]:>6.2f}  "
+                   f"{s['per_t_l2_stepwise'][t]:>8.3f}  {s['per_t_l2'][t]:>8.3f}"
+                   f"  {s['per_t_correct_stepwise'][t]:>7}/{s['per_t_total'][t]:<7}  {note}")
             print(row)
 
             if t in self.examples:
                 e = self.examples[t]
                 print(f"       first error:  digit={e['digit']}"
-                      f"  best_perm={e['best_perm']}"
+                      f"  step_perm={e['step_perm']}"
+                      f"  seq_perm={e['seq_perm']}"
                       f"  pred_float={e['pred_float']}"
                       f"  pred_round={e['pred_round']}"
                       f"  true={e['true']}")
 
         print("-" * 100)
-        print(f"Overall accuracy (best assignment) : {s['overall_acc']:.2f}%")
-        print(f"Overall mean L2  (best assignment) : {s['overall_l2']:.3f}")
+        print(f"Overall accuracy (per-step assignment) : {s['overall_acc_stepwise']:.2f}%")
+        print(f"Overall accuracy (sequence-locked)     : {s['overall_acc']:.2f}%")
+        print(f"Overall mean L2  (per-step assignment) : {s['overall_l2_stepwise']:.3f}")
+        print(f"Overall mean L2  (sequence-locked)     : {s['overall_l2']:.3f}")
         print("=" * 100)
         print()
 
         # ---- breakdown: encoder vs decoder -------------------------
         # The caller should know T_in to split; we report halves as proxy.
         half = s["T"] // 2
-        print(f"  Encoder steps (t=1..{half})   accuracy: {s['encoder_acc']:.2f}%")
-        print(f"  Decoder steps (t={half+1}..{s['T']}) accuracy: {s['decoder_acc']:.2f}%")
+        print(f"  Encoder steps (t=1..{half})   accuracy: "
+              f"{s['encoder_acc_stepwise']:.2f}%  (seq-locked {s['encoder_acc']:.2f}%)")
+        print(f"  Decoder steps (t={half+1}..{s['T']}) accuracy: "
+              f"{s['decoder_acc_stepwise']:.2f}%  (seq-locked {s['decoder_acc']:.2f}%)")
         print()
 
 
