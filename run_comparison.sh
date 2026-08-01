@@ -116,6 +116,36 @@ if [ "$MOTION_MODE" = piecewise ] || [ "$MOTION_MODE" = stochastic ]; then
 fi
 MOTION_TAG="v${DATA_V_RANGE}${MOTION_TAG}"
 
+# ---- MELSTM velocity distillation (no effect on lstm/felstm) --------------
+# The tracker correlates h against the frame, gets no gradient, and nothing in
+# the reconstruction loss rewards h for staying a usable template -- so it can
+# degrade during training and the two slots can collapse onto one digit. These
+# knobs let the frame-pair phase correlation (parameter-free, ~99% correct on
+# constant motion) drive the encoder instead, and optionally teach h to imitate
+# it. Leave all three at the defaults below to reproduce earlier runs exactly.
+BOOTSTRAP_UNTIL=1       # encoder steps 1..N take velocity from the raw pair
+                        # (x_{t-1}, x_t) instead of self-tracking h. 1 = the
+                        # original behaviour. Set to "$INPUT_FRAMES" (or more)
+                        # to remove h from the encoder velocity path entirely
+                        # -- the clean "is the tracker what's broken?" run.
+BOOTSTRAP_ANNEAL=0      # epochs over which to anneal BOOTSTRAP_UNTIL down to
+                        # 1 (0 = hold it). Only meaningful with TRACK_W > 0:
+                        # annealing on its own hands over to a tracker that
+                        # was never trained.
+TRACK_W=0.0             # weight of the tracking cross-entropy (h's correlation
+                        # peak -> the frame-pair teacher's answer). Uses NO
+                        # velocity labels. 0.0 = compute and log it but do not
+                        # backprop -- a pure monitor. Watch train_track_ce:
+                        # falling means h is becoming a usable template.
+TRACK_TEMP=1.0          # softmax temperature; lower = sharper target.
+
+MELSTM_DISTILL=(
+  --bootstrap_until "$BOOTSTRAP_UNTIL"
+  --bootstrap_anneal_epochs "$BOOTSTRAP_ANNEAL"
+  --track_loss_weight "$TRACK_W"
+  --track_loss_temperature "$TRACK_TEMP"
+)
+
 # felstm carries one candidate slot per (vx,vy), so its grid must COVER the
 # data's or the true velocity is simply not representable -- it can never be
 # smaller than DATA_V_RANGE. Following it automatically is the safe default;
@@ -171,7 +201,8 @@ case $MODEL in
   melstm)
     # eval_velocity_mode both: honest val drives selection, oracle val logged
     # alongside (velocity-vs-rendering decomposition). MELSTM-only effect.
-    EXTRA=(--model melstm --num_vel_modes 2 --eval_velocity_mode both --wandb_name "melstm_${RUN_TAG}") ;;
+    EXTRA=(--model melstm --num_vel_modes 2 --eval_velocity_mode both
+           "${MELSTM_DISTILL[@]}" --wandb_name "melstm_${RUN_TAG}") ;;
   *)
     echo "unknown model: $MODEL"; exit 1 ;;
 esac

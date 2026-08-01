@@ -17,19 +17,19 @@ class PhaseCorrelation(nn.Module):
         self.pad_factor = pad_factor
         self.eps = eps
 
-    def forward(self, frame1, frame2):
+    def surface(self, frame1, frame2):
         """
-        Parameters
-        ----------
+        The phase-correlation surface itself, before peak extraction.
+
+        Every operation here is differentiable w.r.t. both inputs (only the
+        topk in forward() is not), so this is what a loss can be attached to
+        when the goal is to shape a template into peaking at a known
+        displacement.
+
         frame1 : (B, C1, H, W)
         frame2 : (B, C2, H, W)
-
-        Returns
-        -------
-        velocities : (B, n_modes, 2)
-        scores     : (B, n_modes)
+        ->       (B, H_pad, W_pad)
         """
-
         B, _, H, W = frame1.shape
         B2, _, H2, W2 = frame2.shape
 
@@ -38,7 +38,7 @@ class PhaseCorrelation(nn.Module):
         H_pad = H * self.pad_factor
         W_pad = W * self.pad_factor
 
-        # collapse channels 
+        # collapse channels
         frame1 = frame1.mean(dim=1)  # (B, H, W)
         frame2 = frame2.mean(dim=1)  # (B, H, W)
 
@@ -51,7 +51,41 @@ class PhaseCorrelation(nn.Module):
         R = R / (R.abs() + self.eps)
 
         # phase correlation
-        corr = torch.fft.irfft2(R, s=(H_pad, W_pad))
+        return torch.fft.irfft2(R, s=(H_pad, W_pad))
+
+    @staticmethod
+    def velocity_to_index(v, H_pad, W_pad):
+        """
+        Inverse of the peak -> velocity mapping below, for use as a target
+        index into the flattened surface.
+
+        forward() reads a flat peak index as y = idx // W_pad, x = idx % W_pad
+        and reports velocity (-x, -y); so a velocity (vx, vy) sits at
+        idx = ((-vy) mod H_pad) * W_pad + ((-vx) mod W_pad).
+
+        v : (..., 2) -> (...) long
+        """
+        vx = torch.round(v[..., 0]).long()
+        vy = torch.round(v[..., 1]).long()
+        return ((-vy) % H_pad) * W_pad + ((-vx) % W_pad)
+
+    def forward(self, frame1, frame2):
+        """
+        Parameters
+        ----------
+        frame1 : (B, C1, H, W)
+        frame2 : (B, C2, H, W)
+
+        Returns
+        -------
+        velocities : (B, n_modes, 2)
+        scores     : (B, n_modes)
+        """
+        B, _, H, W = frame1.shape
+        H_pad = H * self.pad_factor
+        W_pad = W * self.pad_factor
+
+        corr = self.surface(frame1, frame2)
 
         # pop peaks
         corr = corr.reshape(B, -1)

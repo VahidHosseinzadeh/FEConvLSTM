@@ -45,7 +45,12 @@ def build_model(cfg):
         return Seq2SeqMEConvLSTM(
             input_channels=1, hidden_channels=hidden, kernel_size=kernel,
             n_slots=get("num_vel_modes", 2), slot_reduce="max",
-            decoder_layers=dec_layers, decoder_channels=dec_channels)
+            decoder_layers=dec_layers, decoder_channels=dec_channels,
+            # Baked in so offline evaluation (motion_generalization.py), which
+            # calls forward() without the per-call override, reproduces the
+            # velocity protocol the run was trained under. Annealed runs store
+            # the STARTING value, so pass the final one explicitly there.
+            bootstrap_until=get("bootstrap_until", 1))
 
     raise ValueError(f"unknown model {name!r}")
 
@@ -61,7 +66,9 @@ def _unpack_batch(batch, device):
 
 
 def _run_model(model, input_seq, pred_len, target_seq,
-               want_velocity, want_states, track_decoder_velocity=None):
+               want_velocity, want_states, track_decoder_velocity=None,
+               bootstrap_until=None, want_track_loss=False,
+               track_loss_temperature=1.0):
     """
     Single call site for every model type.
 
@@ -76,7 +83,12 @@ def _run_model(model, input_seq, pred_len, target_seq,
     deployable inference). Pass True explicitly for the oracle eval
     (GT-tracked decoder velocities), e.g. via --eval_velocity_mode.
 
-    Returns (output_seq, pred_motion_or_None, states_or_None).
+    bootstrap_until / want_track_loss are MELSTM-only (see
+    Seq2SeqMEConvLSTM.forward): the first controls how many encoder steps read
+    velocity off the raw frame pair instead of self-tracking h, the second
+    asks for the distillation cross-entropy between the two.
+
+    Returns (output_seq, pred_motion_or_None, states_or_None, track_loss_or_None).
     """
     if isinstance(model, Seq2SeqMEConvLSTM):
         if track_decoder_velocity is None:
@@ -86,27 +98,31 @@ def _run_model(model, input_seq, pred_len, target_seq,
             pred_len=pred_len,
             target_seq=target_seq,
             track_decoder_velocity=track_decoder_velocity,
+            bootstrap_until=bootstrap_until,
+            track_loss_temperature=track_loss_temperature,
             return_velocity=want_velocity,
             return_states=want_states,
+            return_track_loss=want_track_loss,
         )
-        if not (want_velocity or want_states):
-            return result, None, None
+        if not (want_velocity or want_states or want_track_loss):
+            return result, None, None, None
         result = list(result if isinstance(result, tuple) else [result])
         output_seq = result.pop(0)
         pred_motion = result.pop(0) if want_velocity else None
         states = result.pop(0) if want_states else None
-        return output_seq, pred_motion, states
+        track_loss = result.pop(0) if want_track_loss else None
+        return output_seq, pred_motion, states, track_loss
 
     if isinstance(model, Seq2SeqFEConvLSTM):
         # FEConvLSTM has no explicit velocity readout (want_velocity is
         # always False for it, see _velocity_flags) -- it only exposes
         # h_states, one channel-mean map per (vx, vy) candidate slot.
         if not want_states:
-            return model(input_seq, pred_len=pred_len), None, None
+            return model(input_seq, pred_len=pred_len), None, None, None
         output_seq, states = model(input_seq, pred_len=pred_len, return_states=True)
-        return output_seq, None, states
+        return output_seq, None, states, None
 
-    return model(input_seq, pred_len=pred_len), None, None
+    return model(input_seq, pred_len=pred_len), None, None, None
 
 
 def _velocity_flags(model, gt_motion, show_h_state=False):
@@ -171,7 +187,7 @@ class ValCurveRecorder:
             seq = self.data[s:s + self.batch_size].to(self.device)
             inp = seq[:, :self.input_frames]
             tgt = seq[:, self.input_frames:]
-            pred, _, _ = _run_model(model, inp, tgt.size(1), None, False, False)
+            pred, _, _, _ = _run_model(model, inp, tgt.size(1), None, False, False)
             d = pred - tgt
             per_seq.append((d.pow(2).mean(dim=(1, 2, 3, 4))
                             + d.abs().mean(dim=(1, 2, 3, 4))).cpu())
@@ -225,11 +241,23 @@ class ValCurveRecorder:
 
 
 def train_epoch(model, dataloader, optimizer, criterion, device, input_frames, grad_clip=None,
-                curve_recorder=None, show_h_state=False):
+                curve_recorder=None, show_h_state=False,
+                bootstrap_until=None, track_loss_weight=0.0,
+                track_loss_temperature=1.0):
+    """
+    bootstrap_until / track_loss_weight : MELSTM velocity-distillation
+        controls. The tracking cross-entropy is computed whenever it can be
+        (it is the "is h ready to take over" readout) and only ADDED to the
+        loss when track_loss_weight > 0 -- so weight 0 gives a pure monitor
+        with no gradient, which is the honest default for old configs.
+    """
     model.train()
     running_loss = 0.0
+    running_track = 0.0
+    n_track = 0
     velocity_metrics = VelocityMetrics()
     has_velocity_data = False
+    is_melstm = isinstance(model, Seq2SeqMEConvLSTM)
 
     pbar = tqdm(dataloader, desc="Training", leave=False, disable=True)
     for i, batch in enumerate(pbar):
@@ -242,10 +270,21 @@ def train_epoch(model, dataloader, optimizer, criterion, device, input_frames, g
         want_states = want_states and i == 0
 
         optimizer.zero_grad()
-        output_seq, pred_motion, states = _run_model(
-            model, input_seq, pred_len, target_seq, want_velocity, want_states
+        output_seq, pred_motion, states, track_loss = _run_model(
+            model, input_seq, pred_len, target_seq, want_velocity, want_states,
+            bootstrap_until=bootstrap_until, want_track_loss=is_melstm,
+            track_loss_temperature=track_loss_temperature,
         )
         loss = criterion(output_seq, target_seq)
+        # Report the RECONSTRUCTION loss only, captured before the auxiliary
+        # term is folded in -- otherwise train_loss stops being comparable to
+        # val_loss the moment the distillation is switched on.
+        recon_loss = loss.item()
+        if track_loss is not None:
+            running_track += track_loss.item()
+            n_track += 1
+            if track_loss_weight > 0:
+                loss = loss + track_loss_weight * track_loss
         loss.backward()
 
         if grad_clip is not None:
@@ -257,7 +296,7 @@ def train_epoch(model, dataloader, optimizer, criterion, device, input_frames, g
             velocity_metrics.update(pred_motion, gt_motion)
             has_velocity_data = True
 
-        batch_loss = loss.item()
+        batch_loss = recon_loss
         running_loss += batch_loss * seq.size(0)
         pbar.set_postfix({"loss": f"{batch_loss:.4f}"})
 
@@ -280,11 +319,25 @@ def train_epoch(model, dataloader, optimizer, criterion, device, input_frames, g
         velocity_metrics.report("Training Velocity")
         log_velocity_report(velocity_metrics.summary(), split_name="train")
 
+    if n_track:
+        mean_ce = running_track / n_track
+        # Falling = h is becoming a usable tracking template; this is the
+        # signal for when bootstrap_until can safely be annealed down.
+        print(f"  Tracking CE (h vs frame-pair teacher): {mean_ce:.4f}"
+              f"   [bootstrap_until={bootstrap_until}, "
+              f"weight={track_loss_weight}]")
+        if wandb.run is not None:
+            wandb.log({"train_track_ce": mean_ce,
+                       "bootstrap_until": (bootstrap_until
+                                           if bootstrap_until is not None
+                                           else model.bootstrap_until)})
+
     return running_loss / len(dataloader.dataset)
 
 
 def eval_epoch(model, dataloader, criterion, device, input_frames, epoch, split_name,
-               decoder_velocity_mode="frozen", show_h_state=False):
+               decoder_velocity_mode="frozen", show_h_state=False,
+               bootstrap_until=None):
     """
     decoder_velocity_mode : "frozen" (default) — honest deployable inference,
         the last encoder velocity rolls the whole horizon; velocity metrics
@@ -310,9 +363,10 @@ def eval_epoch(model, dataloader, criterion, device, input_frames, epoch, split_
             want_velocity, want_states = _velocity_flags(model, gt_motion, show_h_state)
             want_states = want_states and i == 0
 
-            output_seq, pred_motion, states = _run_model(
+            output_seq, pred_motion, states, _ = _run_model(
                 model, input_seq, pred_len, target_seq, want_velocity, want_states,
                 track_decoder_velocity=True if track else None,
+                bootstrap_until=bootstrap_until,
             )
             loss = criterion(output_seq, target_seq)
             batch_loss = loss.item()
@@ -399,7 +453,7 @@ def eval_len_generalization(model, dataloader, device, input_frames, subsample_t
             want_states = want_states and first_pass
 
             # target_seq=None: length generalization is pure rollout.
-            pred, pred_motion, states = _run_model(
+            pred, pred_motion, states, _ = _run_model(
                 model, inp, T, None, want_velocity, want_states
             )
 
@@ -491,7 +545,7 @@ def eval_velocity_generalization(model, device, args):
                 for seq, _ in batch_pbar:
                     seq = seq.to(device)
                     inp, tgt = seq[:, :args.input_frames], seq[:, args.input_frames:]
-                    pred, _, _ = _run_model(model, inp, tgt.size(1), None, False, False)
+                    pred, _, _, _ = _run_model(model, inp, tgt.size(1), None, False, False)
                     mse = crit(pred, tgt).mean(dim=(2, 3, 4))  # [B, T]
                     batch_mse = mse.mean().item()
                     mse_sum += batch_mse * mse.size(0)

@@ -1,4 +1,6 @@
 import random
+from itertools import permutations as _permutations
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -123,6 +125,26 @@ class Seq2SeqMEConvLSTM(nn.Module):
     cell input is always the model's own previous prediction
     (input_seq[:, -1] at t=0) — no teacher forcing.
 
+    Encoder protocol: bootstrap_until
+    ----------------------------------
+    t=0                   v=0 (h is zero, warp(0,v)=0 for any v)
+    t=1                   bootstrap(X_0, X_1) -- DEFINES slot identity
+    2 <= t <= B_until     bootstrap(X_{t-1}, X_t), then bound back to slots
+                          by assign_by_continuity
+    t > B_until           track_velocities(h, X_t)
+
+    bootstrap_until=1 is the original behaviour. Raising it trades the
+    learned tracker for frame-pair phase correlation, which is parameter-free
+    and does not degrade as h drifts -- useful both as a diagnostic (does the
+    val loss still climb?) and as a curriculum: start high so early training
+    sees correct velocities, then anneal toward 1 as h becomes a usable
+    template. Set it >= T_in to take h out of the encoder velocity path
+    entirely.
+
+    Note the asymmetry that makes this possible only in the encoder: it has
+    real frames to correlate. The decoder has only its own predictions, so it
+    keeps the tracked/frozen protocol described below.
+
     Decoder protocol (inference, target_seq is None)
     -------------------------------------------------
     No next frame exists. Tracking against own predictions reintroduces
@@ -143,11 +165,17 @@ class Seq2SeqMEConvLSTM(nn.Module):
                  decoder_channels=None,
                  bias=True,
                  batch_first=True,
+                 bootstrap_until=1,
                  phase_corr_kwargs=None):
         super().__init__()
 
         self.batch_first     = batch_first
         self.n_slots         = n_slots
+        # Encoder steps 1..bootstrap_until read velocity from the raw frame
+        # pair (x_{t-1}, x_t); steps after that self-track against h. 1 is the
+        # original behaviour (bootstrap at t=1 only). Overridable per forward()
+        # call so a training loop can anneal it down toward 1.
+        self.bootstrap_until = bootstrap_until
         self.hidden_channels = hidden_channels
         self.slot_reduce     = slot_reduce
         output_channels      = output_channels or input_channels
@@ -183,9 +211,46 @@ class Seq2SeqMEConvLSTM(nn.Module):
     # ------------------------------------------------------------------
 
     def bootstrap_velocities(self, x0, x1):
-        """K peaks from raw frame pair. Called once: encoder t=1."""
+        """K peaks from a raw frame pair. Unordered w.r.t. slots."""
         v, _ = self.phase_corr_bootstrap(x0, x1)
         return v   # (B, K, 2)
+
+    @staticmethod
+    def assign_by_continuity(v_new, v_prev):
+        """
+        Bind unordered frame-pair peaks to slots by velocity continuity.
+
+        The bootstrap returns its K peaks ordered by correlation-peak
+        STRENGTH, which carries no slot identity and reshuffles from frame to
+        frame. Re-running it mid-sequence therefore needs an assignment step,
+        or slot k silently changes which digit it means. Continuity is the
+        prior that needs no labels: whichever pairing moves the slots least is
+        the one that keeps identities. Exact for constant motion (zero cost),
+        and for transition_mode='smooth' a change is at most 1 per component,
+        so the true pairing is still the cheapest unless two digits nearly
+        swap velocities.
+
+        Deliberately NOT an exclusion rule: two slots are free to end up on
+        the same velocity, which the dataset does allow after t=0
+        (_update_velocity only forbids a digit's own previous velocity).
+
+        v_new  : (B, K, 2) unordered peaks
+        v_prev : (B, K, 2) velocity each slot held at the previous step
+        ->       (B, K, 2) peaks reordered so index k belongs to slot k
+        """
+        B, K, _ = v_new.shape
+        perms = torch.tensor(list(_permutations(range(K))),
+                             device=v_new.device)                # (P, K)
+
+        # cost[b, k, j] = how far slot k would have to jump to take peak j
+        cost = torch.cdist(v_prev.float(), v_new.float())         # (B, K, K)
+        ar   = torch.arange(K, device=v_new.device)
+        # total cost of each candidate pairing; argmin takes the FIRST
+        # minimum and perms[0] is the identity, so an already-correct
+        # ordering (e.g. constant motion) is left untouched.
+        totals = torch.stack([cost[:, ar, p].sum(-1) for p in perms], dim=1)
+        sel    = perms[totals.argmin(dim=1)]                      # (B, K)
+        return torch.gather(v_new, 1, sel.unsqueeze(-1).expand(B, K, 2))
 
     def track_velocities(self, h, frame):
         """
@@ -208,6 +273,55 @@ class Seq2SeqMEConvLSTM(nn.Module):
             v_flat, _ = self.phase_corr_track(h_tmpl, f_rep)
         return v_flat.squeeze(1).reshape(B, K, 2)
 
+    def tracking_logits(self, h, frame):
+        """
+        The tracker's correlation surface, WITH gradient w.r.t. h.
+
+        Same computation track_velocities runs, minus the argmax -- so this is
+        the differentiable view of "where does slot k think its content went".
+        Standardised per (sequence, slot) because the phase-normalised surface
+        has a tiny dynamic range: fed raw into a softmax it is nearly uniform
+        and the gradient all but vanishes.
+
+        h     : (B, K, Ch, H, W)
+        frame : (B, C,  H,  W)
+        ->      (B, K, H*W) logits over candidate displacements
+        """
+        B, K, Ch, H, W = h.shape
+        C = frame.shape[1]
+
+        h_tmpl = h.mean(dim=2).reshape(B * K, 1, H, W)
+        f_rep  = (frame.unsqueeze(1)
+                       .expand(B, K, C, H, W)
+                       .reshape(B * K, C, H, W))
+
+        surf = self.phase_corr_track.surface(h_tmpl, f_rep)     # (B*K, H, W)
+        surf = surf.reshape(B * K, -1)
+        surf = (surf - surf.mean(dim=1, keepdim=True)) / (
+            surf.std(dim=1, keepdim=True) + 1e-6)
+        return surf.reshape(B, K, -1)
+
+    def tracking_ce(self, h, frame, v_target, temperature=1.0):
+        """
+        Cross-entropy pulling each slot's correlation peak onto v_target.
+
+        The teacher is frame-pair phase correlation on (x_{t-1}, x_t) -- no
+        dataset labels, and measured ~99% correct on constant motion / ~93%
+        on piecewise. The student is the h-based tracker. Because each slot
+        gets its OWN target, this also penalises collapse directly: two slots
+        peaking at the same displacement cannot both be right unless the two
+        digits genuinely share a velocity.
+
+        Returns a scalar. Gradient flows into h (and thus the whole cell);
+        v_target is treated as a constant.
+        """
+        B, K, _, H, W = h.shape
+        logits = self.tracking_logits(h, frame) / temperature
+        target = self.phase_corr_track.velocity_to_index(
+            v_target.detach(), H, W)                            # (B, K)
+        return F.cross_entropy(logits.reshape(B * K, -1),
+                               target.reshape(B * K))
+
     def pool_slots(self, h):
         """h : (B, K, Ch, H, W) -> (B, Ch, H, W)"""
         if self.slot_reduce == 'mean':
@@ -226,8 +340,11 @@ class Seq2SeqMEConvLSTM(nn.Module):
                 pred_len,
                 target_seq=None,
                 track_decoder_velocity=True,
+                bootstrap_until=None,
+                track_loss_temperature=1.0,
                 return_velocity=False,
-                return_states=False):
+                return_states=False,
+                return_track_loss=False):
         """
         input_seq : (B, T_in, C, H, W),  T_in >= 2
         pred_len  : int
@@ -247,6 +364,20 @@ class Seq2SeqMEConvLSTM(nn.Module):
         B, T_in, C, H, W = input_seq.shape
         K = self.n_slots
 
+        # None -> the constructor's value. Anneal this toward 1 during
+        # training to hand the job over to h-tracking gradually.
+        boot_until = (self.bootstrap_until if bootstrap_until is None
+                      else bootstrap_until)
+
+        # Raw CE; the caller scales it (train.py's --track_loss_weight) and
+        # decides whether to backprop it. Worth requesting even at weight 0:
+        # it is the readout for "is h a good enough template to take over
+        # yet", i.e. when to anneal bootstrap_until down.
+        want_track_loss = return_track_loss
+        track_ce = torch.zeros((), device=input_seq.device,
+                               dtype=input_seq.dtype)
+        n_ce = 0
+
         h, c = self.cell.init_hidden(B, K, H, W, input_seq.device, input_seq.dtype)
 
         # ---- Encoder ------------------------------------------------
@@ -262,12 +393,38 @@ class Seq2SeqMEConvLSTM(nn.Module):
                                          dtype=input_seq.dtype)
 
             elif t == 1:
-                # First non-zero h. Bootstrap from (X_0, X_1).
+                # First non-zero h. Bootstrap from (X_0, X_1). No assignment
+                # needed here: this call DEFINES slot identity -- slot k just
+                # is peak k, and everything downstream inherits that.
                 v = self.bootstrap_velocities(input_seq[:, 0], input_seq[:, 1])
 
             else:
-                # Slot self-tracking. X_t consumed exactly once.
-                v = self.track_velocities(h, input_seq[:, t])
+                # Teacher: motion read straight off the raw frame pair, bound
+                # back to slot identities. Computed whenever it is needed --
+                # to DRIVE the warp while t <= boot_until, and/or to SUPERVISE
+                # the tracker when the distillation loss is on. Keeping it on
+                # after boot_until is what makes annealing a hand-over rather
+                # than the removal of a crutch: h keeps learning either way.
+                need_teacher = (t <= boot_until) or want_track_loss
+                if need_teacher:
+                    v_teacher = self.assign_by_continuity(
+                        self.bootstrap_velocities(input_seq[:, t - 1],
+                                                  input_seq[:, t]),
+                        v)
+
+                if want_track_loss:
+                    # h here is still h_{t-1}: the same state track_velocities
+                    # would correlate against x_t, so student and teacher
+                    # describe the same transition.
+                    track_ce = track_ce + self.tracking_ce(
+                        h, input_seq[:, t], v_teacher, track_loss_temperature)
+                    n_ce += 1
+
+                if t <= boot_until:
+                    v = v_teacher
+                else:
+                    # Slot self-tracking. X_t consumed exactly once.
+                    v = self.track_velocities(h, input_seq[:, t])
 
             h, c   = self.cell(input_seq[:, t], h, c, v)
 
@@ -309,6 +466,11 @@ class Seq2SeqMEConvLSTM(nn.Module):
             result.append({
                 "h": torch.stack(h_states, dim=1),  # (B, T_in+pred_len, K, H, W)
             })
+
+        if return_track_loss:
+            # Mean over the encoder steps that produced a teacher, so the
+            # magnitude does not depend on T_in or on bootstrap_until.
+            result.append(track_ce / max(n_ce, 1))
 
         if len(result) == 1:
             return result[0]

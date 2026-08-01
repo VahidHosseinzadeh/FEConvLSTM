@@ -194,6 +194,30 @@ def main():
                         help="MELSTM decoder velocity at evaluation: 'frozen' = honest inference (default, drives scheduler/selection); "
                              "'tracked' = oracle GT-tracked eval drives scheduler/selection; "
                              "'both' = select on frozen but also log val_tracked_loss each epoch")
+    # ---- MELSTM velocity distillation ------------------------------------
+    parser.add_argument('--bootstrap_until', type=int, default=1,
+                        help='MELSTM only. Encoder steps 1..N read velocity straight off the raw '
+                             'frame pair (x_{t-1}, x_t) via phase correlation, bound back to slots '
+                             'by continuity; later steps self-track against h. 1 = original '
+                             'behaviour (bootstrap at t=1 only). Set >= --input_frames to take h '
+                             'out of the encoder velocity path entirely -- the clean diagnostic '
+                             'for "is the learned tracker the thing that is broken?".')
+    parser.add_argument('--bootstrap_anneal_epochs', type=int, default=0,
+                        help='MELSTM only. Linearly anneal --bootstrap_until down to 1 over this '
+                             'many epochs (0 = no annealing, hold the value). Pair with a nonzero '
+                             '--track_loss_weight so h is being trained toward the frame-pair '
+                             'teacher while the crutch is still in place; annealing alone just '
+                             'removes the crutch from a tracker that never learned anything.')
+    parser.add_argument('--track_loss_weight', type=float, default=0.0,
+                        help='MELSTM only. Weight of the tracking cross-entropy that pulls each '
+                             "slot's h-vs-frame correlation peak onto the frame-pair teacher's "
+                             'answer. Uses NO dataset velocity labels -- the teacher is phase '
+                             'correlation on the raw frames. 0 = compute and log it but do not '
+                             'backprop it (pure monitor: watch train_track_ce to decide when h is '
+                             'ready for bootstrap_until to be annealed down).')
+    parser.add_argument('--track_loss_temperature', type=float, default=1.0,
+                        help='Softmax temperature for --track_loss_weight. The correlation surface '
+                             'is standardised first; lower = sharper target, stronger gradient.')
     parser.add_argument('--len_gen_every', type=int, default=0,
                         help='Also run length-generalization every N epochs regardless of val improvement '
                              '(0 = only on new best val). Saves to a separate *_latest.npz')
@@ -634,11 +658,27 @@ def main():
 
     for epoch in range(start_epoch, args.epochs + 1):
         epoch_start = time.time()
+
+        # Linear hand-over from the frame-pair teacher to h-tracking. Held at
+        # args.bootstrap_until when annealing is off. Evaluation uses the SAME
+        # value as training: a val loss measured under a different velocity
+        # protocol than the one just trained is not comparable epoch to epoch.
+        if args.bootstrap_anneal_epochs > 0:
+            frac = min(1.0, (epoch - 1) / args.bootstrap_anneal_epochs)
+            boot_until = int(round(args.bootstrap_until
+                                   + frac * (1 - args.bootstrap_until)))
+            boot_until = max(1, boot_until)
+        else:
+            boot_until = args.bootstrap_until
+
         train_loss = train_fn(model, train_loader, optimizer, criterion, device, args.input_frames, args.grad_clip,
-                              curve_recorder=curve_recorder, show_h_state=args.show_h_state)
+                              curve_recorder=curve_recorder, show_h_state=args.show_h_state,
+                              bootstrap_until=boot_until,
+                              track_loss_weight=args.track_loss_weight,
+                              track_loss_temperature=args.track_loss_temperature)
         epoch_time = time.time() - epoch_start
         val_loss = eval_fn(model, val_loader, criterion, device, args.input_frames, epoch, split_name="val",
-                           show_h_state=args.show_h_state)
+                           show_h_state=args.show_h_state, bootstrap_until=boot_until)
 
         # Oracle (GT-tracked decoder velocity) validation: measures the model
         # without velocity-estimation drift; the gap to val_loss isolates
@@ -647,7 +687,8 @@ def main():
         if args.eval_velocity_mode in ('tracked', 'both'):
             val_tracked_loss = eval_fn(model, val_loader, criterion, device, args.input_frames, epoch,
                                        split_name="val_tracked", decoder_velocity_mode="tracked",
-                                       show_h_state=args.show_h_state)
+                                       show_h_state=args.show_h_state,
+                                       bootstrap_until=boot_until)
 
         # Metric driving the scheduler / best-model selection / len-gen gating
         selection_val = val_tracked_loss if args.eval_velocity_mode == 'tracked' else val_loss
