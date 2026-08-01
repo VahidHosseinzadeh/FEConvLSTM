@@ -10,6 +10,11 @@
 # checkpoints first (rm experiments/run_state/checkpoint_<model>_*.pth) so
 # the run starts fresh instead of resuming an old configuration.
 #
+# EXCEPTION: changes to the motion block are detected automatically (see the
+# motion stamp near the bottom) and suppress the resume by themselves, since
+# those change the DATA and sweeping them is the normal way to use this
+# script. Every other setting is still on you.
+#
 # Output layout under $SAVE_DIR (see train.py):
 #   models/     the actual trained weights
 #   results/    plot-script inputs (history/len_gen/vel_gen)
@@ -54,6 +59,70 @@ EARLY_STOP_PATIENCE=0   # ~2-3 LR reductions' worth of chances before giving up
 SEED=42
 SAVE_DIR=./experiments
 
+# ---- motion settings: ALSO must be identical across the three runs --------
+# These define the data, so a comparison is only meaningful if all three
+# models saw the same motion. Only the parameters that apply to the chosen
+# MOTION_MODE are passed through (see the case block below) -- the rest are
+# left at train.py's defaults rather than silently pretending to matter.
+MOTION_MODE=piecewise   # constant   : one velocity for the whole sequence
+                        # piecewise  : held MIN_SEGMENT..MAX_SEGMENT frames, then changes
+                        # stochastic : P_CHANGE chance of changing at every step
+                        # accelerate : speed ramps by a per-digit constant sign every
+                        #              MIN_SEGMENT..MAX_SEGMENT frames, clipped to
+                        #              DATA_V_RANGE -- systematic, not a random walk,
+                        #              so |v| changes over the context window
+TRANSITION_MODE=smooth  # what a change jumps TO. uniform = anywhere on the grid;
+                        # smooth = a neighbouring velocity (each component moves by
+                        # at most 1) with probability SMOOTH_PROB. Applies to
+                        # piecewise/stochastic only; accelerate defines its own step.
+DATA_V_RANGE=2          # velocity grid is [-N..N]^2 minus (0,0), in pixels/frame.
+                        # Raising this makes felstm markedly more expensive (see
+                        # FE_V_RANGE below) -- (2N+1)^2-1 candidate slots: 24 at N=2,
+                        # 48 at N=3.
+MIN_SEGMENT=3           # piecewise/accelerate: frames held before a velocity change.
+MAX_SEGMENT=6           # For accelerate, this is the ramp interval: smaller = faster
+                        # acceleration. Ignored by constant/stochastic.
+P_CHANGE=0.25           # stochastic only: per-step probability of a change.
+SMOOTH_PROB=0.8         # TRANSITION_MODE=smooth only. 0.0 is exactly equivalent to
+                        # TRANSITION_MODE=uniform.
+
+# Only the applicable knobs get passed, per the dataset's own applicability
+# table (TDMovingMNISTDataset docstring, "Which parameters apply to which mode").
+MOTION=(--motion_mode "$MOTION_MODE" --data_v_range "$DATA_V_RANGE")
+case $MOTION_MODE in
+  constant)
+    MOTION_TAG="const" ;;
+  piecewise)
+    MOTION+=(--transition_mode "$TRANSITION_MODE"
+             --min_segment "$MIN_SEGMENT" --max_segment "$MAX_SEGMENT")
+    MOTION_TAG="pw${MIN_SEGMENT}-${MAX_SEGMENT}${TRANSITION_MODE:0:1}" ;;
+  stochastic)
+    MOTION+=(--transition_mode "$TRANSITION_MODE" --p_change "$P_CHANGE")
+    MOTION_TAG="st${P_CHANGE}${TRANSITION_MODE:0:1}" ;;
+  accelerate)
+    # transition_mode/smooth_probability/p_change are unused by this mode
+    MOTION+=(--min_segment "$MIN_SEGMENT" --max_segment "$MAX_SEGMENT")
+    MOTION_TAG="acc${MIN_SEGMENT}-${MAX_SEGMENT}" ;;
+  *)
+    echo "unknown MOTION_MODE: $MOTION_MODE (constant|piecewise|stochastic|accelerate)"; exit 1 ;;
+esac
+# smooth_probability only bites when a transition_mode is actually in play.
+# Written as an if, not `[ ... ] && MOTION+=(...)`: a trailing test that fails
+# is the kind of thing that interacts badly with `set -e`.
+if [ "$MOTION_MODE" = piecewise ] || [ "$MOTION_MODE" = stochastic ]; then
+  if [ "$TRANSITION_MODE" = smooth ]; then
+    MOTION+=(--smooth_probability "$SMOOTH_PROB")
+  fi
+fi
+MOTION_TAG="v${DATA_V_RANGE}${MOTION_TAG}"
+
+# felstm carries one candidate slot per (vx,vy), so its grid must COVER the
+# data's or the true velocity is simply not representable -- it can never be
+# smaller than DATA_V_RANGE. Following it automatically is the safe default;
+# override only if you know why. Cost scales with the slot count, so a bump
+# from 2 to 3 nearly doubles felstm's memory and wall-clock.
+FE_V_RANGE=$DATA_V_RANGE
+
 # Bash array, not a backslash-continued string: a single stray trailing
 # space after a "\" silently breaks string continuation (bash starts
 # parsing the next line as a new command -- that's exactly what just
@@ -61,7 +130,7 @@ SAVE_DIR=./experiments
 # elements need no line-continuation character at all, so this class of
 # corruption can't happen here.
 COMMON=(
-  --data_v_range 2
+  "${MOTION[@]}"
   --hidden_size "$HIDDEN"
   --decoder_hidden_size "$DEC_HIDDEN"
   --decoder_conv_layers "$DEC_LAYERS"
@@ -90,24 +159,51 @@ COMMON=(
 # Expensive: full fixed-velocity test set per (vx,vy) pair, at every new best.
 # COMMON+=(--run_velocity_generalization --gen_vel_min -3 --gen_vel_max 3)
 
+RUN_TAG="h${HIDDEN}_${MOTION_TAG}_s${SEED}"   # motion is in the name so a sweep
+                                           # gives distinguishable wandb runs
 case $MODEL in
   lstm)
-    EXTRA=(--model lstm --v_range 0 --wandb_name "lstm_h${HIDDEN}_s${SEED}") ;;
+    EXTRA=(--model lstm --v_range 0 --wandb_name "lstm_${RUN_TAG}") ;;
   felstm)
     # --show_h_state: FELSTM's counterpart to melstm's --check_velocity_predictor
     # report — logs the per-(vx,vy) candidate h-slot maps to wandb.
-    EXTRA=(--model felstm --v_range 2 --show_h_state --wandb_name "felstm_h${HIDDEN}_s${SEED}") ;;
+    EXTRA=(--model felstm --v_range "$FE_V_RANGE" --show_h_state --wandb_name "felstm_${RUN_TAG}") ;;
   melstm)
     # eval_velocity_mode both: honest val drives selection, oracle val logged
     # alongside (velocity-vs-rendering decomposition). MELSTM-only effect.
-    EXTRA=(--model melstm --num_vel_modes 2 --eval_velocity_mode both --wandb_name "melstm_h${HIDDEN}_s${SEED}") ;;
+    EXTRA=(--model melstm --num_vel_modes 2 --eval_velocity_mode both --wandb_name "melstm_${RUN_TAG}") ;;
   *)
     echo "unknown model: $MODEL"; exit 1 ;;
 esac
 
 # ---- auto-resume after a crash --------------------------------------------
+# Checkpoints are named checkpoint_<model>_<wandb_run_id>.pth (train.py), so
+# the filename carries NO trace of the motion config. Resuming picks the
+# newest match, which means changing a motion knob above and relaunching
+# would silently continue a run trained on different data -- the model would
+# keep its old weights and optimizer state while the dataset changed under
+# it, and nothing would flag it. So stamp the motion config next to the
+# checkpoints and refuse to resume across a change.
+#
+# A missing stamp is treated as "matches" so this doesn't disturb a run that
+# is already in flight from before this guard existed.
+MOTION_STAMP="$SAVE_DIR/run_state/motion_${MODEL}.cfg"
+MOTION_CFG="${MOTION[*]}"
+
 CKPT=$(ls -t "$SAVE_DIR"/run_state/checkpoint_${MODEL}_*.pth 2>/dev/null | head -1)
 RESUME=()
+if [ -n "$CKPT" ] && [ -f "$MOTION_STAMP" ] && [ "$(cat "$MOTION_STAMP")" != "$MOTION_CFG" ]; then
+  echo ">>> Motion config CHANGED since $CKPT was written:"
+  echo "      checkpoint: $(cat "$MOTION_STAMP")"
+  echo "      requested : $MOTION_CFG"
+  echo ">>> NOT resuming — starting a fresh run so the weights match the data."
+  echo "    (old checkpoints are left in place; rm $SAVE_DIR/run_state/checkpoint_${MODEL}_*.pth to clean up)"
+  CKPT=""
+fi
+
+mkdir -p "$SAVE_DIR/run_state"
+printf '%s\n' "$MOTION_CFG" > "$MOTION_STAMP"
+
 if [ -n "$CKPT" ]; then
   echo ">>> Found checkpoint $CKPT — resuming this run."
   RESUME=(--resume "$CKPT")
