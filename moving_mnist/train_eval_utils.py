@@ -177,6 +177,11 @@ class ValCurveRecorder:
         self.step = 0
         self.train_steps, self.train_losses = [], []
         self.val_steps, self.val_means, self.val_stds = [], [], []
+        # Velocity protocol this curve is measured under. train_epoch sets it
+        # each epoch so the curve tracks the SAME protocol training is using;
+        # left at None it would silently pin to the constructor value and keep
+        # reporting the un-annealed model, which is not what this curve is for.
+        self.bootstrap_until = None
 
     @torch.no_grad()
     def _val_loss(self, model):
@@ -187,7 +192,8 @@ class ValCurveRecorder:
             seq = self.data[s:s + self.batch_size].to(self.device)
             inp = seq[:, :self.input_frames]
             tgt = seq[:, self.input_frames:]
-            pred, _, _, _ = _run_model(model, inp, tgt.size(1), None, False, False)
+            pred, _, _, _ = _run_model(model, inp, tgt.size(1), None, False, False,
+                                       bootstrap_until=self.bootstrap_until)
             d = pred - tgt
             per_seq.append((d.pow(2).mean(dim=(1, 2, 3, 4))
                             + d.abs().mean(dim=(1, 2, 3, 4))).cpu())
@@ -258,6 +264,8 @@ def train_epoch(model, dataloader, optimizer, criterion, device, input_frames, g
     velocity_metrics = VelocityMetrics()
     has_velocity_data = False
     is_melstm = isinstance(model, Seq2SeqMEConvLSTM)
+    if curve_recorder is not None:
+        curve_recorder.bootstrap_until = bootstrap_until
 
     pbar = tqdm(dataloader, desc="Training", leave=False, disable=True)
     for i, batch in enumerate(pbar):
