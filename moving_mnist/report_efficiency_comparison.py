@@ -43,24 +43,29 @@ def state_multiplier(cfg):
     lstm/felstm (Seq2SeqFEConvLSTM): dense grid over the v_range x v_range
         velocity lattice -> (2*v_range+1)^2. v_range=0 -> 1, i.e. lstm is
         just felstm's v_range=0 special case; same formula covers both.
-    melstm (Seq2SeqMEConvLSTM): K tracked slots -> num_vel_modes directly.
+    melstm/mernn (Seq2SeqMEConvLSTM / Seq2SeqMEConvRNN): K tracked slots ->
+        num_vel_modes directly.
     """
-    if cfg["model"] == "melstm":
+    if cfg["model"] in ("melstm", "mernn"):
         return cfg["num_vel_modes"]
     return (2 * cfg["v_range"] + 1) ** 2
 
 
 def state_memory_mb(cfg, mult):
     """
-    Recurrent state (h and c together) footprint in MB at the config's own
-    batch_size/image_size, float32. This is the number that actually
-    diverges across models at equal parameter count -- the mechanism
-    behind both the epoch-time and GPU-memory differences.
+    Recurrent state footprint in MB at the config's own batch_size/image_size,
+    float32. This is the number that actually diverges across models at equal
+    parameter count -- the mechanism behind both the epoch-time and GPU-memory
+    differences.
+
+    Two tensors per slot (h and c) for the gated cells; mernn is gateless and
+    carries h only, so it holds half the state at the same width.
     """
     B = cfg["batch_size"]
     H = W = cfg["image_size"]
     hidden = cfg["hidden_size"]
-    bytes_total = 2 * B * mult * hidden * H * W * 4   # h + c, float32
+    n_state = 1 if cfg["model"] == "mernn" else 2      # h  vs  h + c
+    bytes_total = n_state * B * mult * hidden * H * W * 4   # float32
     return bytes_total / (1024 ** 2)
 
 

@@ -12,7 +12,14 @@ from visualization import (
 )
 from velocity_metrics import VelocityMetrics
 from velocity_model_based_MEConvLSTM_model import Seq2SeqMEConvLSTM
+from velocity_model_based_MEConvRNN_model import Seq2SeqMEConvRNN
 from channel_based_FEConvLSTM_model import Seq2SeqFEConvLSTM
+
+# The two motion-estimating models. Seq2SeqMEConvRNN is a drop-in twin of
+# Seq2SeqMEConvLSTM -- same constructor signature, same forward signature and
+# return protocol, only the recurrence differs (h only, no cell state) -- so
+# every "is this a slot/velocity model?" branch below applies to both.
+ME_MODELS = (Seq2SeqMEConvLSTM, Seq2SeqMEConvRNN)
 
 
 def build_model(cfg):
@@ -41,8 +48,11 @@ def build_model(cfg):
             v_range=v_range, pool_type="max",
             decoder_conv_layers=dec_layers, decoder_channels=dec_channels)
 
-    if name == "melstm":
-        return Seq2SeqMEConvLSTM(
+    if name in ("melstm", "mernn"):
+        # mernn is the vanilla-RNN ablation of melstm: identical slot/velocity
+        # machinery, gateless recurrent cell. Same hyperparameters apply.
+        cls = Seq2SeqMEConvLSTM if name == "melstm" else Seq2SeqMEConvRNN
+        return cls(
             input_channels=1, hidden_channels=hidden, kernel_size=kernel,
             n_slots=get("num_vel_modes", 2), slot_reduce="max",
             decoder_layers=dec_layers, decoder_channels=dec_channels,
@@ -72,7 +82,7 @@ def _run_model(model, input_seq, pred_len, target_seq,
     """
     Single call site for every model type.
 
-    MELSTM always receives target_seq when available — NOT teacher forcing:
+    MELSTM/MERNN always receive target_seq when available — NOT teacher forcing:
     its training protocol tracks decoder velocities against the true next
     frame (v = track(h, target_seq[:, t])). Without it the model silently
     runs in inference mode (last encoder velocity frozen for the whole
@@ -83,14 +93,14 @@ def _run_model(model, input_seq, pred_len, target_seq,
     deployable inference). Pass True explicitly for the oracle eval
     (GT-tracked decoder velocities), e.g. via --eval_velocity_mode.
 
-    bootstrap_until / want_track_loss are MELSTM-only (see
+    bootstrap_until / want_track_loss are ME_MODELS-only (see
     Seq2SeqMEConvLSTM.forward): the first controls how many encoder steps read
     velocity off the raw frame pair instead of self-tracking h, the second
     asks for the distillation cross-entropy between the two.
 
     Returns (output_seq, pred_motion_or_None, states_or_None, track_loss_or_None).
     """
-    if isinstance(model, Seq2SeqMEConvLSTM):
+    if isinstance(model, ME_MODELS):
         if track_decoder_velocity is None:
             track_decoder_velocity = model.training
         result = model(
@@ -127,12 +137,12 @@ def _run_model(model, input_seq, pred_len, target_seq,
 
 def _velocity_flags(model, gt_motion, show_h_state=False):
     """
-    want_velocity : True only for Seq2SeqMEConvLSTM, whenever gt_motion is
-        available (--check_velocity_predictor). Returns an explicit tracked
-        (vx, vy) per slot to score against gt_motion.
+    want_velocity : True only for the ME models (ConvLSTM / ConvRNN), whenever
+        gt_motion is available (--check_velocity_predictor). Returns an
+        explicit tracked (vx, vy) per slot to score against gt_motion.
     want_states   : gates the log_state_evolution h_states plot, and is
         deliberately NOT a single shared flag across model types:
-          MEConvLSTM  -- tied to want_velocity/--check_velocity_predictor.
+          ME models   -- tied to want_velocity/--check_velocity_predictor.
               This plot exists to debug the velocity tracker, so it travels
               with the flag that turns the tracker's own debug output on.
           FEConvLSTM  -- independent --show_h_state flag. FELSTM has no
@@ -141,9 +151,9 @@ def _velocity_flags(model, gt_motion, show_h_state=False):
               "the velocity predictor".
     Callers still AND want_states with their own "first batch only" gate.
     """
-    is_melstm = isinstance(model, Seq2SeqMEConvLSTM)
+    is_me = isinstance(model, ME_MODELS)
     is_felstm = isinstance(model, Seq2SeqFEConvLSTM)
-    want_velocity = is_melstm and gt_motion is not None
+    want_velocity = is_me and gt_motion is not None
     want_states = want_velocity or (is_felstm and show_h_state and gt_motion is not None)
     return want_velocity, want_states
 
@@ -251,7 +261,7 @@ def train_epoch(model, dataloader, optimizer, criterion, device, input_frames, g
                 bootstrap_until=None, track_loss_weight=0.0,
                 track_loss_temperature=1.0):
     """
-    bootstrap_until / track_loss_weight : MELSTM velocity-distillation
+    bootstrap_until / track_loss_weight : MELSTM/MERNN velocity-distillation
         controls. The tracking cross-entropy is computed whenever it can be
         (it is the "is h ready to take over" readout) and only ADDED to the
         loss when track_loss_weight > 0 -- so weight 0 gives a pure monitor
@@ -263,7 +273,7 @@ def train_epoch(model, dataloader, optimizer, criterion, device, input_frames, g
     n_track = 0
     velocity_metrics = VelocityMetrics()
     has_velocity_data = False
-    is_melstm = isinstance(model, Seq2SeqMEConvLSTM)
+    is_me = isinstance(model, ME_MODELS)
     if curve_recorder is not None:
         curve_recorder.bootstrap_until = bootstrap_until
 
@@ -280,7 +290,7 @@ def train_epoch(model, dataloader, optimizer, criterion, device, input_frames, g
         optimizer.zero_grad()
         output_seq, pred_motion, states, track_loss = _run_model(
             model, input_seq, pred_len, target_seq, want_velocity, want_states,
-            bootstrap_until=bootstrap_until, want_track_loss=is_melstm,
+            bootstrap_until=bootstrap_until, want_track_loss=is_me,
             track_loss_temperature=track_loss_temperature,
         )
         loss = criterion(output_seq, target_seq)
@@ -349,8 +359,8 @@ def eval_epoch(model, dataloader, criterion, device, input_frames, epoch, split_
     """
     decoder_velocity_mode : "frozen" (default) — honest deployable inference,
         the last encoder velocity rolls the whole horizon; velocity metrics
-        then cover encoder steps only. "tracked" — oracle protocol: MELSTM's
-        decoder velocities are tracked against the true next frames (upper
+        then cover encoder steps only. "tracked" — oracle protocol: the ME
+        models' decoder velocities are tracked against the true next frames (upper
         bound; the gap to "frozen" isolates velocity-estimation error from
         rendering error).
     """

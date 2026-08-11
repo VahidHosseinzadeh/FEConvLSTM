@@ -6,6 +6,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, random_split, Subset
 from velocity_model_based_MEConvLSTM_model import Seq2SeqMEConvLSTM
+from velocity_model_based_MEConvRNN_model import Seq2SeqMEConvRNN
 from moving_mnist_dataset import MovingMNISTDataset
 from time_dependent_moving_mnist_dataset import TDMovingMNISTDataset
 from channel_based_FEConvLSTM_model import Seq2SeqFEConvLSTM
@@ -131,7 +132,10 @@ def main():
     parser.add_argument('--lr_patience', type=int, default=5, help='Epochs with no val_loss improvement before cutting LR (only with --use_lr_scheduler)')
     parser.add_argument('--lr_factor', type=float, default=0.5, help='Multiplicative LR cut factor (only with --use_lr_scheduler)')
     parser.add_argument('--lr_min', type=float, default=1e-6, help='Floor below which LR will not be reduced further (only with --use_lr_scheduler)')
-    parser.add_argument('--model', choices=['lstm', 'felstm', 'melstm'], default='felstm')
+    parser.add_argument('--model', choices=['lstm', 'felstm', 'melstm', 'mernn'], default='felstm',
+                        help="'mernn' is melstm's vanilla-RNN ablation: same slot/velocity "
+                             "machinery and the same MELSTM-only flags below apply to it, but "
+                             "the recurrent cell is gateless (h only, no cell state).")
     parser.add_argument('--hidden_size', type=int, default=128)
     parser.add_argument('--decoder_hidden_size', type=int, default=None,
                         help='Width of the decoder conv stack, independent of --hidden_size (which sets the '
@@ -145,7 +149,7 @@ def main():
     parser.add_argument('--max_train_samples', type=int, default=None, help='Maximum number of training samples to use (default: use all)')
     parser.add_argument('--image_size', type=int, default=28)
     parser.add_argument('--v_range', type=int, default=2)
-    parser.add_argument('--num_vel_modes', type=int, default=2, help='Number of velocity modes for MEConvLSTM')
+    parser.add_argument('--num_vel_modes', type=int, default=2, help='Number of velocity slots for melstm/mernn (MEConv*)')
     parser.add_argument('--data_v_range', type=int, default=2)
     parser.add_argument('--motion_mode', choices=['constant', 'piecewise', 'stochastic', 'accelerate'], default='piecewise',
                         help="How digit velocity evolves over time: 'constant' = fixed for the whole "
@@ -182,34 +186,34 @@ def main():
     parser.add_argument('--wandb_project', type=str, default="FERNN", help='Wandb project')
     parser.add_argument('--wandb_dir', type=str, default='./tmp/', help='Wandb directory')
     parser.add_argument('--wandb_name', type=str, default=None, help='Wandb name')
-    parser.add_argument("--check_velocity_predictor",action="store_true",help="MELSTM only: debug the velocity predictor during training/evaluation.")
+    parser.add_argument("--check_velocity_predictor",action="store_true",help="MELSTM/MERNN only: debug the velocity predictor during training/evaluation.")
     parser.add_argument("--show_h_state", action="store_true",
                          help="FELSTM only: log the per-(vx,vy) candidate h-slot maps "
                               "(filtered to velocities actually observed in the input "
                               "window) to wandb. Independent of --check_velocity_predictor, "
-                              "which is MELSTM's velocity-tracker debug flag.")
+                              "which is the ME models' velocity-tracker debug flag.")
     parser.add_argument('--val_curve_interval', type=int, default=25, help='Record validation loss every N training batches for the loss-vs-steps curve (0 = off)')
     parser.add_argument('--val_curve_size', type=int, default=256, help='Number of fixed validation sequences used for the loss-vs-steps curve')
     parser.add_argument('--eval_velocity_mode', choices=['frozen', 'tracked', 'both'], default='frozen',
-                        help="MELSTM decoder velocity at evaluation: 'frozen' = honest inference (default, drives scheduler/selection); "
+                        help="MELSTM/MERNN decoder velocity at evaluation: 'frozen' = honest inference (default, drives scheduler/selection); "
                              "'tracked' = oracle GT-tracked eval drives scheduler/selection; "
                              "'both' = select on frozen but also log val_tracked_loss each epoch")
-    # ---- MELSTM velocity distillation ------------------------------------
+    # ---- MELSTM/MERNN velocity distillation ------------------------------------
     parser.add_argument('--bootstrap_until', type=int, default=1,
-                        help='MELSTM only. Encoder steps 1..N read velocity straight off the raw '
+                        help='MELSTM/MERNN only. Encoder steps 1..N read velocity straight off the raw '
                              'frame pair (x_{t-1}, x_t) via phase correlation, bound back to slots '
                              'by continuity; later steps self-track against h. 1 = original '
                              'behaviour (bootstrap at t=1 only). Set >= --input_frames to take h '
                              'out of the encoder velocity path entirely -- the clean diagnostic '
                              'for "is the learned tracker the thing that is broken?".')
     parser.add_argument('--bootstrap_anneal_epochs', type=int, default=0,
-                        help='MELSTM only. Linearly anneal --bootstrap_until down to 1 over this '
+                        help='MELSTM/MERNN only. Linearly anneal --bootstrap_until down to 1 over this '
                              'many epochs (0 = no annealing, hold the value). Pair with a nonzero '
                              '--track_loss_weight so h is being trained toward the frame-pair '
                              'teacher while the crutch is still in place; annealing alone just '
                              'removes the crutch from a tracker that never learned anything.')
     parser.add_argument('--track_loss_weight', type=float, default=0.0,
-                        help='MELSTM only. Weight of the tracking cross-entropy that pulls each '
+                        help='MELSTM/MERNN only. Weight of the tracking cross-entropy that pulls each '
                              "slot's h-vs-frame correlation peak onto the frame-pair teacher's "
                              'answer. Uses NO dataset velocity labels -- the teacher is phase '
                              'correlation on the raw frames. 0 = compute and log it but do not '
@@ -682,7 +686,7 @@ def main():
 
         # Oracle (GT-tracked decoder velocity) validation: measures the model
         # without velocity-estimation drift; the gap to val_loss isolates
-        # velocity error from rendering error. MELSTM-only effect.
+        # velocity error from rendering error. MELSTM/MERNN-only effect.
         val_tracked_loss = None
         if args.eval_velocity_mode in ('tracked', 'both'):
             val_tracked_loss = eval_fn(model, val_loader, criterion, device, args.input_frames, epoch,

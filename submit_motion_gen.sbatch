@@ -32,7 +32,7 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 python moving_mnist/motion_generalization.py \
   --model_save_dir "$SAVE_DIR" \
-  --models lstm felstm melstm \
+  --models lstm felstm melstm mernn \
   --n_sequences "$N_SEQ" \
   --batch_size "$BATCH" \
   --root ./data \

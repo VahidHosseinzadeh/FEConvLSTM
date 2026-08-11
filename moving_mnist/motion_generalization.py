@@ -149,8 +149,9 @@ def make_dataset(cfg, preset, args):
 def rollout_error(model, seqs, ctx, pred_len, device, batch_size):
     """(N, seq_len, ...) -> (N, pred_len) per-sequence per-timestep MSE.
 
-    target_seq is never passed, i.e. the deployable protocol: MEConvLSTM
-    freezes its last encoder velocity rather than tracking future frames.
+    target_seq is never passed, i.e. the deployable protocol: the MEConv
+    models freeze their last encoder velocity rather than tracking future
+    frames.
     """
     out = []
     for b in range(0, seqs.shape[0], batch_size):
@@ -169,8 +170,8 @@ def main():
     p.add_argument('--model_save_dir', type=str, default='./experiments',
                    help="Run output root written by train.py (models/, results/); "
                         "motion_gen/ is created alongside them")
-    p.add_argument('--models', nargs='+', default=['lstm', 'felstm', 'melstm'],
-                   choices=['lstm', 'felstm', 'melstm'])
+    p.add_argument('--models', nargs='+', default=['lstm', 'felstm', 'melstm', 'mernn'],
+                   choices=['lstm', 'felstm', 'melstm', 'mernn'])
     p.add_argument('--motions', nargs='+', default=list(MOTION_PRESETS),
                    choices=list(MOTION_PRESETS))
     p.add_argument('--n_sequences', type=int, default=10000,

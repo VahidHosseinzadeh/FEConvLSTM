@@ -6,10 +6,11 @@
   # sbatch --job-name=melstm submit_comparison.sbatch melstm
   # sbatch --job-name=felstm submit_comparison.sbatch felstm
   # sbatch --job-name=lstm   submit_comparison.sbatch lstm
+  # sbatch --job-name=mernn  submit_comparison.sbatch mernn
 #
 # Monitor:
 #   squeue -u $USER
-#   wandb — training progress, per-epoch prints, and the melstm velocity
+#   wandb — training progress, per-epoch prints, and the melstm/mernn velocity
 #   report all show up there (Logs tab).
 #   tail -f slurm_<job-name>_<jobid>.log — same content, locally.
 #
@@ -43,7 +44,7 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --output=slurm_%x_%j.log
 
-MODEL=${1:?usage: sbatch submit_comparison.sbatch lstm|felstm|melstm}
+MODEL=${1:?usage: sbatch submit_comparison.sbatch lstm|felstm|melstm|mernn}
 SAVE_DIR=./experiments   # must match run_comparison.sh's SAVE_DIR
 RUN_STATE_DIR="${SAVE_DIR}/run_state"
 

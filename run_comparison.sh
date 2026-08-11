@@ -4,7 +4,7 @@
 #   tmux new -s melstm
 #   bash run_comparison.sh melstm
 #
-# One model per invocation (one tmux session each): lstm | felstm | melstm.
+# One model per invocation (one tmux session each): lstm | felstm | melstm | mernn.
 # Auto-resumes from the newest matching checkpoint_*.pth if a previous
 # attempt crashed. If you CHANGE any setting below, delete the stale
 # checkpoints first (rm experiments/run_state/checkpoint_<model>_*.pth) so
@@ -21,7 +21,7 @@
 #   run_state/  internal recovery machinery (checkpoints, DONE flags)
 
 set -e
-MODEL=${1:?usage: bash run_comparison.sh lstm|felstm|melstm}
+MODEL=${1:?usage: bash run_comparison.sh lstm|felstm|melstm|mernn}
 
 # ---- shared settings: MUST be identical across the three runs -------------
 HIDDEN=32          # cheap: felstm's cost scales ~quadratically in hidden on top of its
@@ -116,7 +116,7 @@ if [ "$MOTION_MODE" = piecewise ] || [ "$MOTION_MODE" = stochastic ]; then
 fi
 MOTION_TAG="v${DATA_V_RANGE}${MOTION_TAG}"
 
-# ---- MELSTM velocity distillation (no effect on lstm/felstm) --------------
+# ---- MELSTM/MERNN velocity distillation (no effect on lstm/felstm) --------
 # The tracker correlates h against the frame, gets no gradient, and nothing in
 # the reconstruction loss rewards h for staying a usable template -- so it can
 # degrade during training and the two slots can collapse onto one digit. These
@@ -200,9 +200,15 @@ case $MODEL in
     EXTRA=(--model felstm --v_range "$FE_V_RANGE" --show_h_state --wandb_name "felstm_${RUN_TAG}") ;;
   melstm)
     # eval_velocity_mode both: honest val drives selection, oracle val logged
-    # alongside (velocity-vs-rendering decomposition). MELSTM-only effect.
+    # alongside (velocity-vs-rendering decomposition). ME-model-only effect.
     EXTRA=(--model melstm --num_vel_modes 2 --eval_velocity_mode both
            "${MELSTM_DISTILL[@]}" --wandb_name "melstm_${RUN_TAG}") ;;
+  mernn)
+    # Gateless ablation of melstm: same slots, same velocity protocol, same
+    # flags -- the gap to melstm isolates what the LSTM gating buys once the
+    # motion is already handled by the warp.
+    EXTRA=(--model mernn --num_vel_modes 2 --eval_velocity_mode both
+           "${MELSTM_DISTILL[@]}" --wandb_name "mernn_${RUN_TAG}") ;;
   *)
     echo "unknown model: $MODEL"; exit 1 ;;
 esac
