@@ -165,6 +165,16 @@ def main():
     parser.add_argument('--max_segment', type=int, default=6, help='motion_mode=piecewise/accelerate: maximum frames before a velocity change')
     parser.add_argument('--p_change', type=float, default=0.25, help='motion_mode=stochastic only: per-step probability of a velocity change (no effect in piecewise mode)')
     parser.add_argument('--smooth_probability', type=float, default=0.8, help='transition_mode=smooth only: probability a change is a neighbor step rather than a uniform jump')
+    parser.add_argument('--freeze_after', type=int, default=-1,
+                        help="Dataset velocity freezing (TDMovingMNISTDataset.freeze_after). "
+                             "-1 (default) = freeze at the context/prediction boundary "
+                             "(--input_frames for train/val/test, --gen_input_frames for "
+                             "length-gen) — the historical behavior, under which a decoder that "
+                             "freezes its last encoder velocity matches ground truth exactly. "
+                             "0 = no freezing: the velocity keeps evolving through the rollout, "
+                             "which is the only regime where predicting the velocity can beat "
+                             "freezing it (see --use_velocity_dynamics). >0 = freeze at that "
+                             "explicit step for every split.")
     parser.add_argument('--gen_seq_len', type=int, default=40, help='Sequence length used **only** for length‑generalization evaluation (must be > seq_len)')
     parser.add_argument('--data_seed', type=int, default=42, help='Random seed for dataset splitting')
     parser.add_argument('--model_seed', type=int, default=None, help='Random seed for model initialization (default: random)')
@@ -190,10 +200,47 @@ def main():
                               "which is MELSTM's velocity-tracker debug flag.")
     parser.add_argument('--val_curve_interval', type=int, default=25, help='Record validation loss every N training batches for the loss-vs-steps curve (0 = off)')
     parser.add_argument('--val_curve_size', type=int, default=256, help='Number of fixed validation sequences used for the loss-vs-steps curve')
-    parser.add_argument('--eval_velocity_mode', choices=['frozen', 'tracked', 'both'], default='frozen',
+    parser.add_argument('--eval_velocity_mode',
+                        choices=['frozen', 'tracked', 'both', 'predicted', 'all'], default='frozen',
                         help="MELSTM decoder velocity at evaluation: 'frozen' = honest inference (default, drives scheduler/selection); "
                              "'tracked' = oracle GT-tracked eval drives scheduler/selection; "
-                             "'both' = select on frozen but also log val_tracked_loss each epoch")
+                             "'both' = select on frozen but also log val_tracked_loss each epoch; "
+                             "'predicted' = velocity dynamics head rolls the velocity forward "
+                             "(deployable, requires --use_velocity_dynamics) and drives selection; "
+                             "'all' = select on frozen but log all three (val_loss, "
+                             "val_predicted_loss, val_tracked_loss) so the three-way comparison "
+                             "lands in one run")
+    # ---- velocity dynamics head (process model for u) ----
+    # All off by default: an existing command line produces exactly the model,
+    # objective and metrics it produced before this feature existed.
+    parser.add_argument('--use_velocity_dynamics', action='store_true',
+                        help='MELSTM only: add the equivariant velocity dynamics head — a small '
+                             'GRU over the velocity history that predicts u_{t+1}, so the decoder '
+                             'can extrapolate the motion instead of freezing the last encoder '
+                             'velocity. Zero-initialized output, so at init it predicts exactly '
+                             'the frozen velocity.')
+    parser.add_argument('--vel_dyn_state_dim', type=int, default=32,
+                        help='GRU hidden size of the velocity dynamics head (per slot)')
+    parser.add_argument('--vel_dyn_use_h', action='store_true',
+                        help='Condition the dynamics head on a globally pooled (hence '
+                             'translation-invariant) readout of the hidden state, not just on the '
+                             'velocity history. Ablation, not a default: it lets the head explain '
+                             'velocity by appearance and stop extrapolating.')
+    parser.add_argument('--vel_dyn_gain', choices=['fixed', 'learned'], default='fixed',
+                        help="How the prediction and the phase-correlation measurement are "
+                             "combined in the encoder: 'fixed' (default) = k=1, the measurement is "
+                             "taken verbatim and the head is trained but does not influence the "
+                             "encoder; 'learned' = k=sigmoid(MLP(correlation peak score)), so a "
+                             "weak peak defers to the process model.")
+    parser.add_argument('--vel_dyn_loss_weight', type=float, default=0.0,
+                        help="Weight on the dynamics head's one-step-ahead loss "
+                             "smooth_l1(u_pred, v_measured.detach()). 0.0 (default) means the head "
+                             "never trains — set it (e.g. 1.0) whenever --use_velocity_dynamics is on.")
+    parser.add_argument('--vel_dyn_openloop_k', type=int, default=0,
+                        help='Extra multi-step velocity supervision: for the last k encoder steps, '
+                             'replay the head open-loop (fed its own predictions, no measurements) '
+                             'against the velocities already measured for those steps. Trains the '
+                             'extrapolation regime directly, with no image rollout. 0 = off.')
     parser.add_argument('--len_gen_every', type=int, default=0,
                         help='Also run length-generalization every N epochs regardless of val improvement '
                              '(0 = only on new best val). Saves to a separate *_latest.npz')
@@ -246,12 +293,38 @@ def main():
                id=resume_ckpt["run_id"] if resume_ckpt else None,
                resume="allow" if resume_ckpt else None)
 
+    if args.use_velocity_dynamics and args.model != 'melstm':
+        print(f"WARNING: --use_velocity_dynamics has no effect for --model {args.model} "
+              f"(MELSTM only); the flag is ignored.")
+    if args.use_velocity_dynamics and args.vel_dyn_loss_weight == 0.0:
+        print("WARNING: --use_velocity_dynamics is on but --vel_dyn_loss_weight is 0, so the "
+              "dynamics head never trains and predicts exactly the frozen velocity forever. "
+              "Set --vel_dyn_loss_weight (e.g. 1.0).")
+    if args.eval_velocity_mode in ('predicted', 'all') and not args.use_velocity_dynamics:
+        print(f"WARNING: --eval_velocity_mode {args.eval_velocity_mode} needs "
+              f"--use_velocity_dynamics; without it the 'predicted' evaluation degrades to "
+              f"'frozen' and will report the same number as val_loss.")
+
     assert args.input_frames < args.seq_len, "input_frames must be less than seq_len"
     assert args.gen_input_frames < args.gen_seq_len, "gen_input_frames must be less than gen_seq_len"
     pred_frames = args.seq_len - args.input_frames
     gen_pred_frames = args.gen_seq_len - args.gen_input_frames
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    # Dataset velocity freezing. Historically this was hardcoded to the
+    # context/prediction boundary at all three construction sites, which makes
+    # "freeze the last encoder velocity" the exactly-correct decoder policy and
+    # therefore leaves a velocity *predictor* no headroom at all. --freeze_after
+    # is what lets that be turned off for the experiments where predicting the
+    # velocity can actually win. None = TDMovingMNISTDataset's "do not freeze".
+    if args.freeze_after < 0:
+        freeze_after, gen_freeze_after = args.input_frames, args.gen_input_frames
+    elif args.freeze_after == 0:
+        freeze_after = gen_freeze_after = None
+    else:
+        freeze_after = gen_freeze_after = args.freeze_after
+    print(f"Dataset freeze_after: train/val/test={freeze_after}, len_gen={gen_freeze_after}")
 
     
 
@@ -305,7 +378,7 @@ def main():
         smooth_probability=args.smooth_probability,
 
         motion_difficulty=None,
-        freeze_after=args.input_frames,
+        freeze_after=freeze_after,
 
         min_center_distance=20,
         reject_overlap=True,
@@ -341,7 +414,7 @@ def main():
         smooth_probability=args.smooth_probability,
 
         motion_difficulty=None,
-        freeze_after=args.input_frames,
+        freeze_after=freeze_after,
 
         min_center_distance=20,
         reject_overlap=True,
@@ -378,7 +451,7 @@ def main():
 
         motion_difficulty=None,
 
-        freeze_after=args.gen_input_frames,
+        freeze_after=gen_freeze_after,
 
         min_center_distance=20,
         reject_overlap=True,
@@ -634,8 +707,10 @@ def main():
 
     for epoch in range(start_epoch, args.epochs + 1):
         epoch_start = time.time()
-        train_loss = train_fn(model, train_loader, optimizer, criterion, device, args.input_frames, args.grad_clip,
-                              curve_recorder=curve_recorder, show_h_state=args.show_h_state)
+        train_loss, dyn_loss = train_fn(model, train_loader, optimizer, criterion, device, args.input_frames,
+                                        args.grad_clip, curve_recorder=curve_recorder,
+                                        show_h_state=args.show_h_state,
+                                        vel_dyn_loss_weight=args.vel_dyn_loss_weight)
         epoch_time = time.time() - epoch_start
         val_loss = eval_fn(model, val_loader, criterion, device, args.input_frames, epoch, split_name="val",
                            show_h_state=args.show_h_state)
@@ -644,19 +719,48 @@ def main():
         # without velocity-estimation drift; the gap to val_loss isolates
         # velocity error from rendering error. MELSTM-only effect.
         val_tracked_loss = None
-        if args.eval_velocity_mode in ('tracked', 'both'):
+        if args.eval_velocity_mode in ('tracked', 'both', 'all'):
             val_tracked_loss = eval_fn(model, val_loader, criterion, device, args.input_frames, epoch,
                                        split_name="val_tracked", decoder_velocity_mode="tracked",
                                        show_h_state=args.show_h_state)
 
-        # Metric driving the scheduler / best-model selection / len-gen gating
-        selection_val = val_tracked_loss if args.eval_velocity_mode == 'tracked' else val_loss
+        # Deployable-but-extrapolating validation: the dynamics head rolls the
+        # velocity forward with no measurement. Sits between val_loss (frozen,
+        # deployable) and val_tracked_loss (oracle) -- 'all' logs the three
+        # together so the whole comparison comes out of one run.
+        val_predicted_loss = None
+        if args.eval_velocity_mode in ('predicted', 'all'):
+            val_predicted_loss = eval_fn(model, val_loader, criterion, device, args.input_frames, epoch,
+                                         split_name="val_predicted", decoder_velocity_mode="predicted",
+                                         show_h_state=args.show_h_state)
+
+        # Metric driving the scheduler / best-model selection / len-gen gating.
+        # 'both' and 'all' deliberately keep selecting on the honest frozen
+        # metric: they add reporting, they do not change what is optimized for.
+        if args.eval_velocity_mode == 'tracked':
+            selection_val = val_tracked_loss
+        elif args.eval_velocity_mode == 'predicted':
+            selection_val = val_predicted_loss
+        else:
+            selection_val = val_loss
 
         history['train_loss'].append(train_loss)
         history['val_loss'].append(val_loss)
         history['epoch_time_sec'].append(epoch_time)
-        tracked_str = f" | Val (tracked): {val_tracked_loss:.4f}" if val_tracked_loss is not None else ""
-        print(f"Epoch {epoch}/{args.epochs} | {args.model:^8} | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f}{tracked_str} | {epoch_time:.1f}s")
+        if val_predicted_loss is not None:
+            history.setdefault('val_predicted_loss', []).append(val_predicted_loss)
+        if val_tracked_loss is not None:
+            history.setdefault('val_tracked_loss', []).append(val_tracked_loss)
+        if dyn_loss is not None:
+            history.setdefault('dyn_loss', []).append(dyn_loss)
+        extra_str = ""
+        if val_predicted_loss is not None:
+            extra_str += f" | Val (predicted): {val_predicted_loss:.4f}"
+        if val_tracked_loss is not None:
+            extra_str += f" | Val (tracked): {val_tracked_loss:.4f}"
+        if dyn_loss is not None:
+            extra_str += f" | Dyn: {dyn_loss:.4f}"
+        print(f"Epoch {epoch}/{args.epochs} | {args.model:^8} | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f}{extra_str} | {epoch_time:.1f}s")
 
         if scheduler is not None:
             lr_before = optimizer.param_groups[0]['lr']
@@ -675,6 +779,10 @@ def main():
         }
         if val_tracked_loss is not None:
             log_payload["val_tracked_loss"] = val_tracked_loss
+        if val_predicted_loss is not None:
+            log_payload["val_predicted_loss"] = val_predicted_loss
+        if dyn_loss is not None:
+            log_payload["dyn_loss"] = dyn_loss
         wandb.log(log_payload)
 
         # Persist curves incrementally so a killed run still leaves data
@@ -788,6 +896,28 @@ def main():
     # Final history dump (also written incrementally after every epoch)
     dump_history(history)
     print(f"Saved training history to {history_path}")
+
+    # Three-way decoder-velocity comparison, side by side. The expected
+    # ordering is tracked (oracle, has the true next frame) < predicted
+    # (extrapolates) < frozen (holds the last encoder velocity) -- but ONLY on
+    # data whose velocity keeps changing through the rollout. Under the default
+    # --freeze_after the dataset freezes the velocity at the boundary, which
+    # makes "frozen" exactly right and leaves the head nothing to win; run with
+    # --motion_mode accelerate --freeze_after 0 to see the ordering above.
+    if args.eval_velocity_mode == 'all' and history.get('val_predicted_loss'):
+        best_i = int(np.argmin(history['val_loss']))
+        print("\nDecoder velocity comparison (val loss at the best frozen-selection epoch "
+              f"{best_i + 1}):")
+        for label, key in (("frozen   ", 'val_loss'),
+                           ("predicted", 'val_predicted_loss'),
+                           ("tracked  ", 'val_tracked_loss')):
+            series = history.get(key) or []
+            if best_i < len(series):
+                print(f"  {label} : {series[best_i]:.4f}   (final {series[-1]:.4f})")
+        if args.freeze_after < 0:
+            print("  NOTE: --freeze_after is at its default, so the dataset velocity is frozen at "
+                  "the context boundary and 'frozen' is the exactly-correct policy. This comparison "
+                  "only means something with --freeze_after 0.")
 
     # Print final best model paths and test results
     print("\nBest model paths and test results:")

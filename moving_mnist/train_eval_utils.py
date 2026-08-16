@@ -45,7 +45,14 @@ def build_model(cfg):
         return Seq2SeqMEConvLSTM(
             input_channels=1, hidden_channels=hidden, kernel_size=kernel,
             n_slots=get("num_vel_modes", 2), slot_reduce="max",
-            decoder_layers=dec_layers, decoder_channels=dec_channels)
+            decoder_layers=dec_layers, decoder_channels=dec_channels,
+            # Absent from older config dicts -> the defaults reproduce exactly
+            # the architecture those runs were trained with.
+            use_velocity_dynamics=get("use_velocity_dynamics", False),
+            vel_dyn_state_dim=get("vel_dyn_state_dim", 32),
+            vel_dyn_use_h=get("vel_dyn_use_h", False),
+            vel_dyn_gain=get("vel_dyn_gain", "fixed"),
+            vel_dyn_openloop_k=get("vel_dyn_openloop_k", 0))
 
     raise ValueError(f"unknown model {name!r}")
 
@@ -61,7 +68,8 @@ def _unpack_batch(batch, device):
 
 
 def _run_model(model, input_seq, pred_len, target_seq,
-               want_velocity, want_states, track_decoder_velocity=None):
+               want_velocity, want_states, track_decoder_velocity=None,
+               predict_decoder_velocity=False, want_dyn_loss=False):
     """
     Single call site for every model type.
 
@@ -76,7 +84,16 @@ def _run_model(model, input_seq, pred_len, target_seq,
     deployable inference). Pass True explicitly for the oracle eval
     (GT-tracked decoder velocities), e.g. via --eval_velocity_mode.
 
-    Returns (output_seq, pred_motion_or_None, states_or_None).
+    predict_decoder_velocity rolls the decoder velocity forward with the
+    velocity dynamics head instead of freezing it — the third decoder mode,
+    deployable like "frozen" but able to follow a still-changing velocity.
+    Ignored unless the model was built with --use_velocity_dynamics, and
+    superseded by the tracked (oracle) protocol when that is active.
+
+    want_dyn_loss asks the model for the one-step-ahead velocity dynamics
+    loss so the caller can add it to the training objective.
+
+    Returns (output_seq, pred_motion_or_None, states_or_None, dyn_loss_or_None).
     """
     if isinstance(model, Seq2SeqMEConvLSTM):
         if track_decoder_velocity is None:
@@ -86,27 +103,31 @@ def _run_model(model, input_seq, pred_len, target_seq,
             pred_len=pred_len,
             target_seq=target_seq,
             track_decoder_velocity=track_decoder_velocity,
+            predict_decoder_velocity=predict_decoder_velocity,
             return_velocity=want_velocity,
+            return_dyn_loss=want_dyn_loss,
             return_states=want_states,
         )
-        if not (want_velocity or want_states):
-            return result, None, None
+        if not (want_velocity or want_states or want_dyn_loss):
+            return result, None, None, None
+        # Model's return order: outputs, [velocities], [dyn_loss], [states]
         result = list(result if isinstance(result, tuple) else [result])
         output_seq = result.pop(0)
         pred_motion = result.pop(0) if want_velocity else None
+        dyn_loss = result.pop(0) if want_dyn_loss else None
         states = result.pop(0) if want_states else None
-        return output_seq, pred_motion, states
+        return output_seq, pred_motion, states, dyn_loss
 
     if isinstance(model, Seq2SeqFEConvLSTM):
         # FEConvLSTM has no explicit velocity readout (want_velocity is
         # always False for it, see _velocity_flags) -- it only exposes
         # h_states, one channel-mean map per (vx, vy) candidate slot.
         if not want_states:
-            return model(input_seq, pred_len=pred_len), None, None
+            return model(input_seq, pred_len=pred_len), None, None, None
         output_seq, states = model(input_seq, pred_len=pred_len, return_states=True)
-        return output_seq, None, states
+        return output_seq, None, states, None
 
-    return model(input_seq, pred_len=pred_len), None, None
+    return model(input_seq, pred_len=pred_len), None, None, None
 
 
 def _velocity_flags(model, gt_motion, show_h_state=False):
@@ -171,7 +192,7 @@ class ValCurveRecorder:
             seq = self.data[s:s + self.batch_size].to(self.device)
             inp = seq[:, :self.input_frames]
             tgt = seq[:, self.input_frames:]
-            pred, _, _ = _run_model(model, inp, tgt.size(1), None, False, False)
+            pred, _, _, _ = _run_model(model, inp, tgt.size(1), None, False, False)
             d = pred - tgt
             per_seq.append((d.pow(2).mean(dim=(1, 2, 3, 4))
                             + d.abs().mean(dim=(1, 2, 3, 4))).cpu())
@@ -225,11 +246,21 @@ class ValCurveRecorder:
 
 
 def train_epoch(model, dataloader, optimizer, criterion, device, input_frames, grad_clip=None,
-                curve_recorder=None, show_h_state=False):
+                curve_recorder=None, show_h_state=False, vel_dyn_loss_weight=0.0):
+    """
+    vel_dyn_loss_weight : weight on the velocity dynamics head's one-step-ahead
+        loss (--vel_dyn_loss_weight). 0.0 (default) leaves both the objective
+        and the model call identical to before this feature existed; with a
+        head present but zero weight the head simply never trains.
+    """
     model.train()
     running_loss = 0.0
+    running_dyn_loss = 0.0
     velocity_metrics = VelocityMetrics()
     has_velocity_data = False
+
+    want_dyn_loss = (vel_dyn_loss_weight > 0.0
+                     and getattr(model, "vel_dyn", None) is not None)
 
     pbar = tqdm(dataloader, desc="Training", leave=False, disable=True)
     for i, batch in enumerate(pbar):
@@ -242,11 +273,21 @@ def train_epoch(model, dataloader, optimizer, criterion, device, input_frames, g
         want_states = want_states and i == 0
 
         optimizer.zero_grad()
-        output_seq, pred_motion, states = _run_model(
-            model, input_seq, pred_len, target_seq, want_velocity, want_states
+        output_seq, pred_motion, states, dyn_loss = _run_model(
+            model, input_seq, pred_len, target_seq, want_velocity, want_states,
+            want_dyn_loss=want_dyn_loss,
         )
+        # Image loss and total objective are kept separate on purpose: the
+        # reported/curve-recorded train_loss must stay the pixel loss, or
+        # turning the dynamics head on would shift the training curve for
+        # reasons that have nothing to do with prediction quality and make it
+        # incomparable with every previous run.
         loss = criterion(output_seq, target_seq)
-        loss.backward()
+        total_loss = loss
+        if dyn_loss is not None:
+            running_dyn_loss += dyn_loss.item() * seq.size(0)
+            total_loss = loss + vel_dyn_loss_weight * dyn_loss
+        total_loss.backward()
 
         if grad_clip is not None:
             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
@@ -280,7 +321,10 @@ def train_epoch(model, dataloader, optimizer, criterion, device, input_frames, g
         velocity_metrics.report("Training Velocity")
         log_velocity_report(velocity_metrics.summary(), split_name="train")
 
-    return running_loss / len(dataloader.dataset)
+    n = len(dataloader.dataset)
+    # (pixel loss, dynamics loss). The second is None when the head is absent
+    # or unweighted, so the caller can tell "not measured" from "measured 0".
+    return running_loss / n, (running_dyn_loss / n if want_dyn_loss else None)
 
 
 def eval_epoch(model, dataloader, criterion, device, input_frames, epoch, split_name,
@@ -291,10 +335,16 @@ def eval_epoch(model, dataloader, criterion, device, input_frames, epoch, split_
         then cover encoder steps only. "tracked" — oracle protocol: MELSTM's
         decoder velocities are tracked against the true next frames (upper
         bound; the gap to "frozen" isolates velocity-estimation error from
-        rendering error).
+        rendering error). "predicted" — the velocity dynamics head rolls the
+        velocity forward with no measurement: deployable like "frozen", but
+        able to keep following a velocity that is still changing after the
+        context ends. Requires a model built with --use_velocity_dynamics;
+        without one it silently degrades to "frozen", which is exactly what
+        the head predicts at initialization anyway.
     """
     model.eval()
     track = decoder_velocity_mode == "tracked"
+    predict = decoder_velocity_mode == "predicted"
     running_loss = 0.0
     velocity_metrics = VelocityMetrics()
     has_velocity_data = False
@@ -310,9 +360,10 @@ def eval_epoch(model, dataloader, criterion, device, input_frames, epoch, split_
             want_velocity, want_states = _velocity_flags(model, gt_motion, show_h_state)
             want_states = want_states and i == 0
 
-            output_seq, pred_motion, states = _run_model(
+            output_seq, pred_motion, states, _ = _run_model(
                 model, input_seq, pred_len, target_seq, want_velocity, want_states,
                 track_decoder_velocity=True if track else None,
+                predict_decoder_velocity=predict,
             )
             loss = criterion(output_seq, target_seq)
             batch_loss = loss.item()
@@ -399,7 +450,7 @@ def eval_len_generalization(model, dataloader, device, input_frames, subsample_t
             want_states = want_states and first_pass
 
             # target_seq=None: length generalization is pure rollout.
-            pred, pred_motion, states = _run_model(
+            pred, pred_motion, states, _ = _run_model(
                 model, inp, T, None, want_velocity, want_states
             )
 
@@ -491,7 +542,7 @@ def eval_velocity_generalization(model, device, args):
                 for seq, _ in batch_pbar:
                     seq = seq.to(device)
                     inp, tgt = seq[:, :args.input_frames], seq[:, args.input_frames:]
-                    pred, _, _ = _run_model(model, inp, tgt.size(1), None, False, False)
+                    pred, _, _, _ = _run_model(model, inp, tgt.size(1), None, False, False)
                     mse = crit(pred, tgt).mean(dim=(2, 3, 4))  # [B, T]
                     batch_mse = mse.mean().item()
                     mse_sum += batch_mse * mse.size(0)

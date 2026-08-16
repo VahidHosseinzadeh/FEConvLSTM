@@ -4,6 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from velocity_predictor_model import PhaseCorrelation
+from velocity_dynamics_model import VelocityDynamicsHead
 
 
 class MEConvLSTMCell(nn.Module):
@@ -141,6 +142,21 @@ class Seq2SeqMEConvLSTM(nn.Module):
     Correct choice: freeze v_last (last encoder velocity).
     For constant-velocity data (Moving MNIST) this is exact.
     For time-varying velocities, no better option exists without GT.
+
+    Velocity dynamics head (optional, --use_velocity_dynamics)
+    ----------------------------------------------------------
+    "No better option exists without GT" is true only as long as velocity is
+    treated as something to be *measured*. VelocityDynamicsHead adds a process
+    model: a small GRU over the velocity history that predicts u_{t+1}, so the
+    decoder can extrapolate instead of freezing. Together with the correlation
+    head this is a predict/correct filter -- measurement + process model.
+
+    It is exactly motion-equivariant (see velocity_dynamics_model.py), so
+    turning it on does not cost the property the whole architecture exists for.
+    With use_velocity_dynamics=False the forward pass below is byte-for-byte
+    the old one; with it True but freshly initialized, the zero-initialized
+    output layer makes the head's prediction equal to the frozen velocity, so
+    it nests the old behaviour rather than replacing it.
     """
 
     def __init__(self,
@@ -154,7 +170,14 @@ class Seq2SeqMEConvLSTM(nn.Module):
                  decoder_channels=None,
                  bias=True,
                  batch_first=True,
-                 phase_corr_kwargs=None):
+                 phase_corr_kwargs=None,
+                 use_velocity_dynamics=False,
+                 vel_dyn_state_dim=32,
+                 vel_dyn_use_h=False,
+                 vel_dyn_gain='fixed',
+                 vel_dyn_h_embed_dim=16,
+                 vel_dyn_v_max=None,
+                 vel_dyn_openloop_k=0):
         super().__init__()
 
         self.batch_first     = batch_first
@@ -189,23 +212,74 @@ class Seq2SeqMEConvLSTM(nn.Module):
                              3, padding=1, padding_mode='circular', bias=True)]
         self.decoder = nn.Sequential(*layers)
 
+        # ---- optional velocity process model -------------------------
+        # Off by default: every existing run, checkpoint and result must be
+        # bit-for-bit unaffected, so nothing below is even constructed unless
+        # asked for (a constructed-but-unused module would still change the
+        # parameter count and the RNG stream during init).
+        if vel_dyn_gain not in ('fixed', 'learned'):
+            raise ValueError(f"vel_dyn_gain must be 'fixed' or 'learned', got {vel_dyn_gain!r}")
+
+        self.use_velocity_dynamics = use_velocity_dynamics
+        self.vel_dyn_gain          = vel_dyn_gain
+        self.vel_dyn_openloop_k    = vel_dyn_openloop_k
+        self.vel_dyn               = None
+        self.vel_dyn_gain_mlp      = None
+
+        if use_velocity_dynamics:
+            self.vel_dyn = VelocityDynamicsHead(
+                state_dim=vel_dyn_state_dim,
+                hidden_channels=hidden_channels,
+                use_h=vel_dyn_use_h,
+                h_embed_dim=vel_dyn_h_embed_dim,
+                v_max=vel_dyn_v_max,
+            )
+            if vel_dyn_gain == 'learned':
+                # Kalman-ish gain from the correlation peak strength: a weak
+                # peak means the measurement is unreliable and the process
+                # model should be trusted more. The peak score is INVARIANT
+                # under global translation (phase correlation shifts the peak,
+                # it does not change its height), so k is invariant and
+                #     u = u_pred + k * (v_meas - u_pred)
+                # stays equivariant: both terms carry +v, their difference
+                # carries none, and k scales an invariant quantity.
+                self.vel_dyn_gain_mlp = nn.Sequential(
+                    nn.Linear(1, 16), nn.ReLU(), nn.Linear(16, 1),
+                )
+                # Start at k = sigmoid(6) ~ 0.9975, i.e. essentially "trust the
+                # measurement" -- the same regime as the 'fixed' default -- so
+                # the learned gain has to earn its departure from it rather
+                # than starting somewhere arbitrary. (It cannot nest 'fixed'
+                # exactly: sigmoid never reaches 1.)
+                nn.init.zeros_(self.vel_dyn_gain_mlp[-1].weight)
+                nn.init.constant_(self.vel_dyn_gain_mlp[-1].bias, 6.0)
+
     # ------------------------------------------------------------------
     # Velocity helpers
     # ------------------------------------------------------------------
 
-    def bootstrap_velocities(self, x0, x1):
-        """K peaks from raw frame pair. Called once: encoder t=1."""
-        v, _ = self.phase_corr_bootstrap(x0, x1)
-        return v   # (B, K, 2)
+    def bootstrap_velocities(self, x0, x1, return_score=False):
+        """K peaks from raw frame pair. Called once: encoder t=1.
 
-    def track_velocities(self, h, frame):
+        return_score additionally returns the (B, K) correlation peak heights,
+        which the learned dynamics gain uses as a confidence signal. Default
+        False keeps the original single-return signature for every existing
+        caller."""
+        v, s = self.phase_corr_bootstrap(x0, x1)
+        return (v, s) if return_score else v   # (B, K, 2), (B, K)
+
+    def track_velocities(self, h, frame, return_score=False):
         """
         Per-slot self-tracking: correlate each slot's h against frame.
         All B*K pairs in one batched call.
 
         h     : (B, K, Ch, H, W)
         frame : (B, C,  H,  W)
-        ->      (B, K, 2)
+        ->      (B, K, 2)   (and (B, K) peak scores if return_score)
+
+        The scores were always computed and thrown away; the learned dynamics
+        gain needs them, so they can now be asked for. Nothing about the
+        velocity path changes.
         """
         B, K, Ch, H, W = h.shape
         _, C, _, _     = frame.shape
@@ -216,8 +290,11 @@ class Seq2SeqMEConvLSTM(nn.Module):
                        .reshape(B * K, C, H, W))
 
         with torch.no_grad():
-            v_flat, _ = self.phase_corr_track(h_tmpl, f_rep)
-        return v_flat.squeeze(1).reshape(B, K, 2)
+            v_flat, s_flat = self.phase_corr_track(h_tmpl, f_rep)
+        v = v_flat.squeeze(1).reshape(B, K, 2)
+        if not return_score:
+            return v
+        return v, s_flat.squeeze(1).reshape(B, K)
 
     def pool_slots(self, h):
         """h : (B, K, Ch, H, W) -> (B, Ch, H, W)"""
@@ -228,6 +305,21 @@ class Seq2SeqMEConvLSTM(nn.Module):
         else:
             return h.max(dim=1).values
 
+    def _dyn_gain(self, score):
+        """
+        Blending weight k for u = u_pred + k * (v_meas - u_pred).
+
+        'fixed' returns None, which the caller reads as "k = 1, take the
+        measurement verbatim". It is deliberately not the float 1.0: writing
+        u_pred + 1.0 * (v_meas - u_pred) is not bit-identical to v_meas in
+        floating point, and the nesting guarantee (dynamics head on == old
+        behaviour) has to hold exactly, not to 1e-7.
+        """
+        if self.vel_dyn_gain == 'fixed':
+            return None
+        k = torch.sigmoid(self.vel_dyn_gain_mlp(score.unsqueeze(-1)))  # (B,K,1)
+        return k
+
     # ------------------------------------------------------------------
     # Forward
     # ------------------------------------------------------------------
@@ -237,7 +329,9 @@ class Seq2SeqMEConvLSTM(nn.Module):
                 pred_len,
                 target_seq=None,
                 track_decoder_velocity=True,
+                predict_decoder_velocity=False,
                 return_velocity=False,
+                return_dyn_loss=False,
                 return_states=False):
         """
         input_seq : (B, T_in, C, H, W),  T_in >= 2
@@ -251,14 +345,46 @@ class Seq2SeqMEConvLSTM(nn.Module):
             inference behavior — regardless of whether target_seq is given
             (so velocity metrics/losses can still be computed against a
             target without leaking its motion into the prediction).
+        predict_decoder_velocity : the third decoder mode. Requires
+            use_velocity_dynamics. The dynamics head rolls the velocity
+            forward with no measurement at all (k = 0) — deployable like
+            "frozen", but able to follow a velocity that keeps changing after
+            the context ends. Ignored when the tracked (oracle) protocol is
+            active: a real measurement always beats a prediction.
+        return_dyn_loss : return the mean one-step-ahead dynamics loss (a
+            scalar tensor) for the caller to add to its training objective.
+            Zero when the head is off or when no supervised step occurred.
+
+        Return order when several flags are set:
+            outputs, [velocities], [dyn_loss], [states]
         """
         if not self.batch_first:
             input_seq = input_seq.permute(1, 0, 2, 3, 4)
 
         B, T_in, C, H, W = input_seq.shape
         K = self.n_slots
+        device, dtype = input_seq.device, input_seq.dtype
 
         h, c = self.cell.init_hidden(B, K, H, W, input_seq.device, input_seq.dtype)
+
+        # ---- Velocity dynamics bookkeeping --------------------------
+        # use_dyn gates every line this feature added. With it False the code
+        # below is exactly the pre-existing forward pass — same ops, same
+        # order, same RNG consumption — which is what the nesting test checks.
+        use_dyn   = self.vel_dyn is not None
+        dyn_state = self.vel_dyn.init_state(B, K, device, dtype) if use_dyn else None
+        u_prev    = torch.zeros(B, K, 2, device=device, dtype=dtype)
+        du_prev   = torch.zeros(B, K, 2, device=device, dtype=dtype)
+        n_meas    = 0                      # measurements consumed so far
+        dyn_terms = []                     # per-step smooth-L1 terms
+        # (t, h_at_t, v_meas) per supervised encoder step, for the optional
+        # open-loop replay. Holds references to tensors autograd is keeping
+        # alive anyway, so it costs bookkeeping, not memory.
+        dyn_records = []
+        ol_fork     = None
+        # Earliest usable fork is t=2: t=1 is the first measurement, so t=2 is
+        # the first step at which "predict the next velocity" is even defined.
+        t_fork      = max(2, T_in - self.vel_dyn_openloop_k) if use_dyn else None
 
         # ---- Encoder ------------------------------------------------
         # v_last = torch.zeros(B, K, 2, device=input_seq.device, dtype=input_seq.dtype)
@@ -267,6 +393,8 @@ class Seq2SeqMEConvLSTM(nn.Module):
 
         for t in range(T_in):
 
+            score = None
+
             if t == 0:
                 # h=0, warp(0,v)=0 for any v. h_1 = σ(U★X_0).
                 v = torch.zeros(B, K, 2, device=input_seq.device,
@@ -274,11 +402,56 @@ class Seq2SeqMEConvLSTM(nn.Module):
 
             elif t == 1:
                 # First non-zero h. Bootstrap from (X_0, X_1).
-                v = self.bootstrap_velocities(input_seq[:, 0], input_seq[:, 1])
+                if use_dyn and self.vel_dyn_gain == 'learned':
+                    v, score = self.bootstrap_velocities(
+                        input_seq[:, 0], input_seq[:, 1], return_score=True)
+                else:
+                    v = self.bootstrap_velocities(input_seq[:, 0], input_seq[:, 1])
 
             else:
                 # Slot self-tracking. X_t consumed exactly once.
-                v = self.track_velocities(h, input_seq[:, t])
+                if use_dyn and self.vel_dyn_gain == 'learned':
+                    v, score = self.track_velocities(h, input_seq[:, t],
+                                                     return_score=True)
+                else:
+                    v = self.track_velocities(h, input_seq[:, t])
+
+            # Predict/correct. t=0 produces no measurement (v is a placeholder
+            # zero, not an estimate), so the filter starts at t=1.
+            if use_dyn and t >= 1:
+                if self.vel_dyn_openloop_k > 0 and t == t_fork and n_meas >= 1:
+                    ol_fork = (u_prev, du_prev, dyn_state)
+
+                u_pred, dyn_state = self.vel_dyn(u_prev, du_prev, h, dyn_state)
+
+                # The measurement is the TARGET and is detached: the dynamics
+                # head learns from phase correlation, phase correlation must
+                # never learn from the dynamics head. (It is non-differentiable
+                # anyway — the velocity comes from an argmax index — so this
+                # detach is documentation as much as it is a stop-gradient.)
+                # No term at the first measurement: there is nothing to have
+                # predicted it from.
+                if n_meas >= 1:
+                    dyn_terms.append(F.smooth_l1_loss(u_pred, v.detach()))
+
+                # Blend only once the process model has seen something. At the
+                # very first measurement u_pred is just the zero-initialized
+                # u_prev, so blending would shrink the bootstrap velocity
+                # toward zero on the strength of a prediction made from no
+                # evidence at all.
+                k = self._dyn_gain(score) if n_meas >= 1 else None
+                if k is not None:
+                    v = u_pred + k * (v - u_pred)
+                # k is None => k = 1 => v is the measurement, untouched.
+
+                # du is only meaningful once two measurements exist; zeros
+                # otherwise (feeding u_1 - 0 would tell the GRU the digit just
+                # accelerated from rest, which never happened).
+                du_prev = (v - u_prev) if n_meas >= 1 else torch.zeros_like(v)
+                u_prev  = v
+                n_meas += 1
+                if self.vel_dyn_openloop_k > 0:
+                    dyn_records.append((t, h, v.detach()))
 
             h, c   = self.cell(input_seq[:, t], h, c, v)
 
@@ -287,6 +460,23 @@ class Seq2SeqMEConvLSTM(nn.Module):
 
             if return_states:
                 h_states.append(h.mean(dim=2).detach())
+
+        # ---- Optional open-loop velocity supervision ----------------
+        # Multi-step supervision for free: re-run the head from a fork point
+        # partway through the encoder, feeding it its OWN predictions instead
+        # of the measurements, and score it against the measurements already
+        # in hand. This trains the extrapolation regime (exactly what the
+        # decoder does) without rolling out a single image. The main path
+        # above is untouched — the fork is a side branch.
+        if use_dyn and self.vel_dyn_openloop_k > 0 and ol_fork is not None:
+            u_ol, du_ol, st_ol = ol_fork
+            for t_rec, h_rec, v_rec in dyn_records:
+                if t_rec < t_fork:
+                    continue
+                u_ol_next, st_ol = self.vel_dyn(u_ol, du_ol, h_rec, st_ol)
+                dyn_terms.append(F.smooth_l1_loss(u_ol_next, v_rec))
+                du_ol = u_ol_next - u_ol
+                u_ol  = u_ol_next
 
         # ---- Decoder ------------------------------------------------
         prev_frame = input_seq[:, -1]
@@ -297,7 +487,29 @@ class Seq2SeqMEConvLSTM(nn.Module):
 
             if target_seq is not None and track_decoder_velocity:
                 v = self.track_velocities(h, target_seq[:, t])
+                if use_dyn:
+                    # The oracle measurement still wins, but the head is run
+                    # and supervised anyway: these steps are precisely the
+                    # regime it exists for, so they are the most informative
+                    # supervision available and it would be wasteful to skip
+                    # them just because the rollout does not need the output.
+                    u_pred, dyn_state = self.vel_dyn(u_prev, du_prev, h, dyn_state)
+                    if n_meas >= 1:
+                        dyn_terms.append(F.smooth_l1_loss(u_pred, v.detach()))
+                    du_prev = (v - u_prev) if n_meas >= 1 else torch.zeros_like(v)
+                    u_prev  = v
+                    n_meas += 1
                 estimated_velocities.append(v.clone().detach())
+
+            elif use_dyn and predict_decoder_velocity:
+                # No measurement exists here, so k = 0: the process model runs
+                # the velocity forward on its own. Gradients from the image
+                # loss do reach the head through the warp, which is intended —
+                # in this mode the head is part of the rollout, not a bystander.
+                v, dyn_state = self.vel_dyn(u_prev, du_prev, h, dyn_state)
+                du_prev = v - u_prev
+                u_prev  = v
+                estimated_velocities.append(v.detach())
             # else: v keeps the last encoder estimate (frozen rollout)
 
             h, c  = self.cell(current_frame, h, c, v)
@@ -305,7 +517,7 @@ class Seq2SeqMEConvLSTM(nn.Module):
             outputs.append(pred)
             prev_frame = pred
 
-                
+
             if return_states:
                 h_states.append(h.mean(dim=2).detach())
 
@@ -315,6 +527,13 @@ class Seq2SeqMEConvLSTM(nn.Module):
 
         if return_velocity:
             result.append(torch.stack(estimated_velocities, dim=1))
+
+        if return_dyn_loss:
+            # Mean, not sum: the magnitude must not depend on T_in / pred_len,
+            # or --vel_dyn_loss_weight would silently mean something different
+            # for every sequence length.
+            result.append(torch.stack(dyn_terms).mean() if dyn_terms
+                          else torch.zeros((), device=device, dtype=dtype))
 
         if return_states:
             result.append({
