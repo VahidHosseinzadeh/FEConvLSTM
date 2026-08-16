@@ -63,8 +63,19 @@ class MEConvRNNCell(nn.Module):
         yy = yy.unsqueeze(0).expand(B * K, -1, -1)
         xx = xx.unsqueeze(0).expand(B * K, -1, -1)
 
-        yy = 2 * torch.remainder(yy - dy, H) / (H - 1) - 1
-        xx = 2 * torch.remainder(xx - dx, W) / (W - 1) - 1
+        # remainder() puts the source coordinate in [0, H), but align_corners
+        # normalisation only reaches pixel H-1 at +1. A fractional residual in
+        # (H-1, H) -- the band straddling the wrap -- would normalise above 1
+        # and get clamped to the last row instead of interpolating against row
+        # 0. Sampling from a 1-px circular pad makes that band a real interior
+        # interpolation: source p in [0, H) sits at padded coordinate p+1,
+        # normalised over the padded extent H+2 (align_corners -> divide by
+        # H+1). Integer velocities are unaffected (they land on grid points
+        # either way); this is what makes sub-pixel velocities safe.
+        x = F.pad(x, (1, 1, 1, 1), mode="circular")
+
+        yy = 2 * (torch.remainder(yy - dy, H) + 1) / (H + 1) - 1
+        xx = 2 * (torch.remainder(xx - dx, W) + 1) / (W + 1) - 1
 
         grid = torch.stack([xx, yy], dim=-1)
         x = F.grid_sample(x, grid, mode="bilinear",
