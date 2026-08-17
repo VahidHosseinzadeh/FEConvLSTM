@@ -19,6 +19,27 @@
 #   models/     the actual trained weights
 #   results/    plot-script inputs (history/len_gen/vel_gen)
 #   run_state/  internal recovery machinery (checkpoints, DONE flags)
+#
+# ---------------------------------------------------------------------------
+# CURRENT DEFAULTS = the velocity-dynamics-head experiment, NOT the old
+# baseline. Two data settings were changed from what this script used to run:
+#
+#     MOTION_MODE   piecewise -> accelerate
+#     FREEZE_AFTER  (new)     -> 0
+#
+# Both are required for the experiment to mean anything. The dataset normally
+# freezes the ground-truth velocity at the context/prediction boundary
+# (FREEZE_AFTER=-1), which makes "decoder freezes its last encoder velocity"
+# the EXACTLY correct policy and leaves a velocity predictor precisely zero
+# headroom -- you would measure "no effect" and learn nothing. FREEZE_AFTER=0
+# turns the freeze off so the velocity keeps ramping through the rollout, and
+# accelerate makes it ramp systematically rather than random-walk.
+#
+# To get the old baseline back: MOTION_MODE=piecewise, FREEZE_AFTER=-1,
+# USE_VEL_DYN=0. All three models still see identical data either way, so the
+# lstm/felstm comparison remains valid at these settings -- it is just a
+# harder, non-frozen version of the task.
+# ---------------------------------------------------------------------------
 
 set -e
 MODEL=${1:?usage: bash run_comparison.sh lstm|felstm|melstm}
@@ -64,7 +85,7 @@ SAVE_DIR=./experiments
 # models saw the same motion. Only the parameters that apply to the chosen
 # MOTION_MODE are passed through (see the case block below) -- the rest are
 # left at train.py's defaults rather than silently pretending to matter.
-MOTION_MODE=piecewise   # constant   : one velocity for the whole sequence
+MOTION_MODE=accelerate  # constant   : one velocity for the whole sequence
                         # piecewise  : held MIN_SEGMENT..MAX_SEGMENT frames, then changes
                         # stochastic : P_CHANGE chance of changing at every step
                         # accelerate : speed ramps by a per-digit constant sign every
@@ -85,10 +106,27 @@ MAX_SEGMENT=6           # For accelerate, this is the ramp interval: smaller = f
 P_CHANGE=0.25           # stochastic only: per-step probability of a change.
 SMOOTH_PROB=0.8         # TRANSITION_MODE=smooth only. 0.0 is exactly equivalent to
                         # TRANSITION_MODE=uniform.
+FREEZE_AFTER=0          # When the dataset stops letting the velocity evolve.
+                        #  -1 = freeze at the context/prediction boundary
+                        #       (INPUT_FRAMES for train/val/test, GEN_INPUT for
+                        #       len-gen) -- the historical behavior. Under it the
+                        #       velocity that governs the ENTIRE rollout equals the
+                        #       last transition visible in the context, so freezing
+                        #       the last encoder velocity is exactly right and
+                        #       nothing can beat it. Do not run the dynamics-head
+                        #       experiment here.
+                        #   0 = no freezing: the velocity keeps evolving through the
+                        #       rollout. This is the ONLY regime where predicting
+                        #       the velocity can beat freezing it.
+                        #  >0 = freeze at that explicit step, for every split.
 
 # Only the applicable knobs get passed, per the dataset's own applicability
 # table (TDMovingMNISTDataset docstring, "Which parameters apply to which mode").
-MOTION=(--motion_mode "$MOTION_MODE" --data_v_range "$DATA_V_RANGE")
+# FREEZE_AFTER lives in this array (not COMMON) because it is a DATA setting:
+# that puts it in the motion stamp below, so changing it correctly refuses to
+# resume a checkpoint trained on the frozen version of the data.
+MOTION=(--motion_mode "$MOTION_MODE" --data_v_range "$DATA_V_RANGE"
+        --freeze_after "$FREEZE_AFTER")
 case $MOTION_MODE in
   constant)
     MOTION_TAG="const" ;;
@@ -115,6 +153,55 @@ if [ "$MOTION_MODE" = piecewise ] || [ "$MOTION_MODE" = stochastic ]; then
   fi
 fi
 MOTION_TAG="v${DATA_V_RANGE}${MOTION_TAG}"
+# Freezing changes the task, not just the sample, so it belongs in the run
+# name -- otherwise a frozen and an unfrozen run are indistinguishable in wandb.
+case $FREEZE_AFTER in
+  -1) : ;;                                   # historical default, left unmarked
+   0) MOTION_TAG="${MOTION_TAG}_nofrz" ;;
+   *) MOTION_TAG="${MOTION_TAG}_frz${FREEZE_AFTER}" ;;
+esac
+
+# ---- velocity dynamics head: melstm only ----------------------------------
+# A small GRU over the velocity history that PREDICTS u_{t+1}, so the decoder
+# can extrapolate the motion instead of freezing the last encoder velocity.
+# Exactly motion-equivariant, and zero-initialized: with USE_VEL_DYN=1 but
+# VEL_DYN_LOSS_W=0 the model is bitwise identical to USE_VEL_DYN=0, which is
+# what makes the head safe to leave on.
+#
+# Ignored entirely by lstm/felstm (no velocity state to predict).
+USE_VEL_DYN=1           # 0 = off, exactly the pre-head melstm. The ablation
+                        # to run against this one, on the SAME data.
+VEL_DYN_LOSS_W=1.0      # weight on smooth_l1(u_pred, v_measured). MUST be > 0
+                        # or the head never trains and predicts the frozen
+                        # velocity forever -- the "on but useless" trap.
+VEL_DYN_STATE_DIM=32    # GRU hidden size, per slot. Tiny next to the cell
+                        # (~4k params at 32): raise it freely if the head
+                        # underfits the acceleration pattern.
+VEL_DYN_GAIN=fixed      # fixed   : k=1, the phase-correlation measurement is
+                        #           taken verbatim in the encoder and the head
+                        #           is trained but does not steer it. Start here.
+                        # learned : k=sigmoid(MLP(correlation peak score)), so a
+                        #           weak/ambiguous peak defers to the head.
+                        #           Second experiment, not the first.
+VEL_DYN_USE_H=0         # 1 = also condition on a globally pooled (translation
+                        # invariant) readout of the hidden state. Ablation only:
+                        # it lets the head explain velocity by appearance and
+                        # stop extrapolating, which is the failure mode this
+                        # experiment is trying to avoid.
+VEL_DYN_OPENLOOP_K=3    # extra multi-step supervision: for the last K encoder
+                        # steps, replay the head open-loop (fed its own
+                        # predictions) against velocities already measured for
+                        # those steps. Trains exactly the extrapolation regime
+                        # the decoder runs in, at no image-rollout cost. 0 = off.
+                        # Keep well below INPUT_FRAMES.
+EVAL_VEL_MODE=all       # frozen    : honest inference only (cheapest)
+                        # both      : + oracle GT-tracked val
+                        # all       : + head-predicted val. Logs val_loss,
+                        #             val_predicted_loss and val_tracked_loss
+                        #             every epoch, so the three-way comparison
+                        #             lands in ONE run. Expected ordering:
+                        #             tracked < predicted < frozen.
+                        #             Costs two extra val passes per epoch.
 
 # felstm carries one candidate slot per (vx,vy), so its grid must COVER the
 # data's or the true velocity is simply not representable -- it can never be
@@ -169,9 +256,40 @@ case $MODEL in
     # report — logs the per-(vx,vy) candidate h-slot maps to wandb.
     EXTRA=(--model felstm --v_range "$FE_V_RANGE" --show_h_state --wandb_name "felstm_${RUN_TAG}") ;;
   melstm)
-    # eval_velocity_mode both: honest val drives selection, oracle val logged
-    # alongside (velocity-vs-rendering decomposition). MELSTM-only effect.
-    EXTRA=(--model melstm --num_vel_modes 2 --eval_velocity_mode both --wandb_name "melstm_${RUN_TAG}") ;;
+    # eval_velocity_mode: honest (frozen) val always drives selection; the
+    # oracle and head-predicted vals are logged alongside for the
+    # velocity-vs-rendering decomposition. MELSTM-only effect.
+    ME_EVAL_MODE=$EVAL_VEL_MODE
+    ME_TAG=""
+    EXTRA=(--model melstm --num_vel_modes 2)
+
+    if [ "$USE_VEL_DYN" = 1 ]; then
+      EXTRA+=(--use_velocity_dynamics
+              --vel_dyn_state_dim "$VEL_DYN_STATE_DIM"
+              --vel_dyn_gain "$VEL_DYN_GAIN"
+              --vel_dyn_loss_weight "$VEL_DYN_LOSS_W"
+              --vel_dyn_openloop_k "$VEL_DYN_OPENLOOP_K")
+      ME_TAG="_vd${VEL_DYN_STATE_DIM}${VEL_DYN_GAIN:0:1}"
+      if [ "$VEL_DYN_USE_H" = 1 ]; then
+        EXTRA+=(--vel_dyn_use_h)
+        ME_TAG="${ME_TAG}h"
+      fi
+      if [ "$VEL_DYN_OPENLOOP_K" != 0 ]; then
+        ME_TAG="${ME_TAG}_ol${VEL_DYN_OPENLOOP_K}"
+      fi
+    else
+      # 'predicted'/'all' need the head; without it they re-measure the frozen
+      # rollout under a different name and quietly waste a val pass per epoch.
+      if [ "$ME_EVAL_MODE" = all ]; then
+        ME_EVAL_MODE=both
+      elif [ "$ME_EVAL_MODE" = predicted ]; then
+        ME_EVAL_MODE=frozen
+      fi
+      ME_TAG="_novd"
+    fi
+
+    EXTRA+=(--eval_velocity_mode "$ME_EVAL_MODE"
+            --wandb_name "melstm_${RUN_TAG}${ME_TAG}") ;;
   *)
     echo "unknown model: $MODEL"; exit 1 ;;
 esac
@@ -187,8 +305,18 @@ esac
 #
 # A missing stamp is treated as "matches" so this doesn't disturb a run that
 # is already in flight from before this guard existed.
+#
+# The same argument applies to the model-specific architecture flags (EXTRA):
+# toggling USE_VEL_DYN changes the parameter set, but the checkpoint filename
+# says only "melstm", so a relaunch would try to resume a head-less checkpoint
+# into a model that has a head. train.py survives that (it detects the shape
+# mismatch and starts fresh), but loudly and only after the fact -- better to
+# not offer it the checkpoint at all. Kept as a SEPARATE stamp file so a run
+# already in flight, which has a motion stamp but no arch stamp, still resumes.
 MOTION_STAMP="$SAVE_DIR/run_state/motion_${MODEL}.cfg"
 MOTION_CFG="${MOTION[*]}"
+ARCH_STAMP="$SAVE_DIR/run_state/arch_${MODEL}.cfg"
+ARCH_CFG="${EXTRA[*]}"
 
 CKPT=$(ls -t "$SAVE_DIR"/run_state/checkpoint_${MODEL}_*.pth 2>/dev/null | head -1)
 RESUME=()
@@ -200,9 +328,18 @@ if [ -n "$CKPT" ] && [ -f "$MOTION_STAMP" ] && [ "$(cat "$MOTION_STAMP")" != "$M
   echo "    (old checkpoints are left in place; rm $SAVE_DIR/run_state/checkpoint_${MODEL}_*.pth to clean up)"
   CKPT=""
 fi
+if [ -n "$CKPT" ] && [ -f "$ARCH_STAMP" ] && [ "$(cat "$ARCH_STAMP")" != "$ARCH_CFG" ]; then
+  echo ">>> Architecture config CHANGED since $CKPT was written:"
+  echo "      checkpoint: $(cat "$ARCH_STAMP")"
+  echo "      requested : $ARCH_CFG"
+  echo ">>> NOT resuming — starting a fresh run so the weights match the model."
+  echo "    (old checkpoints are left in place; rm $SAVE_DIR/run_state/checkpoint_${MODEL}_*.pth to clean up)"
+  CKPT=""
+fi
 
 mkdir -p "$SAVE_DIR/run_state"
 printf '%s\n' "$MOTION_CFG" > "$MOTION_STAMP"
+printf '%s\n' "$ARCH_CFG" > "$ARCH_STAMP"
 
 if [ -n "$CKPT" ]; then
   echo ">>> Found checkpoint $CKPT — resuming this run."
