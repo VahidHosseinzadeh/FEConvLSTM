@@ -18,10 +18,12 @@ class TDMovingMNISTDataset(Dataset):
     "constant"    : velocity is fixed for the whole sequence.
     "piecewise"   : velocity held for a random segment, then updated.
     "stochastic"  : velocity changes with probability p_change each step.
-    "accelerate"  : each digit gets a constant acceleration vector; every
-                    min_segment..max_segment steps the velocity is incremented
-                    by it and clipped to the grid, so |v| ramps rather than
-                    jumping. Unlike the other modes the velocity sequence is
+    "accelerate"  : each digit gets an acceleration sign; every
+                    min_segment..max_segment steps the velocity is stepped away
+                    from or toward zero, so |v| ramps rather than jumping. The
+                    sign reverses at the limits, so the speed BREATHES between 1
+                    and max_speed instead of saturating and sticking. (0, 0) is
+                    off the velocity grid, so a digit never actually stops. Unlike the other modes the velocity sequence is
                     systematic, not a random walk -- use it to test motion whose
                     *magnitude* changes over the context. transition_mode,
                     smooth_probability and p_change are unused here.
@@ -499,6 +501,13 @@ class TDMovingMNISTDataset(Dataset):
                                 min(max(step(current[1]), -self.max_speed), self.max_speed))
                         # (0, 0) is not on the velocity grid; hold instead of stopping
                         new_v = current if cand == (0, 0) else cand
+                        # reverse at the limits so |v| ramps up and down instead
+                        # of saturating at max_speed and sticking there
+                        speed = max(abs(new_v[0]), abs(new_v[1]))
+                        if speed >= self.max_speed:
+                            accel_sign[i] = -1
+                        elif speed <= 1:
+                            accel_sign[i] = +1
                         segment_remaining[i] = self._randint(
                             self.min_segment, self.max_segment + 1
                         )
