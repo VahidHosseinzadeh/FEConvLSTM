@@ -1,3 +1,5 @@
+import warnings
+
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -34,6 +36,25 @@ class TDMovingMNISTDataset(Dataset):
                                    equivalent to "uniform")
 
     All modes support freeze_after (see below).
+
+    motion_difficulty
+    -----------------
+    A single scalar d in [0, 1] spanning the whole family, for sweeps that need
+    one ordered "how hard is the motion" axis. Setting it FORCES
+    motion_mode="stochastic" and transition_mode="smooth" (passing a non-default
+    value for either alongside it warns), because difficulty is defined as the
+    entropy of the velocity process and only the stochastic family varies that
+    continuously.
+
+        d = 0.0  : p_change = 0    -- pure constant flow, 0 bits/frame
+        d = 0.5  : p_change = 0.222, smooth_probability = 0.80
+                   -- exactly the TRAINING regime, ~1.50 bits/frame
+        d = 1.0  : p_change = 1, smooth_probability = 0
+                   -- i.i.d. uniform velocity every frame, 4.52 bits/frame
+
+    max_speed is deliberately NOT part of d: leaving the velocity grid is a
+    separate axis, and folding it in would confound "harder to infer" with
+    "impossible to represent".
 
     freeze_after
     ------------
@@ -159,11 +180,62 @@ class TDMovingMNISTDataset(Dataset):
 
         # Optional difficulty preset
         if motion_difficulty is not None:
-            d = float(np.clip(motion_difficulty, 0.0, 1.0))
-            self.p_change           = 0.02 + 0.48 * d
-            self.min_segment        = int(round(8  - 5 * d))
-            self.max_segment        = int(round(12 - 6 * d))
-            self.smooth_probability = 0.95 - 0.45 * d
+            overridden = []
+            if motion_mode != "piecewise":
+                overridden.append(f"motion_mode={motion_mode!r}")
+            if transition_mode != "smooth":
+                overridden.append(f"transition_mode={transition_mode!r}")
+            if overridden:
+                warnings.warn(
+                    "motion_difficulty is defined on the stochastic family and "
+                    "overrides the motion family, so "
+                    + " and ".join(overridden)
+                    + " will be ignored in favour of motion_mode='stochastic', "
+                      "transition_mode='smooth'.",
+                    UserWarning, stacklevel=2)
+            self._apply_difficulty(motion_difficulty)
+
+    def _apply_difficulty(self, d):
+        """
+        One scalar d in [0,1] spanning the whole motion family, in "stochastic" mode.
+
+            d = 0.0  ->  p_change = 0                      : the velocity never
+                                                             changes. A pure flow --
+                                                             the setting that
+                                                             flow-equivariant models
+                                                             are built for. 0 bits/frame.
+            d = 0.5  ->  p_change = 0.222,                 : the TRAINING regime.
+                         smooth_probability = 0.80           One change every ~4.5
+                                                             frames, mostly to a
+                                                             lattice neighbour.
+            d = 1.0  ->  p_change = 1,                     : i.i.d. uniform velocity
+                         smooth_probability = 0              every frame. Maximum
+                                                             entropy, 4.52 bits/frame.
+
+        The exponents are solved so that d = 0.5 reproduces the training statistics:
+            p(d) = d ** 2.170      ->  p(0.5) = 1/4.5   (training segments [3,6])
+            s(d) = (1-d) ** 0.322  ->  s(0.5) = 0.80    (training smooth_probability)
+
+        max_speed is deliberately untouched. Difficulty must never turn into the
+        trivial 'outside the velocity grid' result -- that is a separate axis.
+
+        Pure parameter assignment: this must never consume the RNG, or every
+        previously generated fixed benchmark would silently change.
+        """
+        d = float(np.clip(d, 0.0, 1.0))
+
+        self.motion_mode        = "stochastic"
+        self.transition_mode    = "smooth"    # s = 0 is exactly equivalent to "uniform"
+        self.p_change           = d ** 2.170
+        self.smooth_probability = (1.0 - d) ** 0.322
+
+        # unused in stochastic mode, but kept consistent so that a piecewise run at
+        # the same d has the same EXPECTED switching rate -- which makes piecewise
+        # vs stochastic a controlled comparison of timing regularity, not frequency
+        mean_gap = (1.0 / self.p_change) if self.p_change > 1e-9 else float(self.seq_len)
+        mean_gap = min(mean_gap, float(self.seq_len))
+        self.min_segment = max(1, int(round(0.70 * mean_gap)))
+        self.max_segment = max(self.min_segment + 1, int(round(1.35 * mean_gap)))
 
     # ------------------------------------------------------------------
     # Dataset interface
