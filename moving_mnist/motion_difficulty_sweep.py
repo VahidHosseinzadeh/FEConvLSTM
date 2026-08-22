@@ -44,33 +44,49 @@ D_GRID = (0.0, 0.2, 0.35, 0.5, 0.65, 0.8, 1.0)
 # Fixed-parameter regimes. Not on the d axis: each pins one corner of the
 # rate x jump-size plane that the scalar sweep only crosses diagonally.
 NAMED_REGIMES = {
+    # Fixed-parameter regimes pinning the corners of the (switching rate x jump
+    # size) plane that the scalar d axis only crosses diagonally. Chosen so that
+    # net context displacement stays coherent -- a regime whose digit vibrates in
+    # place is an easier task, not a harder one, and would confound the result.
+    #
+    #                      rate   |dv|  net disp (px, of 27.5 at constant)
     "constant":       dict(motion_mode="constant"),
-    # max rate / min jump: a new velocity every frame, always to a neighbour
-    "random_walk":    dict(motion_mode="stochastic", p_change=1.0,
-                           transition_mode="smooth", smooth_probability=1.0),
-    # min rate / max jump: rarely changes, and when it does it goes anywhere
+    #                     0.000   0.00   27.5   the floor: a pure flow
     "rare_teleport":  dict(motion_mode="stochastic", p_change=0.05,
                            transition_mode="uniform"),
-    "accelerate":     dict(motion_mode="accelerate"),
-    # the ACTUAL training config -- should land near d = 0.5
+    #                     0.049   2.42   23.7   low rate, max jump
+    "regular_fast":   dict(motion_mode="piecewise", min_segment=2, max_segment=2,
+                           transition_mode="smooth", smooth_probability=0.8),
+    #                     0.337   1.40   19.1   REGULAR timing at a raised rate.
+    #   Rate sits between the d=0.65 and d=0.80 cells, so comparing it against
+    #   them separates "how often the velocity changes" from "how unpredictable
+    #   the timing of those changes is".
+    "random_walk":    dict(motion_mode="stochastic", p_change=1.0,
+                           transition_mode="smooth", smooth_probability=1.0),
+    #                     0.668   1.00   21.7   max rate, min jump
+    "churn_half":     dict(motion_mode="stochastic", p_change=0.5,
+                           transition_mode="uniform"),
+    #                     0.500   2.43   10.9   high rate AND max jump -- the
+    #   corner left empty by the others. Travel is reduced but not collapsed;
+    #   p_change=1.0 here would drop it to 6.4 px, i.e. a digit vibrating in
+    #   place, which is the confound Fix 1 removed from the d axis.
     "piecewise@0.5":  dict(motion_mode="piecewise", transition_mode="smooth",
                            min_segment=3, max_segment=6, smooth_probability=0.8),
+    #   the ACTUAL training config. Not a panel-(b) category -- it is the
+    #   validation point marked against the d curve, and should land near d=0.5.
 }
 
-# d = 0 is a pure flow -- the canonical setting a flow-equivariant model is built
-# for -- so normalising there asks "how much does each model degrade as the motion
-# departs from a flow?" and every curve starts at 1.0.
 REFERENCE_REGIME = "d=0.00"
 
 
 def cells(which):
     """(regime, difficulty, dataset kwargs) for every cell in the sweep.
 
-    Sweep A pairs the difficulty axis with neighbor_kernel="symmetric": the
-    legacy kernel is degree-biased, so mean |v| drifts with d and difficulty
-    gets confounded with speed. Sweep B keeps the default kernel -- those cells
-    are fixed regimes, not points on the d axis, and leaving them on the legacy
-    stream keeps them comparable with everything else generated that way.
+    Every cell uses neighbor_kernel="symmetric": the legacy kernel is
+    degree-biased, so mean |v| drifts with the switching rate and difficulty
+    gets confounded with speed. Sweep B needs it too -- random_walk routes every
+    change through the neighbour kernel, so under the legacy kernel its realised
+    rate (1.00) is not comparable with the d axis (0.67 at the same p_change).
     """
     out = []
     if which in ("all", "a"):
@@ -79,7 +95,7 @@ def cells(which):
                         dict(motion_difficulty=d, neighbor_kernel="symmetric")))
     if which in ("all", "b"):
         for name, kw in NAMED_REGIMES.items():
-            out.append((name, None, dict(kw)))
+            out.append((name, None, dict(kw, neighbor_kernel="symmetric")))
     return out
 
 
