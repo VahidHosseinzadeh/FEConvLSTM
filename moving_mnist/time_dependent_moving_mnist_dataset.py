@@ -39,24 +39,44 @@ class TDMovingMNISTDataset(Dataset):
 
     All modes support freeze_after (see below).
 
+    neighbor_kernel
+    ---------------
+    How "smooth" transitions pick the next velocity. "legacy" (default) draws
+    uniformly from the valid neighbours of v, which is degree-biased: interior
+    low-speed states have more neighbours and accumulate stationary mass.
+    "symmetric" proposes a uniform unit offset and holds if it leaves the grid,
+    which is doubly stochastic and leaves the velocity uniform over the grid at
+    every switching rate. Default stays "legacy" only because "symmetric" draws
+    a different number of RNG values and so cannot reproduce existing fixed
+    benchmarks byte-for-byte.
+
     motion_difficulty
     -----------------
-    A single scalar d in [0, 1] spanning the whole family, for sweeps that need
-    one ordered "how hard is the motion" axis. Setting it FORCES
+    A single scalar d in [0, 1] controlling HOW OFTEN the velocity changes, for
+    sweeps that need one ordered "how hard is the motion" axis. Setting it FORCES
     motion_mode="stochastic" and transition_mode="smooth" (passing a non-default
-    value for either alongside it warns), because difficulty is defined as the
-    entropy of the velocity process and only the stochastic family varies that
-    continuously.
+    value for either alongside it warns).
 
-        d = 0.0  : p_change = 0    -- pure constant flow, 0 bits/frame
-        d = 0.5  : p_change = 0.222, smooth_probability = 0.80
-                   -- exactly the TRAINING regime, ~1.50 bits/frame
-        d = 1.0  : p_change = 1, smooth_probability = 0
-                   -- i.i.d. uniform velocity every frame, 4.52 bits/frame
+        d = 0.0  : p_change = 0     -- pure constant flow, 0 bits/frame
+        d = 0.5  : p_change = 0.222 -- exactly the TRAINING regime, ~1.2 bits/frame
+        d = 1.0  : p_change = 1     -- a change every frame, 80% of them to a
+                   lattice neighbour: a random walk in velocity, ~3.4 bits/frame
 
-    max_speed is deliberately NOT part of d: leaving the velocity grid is a
-    separate axis, and folding it in would confound "harder to infer" with
-    "impossible to represent".
+    Two things are deliberately held OFF the axis:
+
+    smooth_probability is fixed at the training value 0.80 rather than swept to
+    0. The top of the scale is therefore NOT the maximum-entropy process (3.4
+    bits, not the 4.5 of an i.i.d. uniform velocity). That is the point: an
+    i.i.d. velocity makes the digit vibrate in place instead of travelling, which
+    collapses net displacement and is an EASIER task, not a harder one. Jump size
+    is a separate axis and belongs in a named regime.
+
+    max_speed is untouched: leaving the velocity grid would confound "harder to
+    infer" with "impossible to represent".
+
+    Pair d with neighbor_kernel="symmetric" for a sweep: the legacy kernel is
+    degree-biased, so mean |v| drifts with d and difficulty gets confounded with
+    speed.
 
     freeze_after
     ------------
@@ -116,6 +136,8 @@ class TDMovingMNISTDataset(Dataset):
 
         p_change=0.25,
         smooth_probability=0.8,
+        neighbor_kernel="legacy",       # "legacy" | "symmetric", see
+                                        # _sample_neighbor_velocity
 
         motion_difficulty=None,
 
@@ -180,6 +202,11 @@ class TDMovingMNISTDataset(Dataset):
             if (vx, vy) != (0, 0)
         ]
 
+        self.neighbor_kernel = neighbor_kernel
+        self._velocity_set   = set(self.velocity_grid)
+        self._unit_offsets   = [(a, b) for a in (-1, 0, 1) for b in (-1, 0, 1)
+                                if (a, b) != (0, 0)]
+
         # Optional difficulty preset
         if motion_difficulty is not None:
             overridden = []
@@ -199,27 +226,28 @@ class TDMovingMNISTDataset(Dataset):
 
     def _apply_difficulty(self, d):
         """
-        One scalar d in [0,1] spanning the whole motion family, in "stochastic" mode.
+        One scalar d in [0,1] controlling HOW OFTEN the velocity changes, with the
+        jump-size statistics held at the training value throughout.
 
-            d = 0.0  ->  p_change = 0                      : the velocity never
-                                                             changes. A pure flow --
-                                                             the setting that
-                                                             flow-equivariant models
-                                                             are built for. 0 bits/frame.
-            d = 0.5  ->  p_change = 0.222,                 : the TRAINING regime.
-                         smooth_probability = 0.80           One change every ~4.5
-                                                             frames, mostly to a
-                                                             lattice neighbour.
-            d = 1.0  ->  p_change = 1,                     : i.i.d. uniform velocity
-                         smooth_probability = 0              every frame. Maximum
-                                                             entropy, 4.52 bits/frame.
+            d = 0.0  ->  p_change = 0      : velocity never changes. A pure flow --
+                                             the setting flow-equivariant models are
+                                             built for.
+            d = 0.5  ->  p_change = 0.222  : the TRAINING regime, one change every
+                                             ~4.5 frames.
+            d = 1.0  ->  p_change = 1      : the velocity changes every frame, 80% of
+                                             changes to a lattice neighbour -- a
+                                             random walk in velocity.
 
-        The exponents are solved so that d = 0.5 reproduces the training statistics:
-            p(d) = d ** 2.170      ->  p(0.5) = 1/4.5   (training segments [3,6])
-            s(d) = (1-d) ** 0.322  ->  s(0.5) = 0.80    (training smooth_probability)
+        p(d) = d ** 2.170 is solved so that p(0.5) = 1/4.5, matching the training
+        segment range [3, 6].
 
-        max_speed is deliberately untouched. Difficulty must never turn into the
-        trivial 'outside the velocity grid' result -- that is a separate axis.
+        smooth_probability is FIXED at 0.80 (the training value), not swept. Driving
+        it to 0 makes the velocity i.i.d. at d=1, which collapses net displacement
+        and makes the task easier rather than harder. Jump size is a separate axis
+        and belongs in the named-regime panel, not in d.
+
+        max_speed is untouched: difficulty must never become the trivial
+        'outside the velocity grid' result.
 
         Pure parameter assignment: this must never consume the RNG, or every
         previously generated fixed benchmark would silently change.
@@ -227,13 +255,10 @@ class TDMovingMNISTDataset(Dataset):
         d = float(np.clip(d, 0.0, 1.0))
 
         self.motion_mode        = "stochastic"
-        self.transition_mode    = "smooth"    # s = 0 is exactly equivalent to "uniform"
+        self.transition_mode    = "smooth"
         self.p_change           = d ** 2.170
-        self.smooth_probability = (1.0 - d) ** 0.322
+        self.smooth_probability = 0.80
 
-        # unused in stochastic mode, but kept consistent so that a piecewise run at
-        # the same d has the same EXPECTED switching rate -- which makes piecewise
-        # vs stochastic a controlled comparison of timing regularity, not frequency
         mean_gap = (1.0 / self.p_change) if self.p_change > 1e-9 else float(self.seq_len)
         mean_gap = min(mean_gap, float(self.seq_len))
         self.min_segment = max(1, int(round(0.70 * mean_gap)))
@@ -567,6 +592,28 @@ class TDMovingMNISTDataset(Dataset):
         return self._choice(candidates)
 
     def _sample_neighbor_velocity(self, velocity):
+        """
+        "legacy"    : uniform over the valid neighbours of v. Degree-biased --
+                      the stationary velocity distribution favours low-speed
+                      interior states, so mean |v| drifts with difficulty.
+        "symmetric" : propose v + eps with eps uniform over the eight unit
+                      offsets, and HOLD if the proposal leaves the grid.
+                      Symmetric, hence doubly stochastic, hence uniform
+                      stationary distribution -- mean |v| is constant across
+                      the whole difficulty sweep.
+
+        A held proposal is not a change, so the realised switch count under
+        "symmetric" is below p_change * T. That is expected.
+
+        "legacy" is the default because "symmetric" draws a different number of
+        RNG values per call and therefore does not reproduce previously
+        generated fixed benchmarks byte-for-byte.
+        """
+        if self.neighbor_kernel == "symmetric":
+            dx, dy = self._choice(self._unit_offsets)
+            cand = (velocity[0] + dx, velocity[1] + dy)
+            return cand if cand in self._velocity_set else velocity
+
         vx, vy = velocity
         neighbors = [
             u for u in self.velocity_grid

@@ -57,15 +57,26 @@ NAMED_REGIMES = {
                            min_segment=3, max_segment=6, smooth_probability=0.8),
 }
 
-REFERENCE_REGIME = "d=0.50"          # normalisation denominator
+# d = 0 is a pure flow -- the canonical setting a flow-equivariant model is built
+# for -- so normalising there asks "how much does each model degrade as the motion
+# departs from a flow?" and every curve starts at 1.0.
+REFERENCE_REGIME = "d=0.00"
 
 
 def cells(which):
-    """(regime, difficulty, dataset kwargs) for every cell in the sweep."""
+    """(regime, difficulty, dataset kwargs) for every cell in the sweep.
+
+    Sweep A pairs the difficulty axis with neighbor_kernel="symmetric": the
+    legacy kernel is degree-biased, so mean |v| drifts with d and difficulty
+    gets confounded with speed. Sweep B keeps the default kernel -- those cells
+    are fixed regimes, not points on the d axis, and leaving them on the legacy
+    stream keeps them comparable with everything else generated that way.
+    """
     out = []
     if which in ("all", "a"):
         for d in D_GRID:
-            out.append((f"d={d:.2f}", float(d), dict(motion_difficulty=d)))
+            out.append((f"d={d:.2f}", float(d),
+                        dict(motion_difficulty=d, neighbor_kernel="symmetric")))
     if which in ("all", "b"):
         for name, kw in NAMED_REGIMES.items():
             out.append((name, None, dict(kw)))
@@ -288,6 +299,7 @@ def main():
                 n_sequences=args.n_sequences,
                 max_speed=args.max_speed,
                 regime=regime,
+                neighbor_kernel=kwargs.get("neighbor_kernel", "legacy"),
                 # npz has no None; NaN encodes "not on the d axis"
                 difficulty=np.float64(difficulty if difficulty is not None else np.nan),
                 motion_schedule=motions.numpy().astype(np.int16),
