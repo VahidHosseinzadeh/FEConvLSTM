@@ -87,3 +87,4 @@ archive/
 cluster_runs/
 figures/
 EXPERIMENT_REPORT.md
+motion_difficulty_prompt.md
