@@ -70,13 +70,32 @@ NAMED_REGIMES = {
     #   corner left empty by the others. Travel is reduced but not collapsed;
     #   p_change=1.0 here would drop it to 6.4 px, i.e. a digit vibrating in
     #   place, which is the confound Fix 1 removed from the d axis.
+    "churn_mid":      dict(motion_mode="stochastic", transition_mode="smooth",
+                           smooth_probability=0.40, p_change=0.5192),
+    #                     0.451   1.98   13.5   the unmeasured interior: between
+    #   regular_fast (0.34) and churn_half (0.50) in rate, mid jump size.
+    "churn_max":      dict(motion_mode="stochastic", transition_mode="uniform",
+                           smooth_probability=0.00, p_change=0.7360),
+    #                     0.736   2.42    8.5   max rate AND max jump. Travel drops
+    #   to 8.5 px (27.5 at constant) -- report it; the digit still moves but far
+    #   less coherently than anywhere else on the panel.
     "piecewise@0.5":  dict(motion_mode="piecewise", transition_mode="smooth",
                            min_segment=3, max_segment=6, smooth_probability=0.8),
     #   the ACTUAL training config. Not a panel-(b) category -- it is the
     #   validation point marked against the d curve, and should land near d=0.5.
 }
 
-REFERENCE_REGIME = "d=0.00"
+# Realised statistics a cell must reproduce, else its configuration is wrong.
+# Simulated independently before the sweep.
+REGIME_CHECKS = {
+    "churn_mid": dict(rate=0.451, speed=1.955),
+    "churn_max": dict(rate=0.735, speed=1.952),
+}
+RATE_TOL, SPEED_TOL = 0.005, 0.01
+
+# Must match CFG_MOTION["reference"] in make_figures.ipynb, or this script's
+# summary table contradicts the figure.
+REFERENCE_REGIME = "d=0.50"
 
 
 def cells(which):
@@ -204,7 +223,10 @@ def motion_stats(motion_schedule, input_frames, max_speed):
             p = joint[k][joint[k] > 0] / row[k]
             entropy += (row[k] / total) * float(-(p * np.log2(p)).sum())
     p_emp = n_change / n_trans if n_trans else 0.0
+    ctx = m[:, :f - 1].astype(np.int64)
     return dict(
+        mean_speed=float(np.sqrt((ctx ** 2).sum(axis=-1)).mean()),
+        net_disp=float(np.sqrt((ctx.sum(axis=1) ** 2).sum(axis=-1)).mean()),
         p_change=p_emp,
         mean_gap=(1.0 / p_emp) if p_emp > 0 else float("inf"),
         mean_dv=float(np.mean(jumps)) if jumps else 0.0,
@@ -228,6 +250,9 @@ def main():
     p.add_argument('--models', nargs='+', default=['lstm', 'felstm', 'melstm'],
                    choices=['lstm', 'felstm', 'melstm'])
     p.add_argument('--sweep', default='all', choices=['all', 'a', 'b'])
+    p.add_argument('--regimes', nargs='+', default=None, choices=list(NAMED_REGIMES),
+                   help='Run only these named regimes (implies --sweep b). Use it to '
+                        'ADD cells without recomputing the ones you already have.')
     p.add_argument('--n_sequences', type=int, default=2000)
     p.add_argument('--batch_size', type=int, default=100)
     p.add_argument('--root', default='./data')
@@ -240,6 +265,8 @@ def main():
     p.add_argument('--device', default=None)
     p.add_argument('--out_name', default='motion_sweep')
     args = p.parse_args()
+    if args.regimes:
+        args.sweep = 'b'
 
     # eval_len_generalization logs qualitative panels to wandb on its first
     # batch. Disable the run and stub the loggers: this touches the logging
@@ -273,6 +300,8 @@ def main():
         loaded[name] = m.to(device).eval()
 
     todo = cells(args.sweep)
+    if args.regimes:
+        todo = [c for c in todo if c[0] in args.regimes]
     print(f"device            : {device}", flush=True)
     print(f"models            : {', '.join(args.models)}")
     print(f"cells             : {len(todo)}  ({', '.join(r for r, _, _ in todo)})")
@@ -298,6 +327,16 @@ def main():
         loader = DataLoader(TensorDataset(seqs, labels, motions),
                             batch_size=args.batch_size, shuffle=False, num_workers=0)
         stats = motion_stats(motions.numpy(), ctx, args.max_speed)
+
+        chk = REGIME_CHECKS.get(regime)
+        if chk:
+            assert abs(stats["p_change"] - chk["rate"]) <= RATE_TOL, (
+                f"{regime}: realised rate {stats['p_change']:.4f} != {chk['rate']} "
+                f"+- {RATE_TOL}; the configuration is wrong")
+            assert abs(stats["mean_speed"] - chk["speed"]) <= SPEED_TOL, (
+                f"{regime}: mean |v| {stats['mean_speed']:.4f} != {chk['speed']} "
+                f"+- {SPEED_TOL}; the symmetric kernel should hold the stationary "
+                f"velocity uniform")
 
         for name in args.models:
             cfg, run_id, _ = runs[name]
