@@ -1,3 +1,5 @@
+import warnings
+
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -16,10 +18,12 @@ class TDMovingMNISTDataset(Dataset):
     "constant"    : velocity is fixed for the whole sequence.
     "piecewise"   : velocity held for a random segment, then updated.
     "stochastic"  : velocity changes with probability p_change each step.
-    "accelerate"  : each digit gets a constant acceleration vector; every
-                    min_segment..max_segment steps the velocity is incremented
-                    by it and clipped to the grid, so |v| ramps rather than
-                    jumping. Unlike the other modes the velocity sequence is
+    "accelerate"  : each digit gets an acceleration sign; every
+                    min_segment..max_segment steps the velocity is stepped away
+                    from or toward zero, so |v| ramps rather than jumping. The
+                    sign reverses at the limits, so the speed BREATHES between 1
+                    and max_speed instead of saturating and sticking. (0, 0) is
+                    off the velocity grid, so a digit never actually stops. Unlike the other modes the velocity sequence is
                     systematic, not a random walk -- use it to test motion whose
                     *magnitude* changes over the context. transition_mode,
                     smooth_probability and p_change are unused here.
@@ -34,6 +38,45 @@ class TDMovingMNISTDataset(Dataset):
                                    equivalent to "uniform")
 
     All modes support freeze_after (see below).
+
+    neighbor_kernel
+    ---------------
+    How "smooth" transitions pick the next velocity. "legacy" (default) draws
+    uniformly from the valid neighbours of v, which is degree-biased: interior
+    low-speed states have more neighbours and accumulate stationary mass.
+    "symmetric" proposes a uniform unit offset and holds if it leaves the grid,
+    which is doubly stochastic and leaves the velocity uniform over the grid at
+    every switching rate. Default stays "legacy" only because "symmetric" draws
+    a different number of RNG values and so cannot reproduce existing fixed
+    benchmarks byte-for-byte.
+
+    motion_difficulty
+    -----------------
+    A single scalar d in [0, 1] controlling HOW OFTEN the velocity changes, for
+    sweeps that need one ordered "how hard is the motion" axis. Setting it FORCES
+    motion_mode="stochastic" and transition_mode="smooth" (passing a non-default
+    value for either alongside it warns).
+
+        d = 0.0  : p_change = 0     -- pure constant flow, 0 bits/frame
+        d = 0.5  : p_change = 0.222 -- exactly the TRAINING regime, ~1.2 bits/frame
+        d = 1.0  : p_change = 1     -- a change every frame, 80% of them to a
+                   lattice neighbour: a random walk in velocity, ~3.4 bits/frame
+
+    Two things are deliberately held OFF the axis:
+
+    smooth_probability is fixed at the training value 0.80 rather than swept to
+    0. The top of the scale is therefore NOT the maximum-entropy process (3.4
+    bits, not the 4.5 of an i.i.d. uniform velocity). That is the point: an
+    i.i.d. velocity makes the digit vibrate in place instead of travelling, which
+    collapses net displacement and is an EASIER task, not a harder one. Jump size
+    is a separate axis and belongs in a named regime.
+
+    max_speed is untouched: leaving the velocity grid would confound "harder to
+    infer" with "impossible to represent".
+
+    Pair d with neighbor_kernel="symmetric" for a sweep: the legacy kernel is
+    degree-biased, so mean |v| drifts with d and difficulty gets confounded with
+    speed.
 
     freeze_after
     ------------
@@ -93,6 +136,8 @@ class TDMovingMNISTDataset(Dataset):
 
         p_change=0.25,
         smooth_probability=0.8,
+        neighbor_kernel="legacy",       # "legacy" | "symmetric", see
+                                        # _sample_neighbor_velocity
 
         motion_difficulty=None,
 
@@ -157,13 +202,67 @@ class TDMovingMNISTDataset(Dataset):
             if (vx, vy) != (0, 0)
         ]
 
+        self.neighbor_kernel = neighbor_kernel
+        self._velocity_set   = set(self.velocity_grid)
+        self._unit_offsets   = [(a, b) for a in (-1, 0, 1) for b in (-1, 0, 1)
+                                if (a, b) != (0, 0)]
+
         # Optional difficulty preset
         if motion_difficulty is not None:
-            d = float(np.clip(motion_difficulty, 0.0, 1.0))
-            self.p_change           = 0.02 + 0.48 * d
-            self.min_segment        = int(round(8  - 5 * d))
-            self.max_segment        = int(round(12 - 6 * d))
-            self.smooth_probability = 0.95 - 0.45 * d
+            overridden = []
+            if motion_mode != "piecewise":
+                overridden.append(f"motion_mode={motion_mode!r}")
+            if transition_mode != "smooth":
+                overridden.append(f"transition_mode={transition_mode!r}")
+            if overridden:
+                warnings.warn(
+                    "motion_difficulty is defined on the stochastic family and "
+                    "overrides the motion family, so "
+                    + " and ".join(overridden)
+                    + " will be ignored in favour of motion_mode='stochastic', "
+                      "transition_mode='smooth'.",
+                    UserWarning, stacklevel=2)
+            self._apply_difficulty(motion_difficulty)
+
+    def _apply_difficulty(self, d):
+        """
+        One scalar d in [0,1] controlling HOW OFTEN the velocity changes, with the
+        jump-size statistics held at the training value throughout.
+
+            d = 0.0  ->  p_change = 0      : velocity never changes. A pure flow --
+                                             the setting flow-equivariant models are
+                                             built for.
+            d = 0.5  ->  p_change = 0.222  : the TRAINING regime, one change every
+                                             ~4.5 frames.
+            d = 1.0  ->  p_change = 1      : the velocity changes every frame, 80% of
+                                             changes to a lattice neighbour -- a
+                                             random walk in velocity.
+
+        p(d) = d ** 2.170 is solved so that p(0.5) = 1/4.5, matching the training
+        segment range [3, 6].
+
+        smooth_probability is FIXED at 0.80 (the training value), not swept. Driving
+        it to 0 makes the velocity i.i.d. at d=1, which collapses net displacement
+        and makes the task easier rather than harder. Jump size is a separate axis
+        and belongs in the named-regime panel, not in d.
+
+        max_speed is untouched: difficulty must never become the trivial
+        'outside the velocity grid' result.
+
+        Pure parameter assignment: this must never consume the RNG, or every
+        previously generated fixed benchmark would silently change.
+        """
+        d = float(np.clip(d, 0.0, 1.0))
+
+        self.motion_mode        = "stochastic"
+        self.transition_mode    = "smooth"
+        self.p_change           = d ** 2.170
+        self.smooth_probability = 0.80
+
+        mean_gap = (1.0 / self.p_change) if self.p_change > 1e-9 else float(self.seq_len)
+        mean_gap = min(mean_gap, float(self.seq_len))
+        self.min_segment = max(1, int(round(0.70 * mean_gap)))
+        self.max_segment = max(self.min_segment + 1, int(round(1.35 * mean_gap)))
 
     # ------------------------------------------------------------------
     # Dataset interface
@@ -427,6 +526,13 @@ class TDMovingMNISTDataset(Dataset):
                                 min(max(step(current[1]), -self.max_speed), self.max_speed))
                         # (0, 0) is not on the velocity grid; hold instead of stopping
                         new_v = current if cand == (0, 0) else cand
+                        # reverse at the limits so |v| ramps up and down instead
+                        # of saturating at max_speed and sticking there
+                        speed = max(abs(new_v[0]), abs(new_v[1]))
+                        if speed >= self.max_speed:
+                            accel_sign[i] = -1
+                        elif speed <= 1:
+                            accel_sign[i] = +1
                         segment_remaining[i] = self._randint(
                             self.min_segment, self.max_segment + 1
                         )
@@ -486,6 +592,28 @@ class TDMovingMNISTDataset(Dataset):
         return self._choice(candidates)
 
     def _sample_neighbor_velocity(self, velocity):
+        """
+        "legacy"    : uniform over the valid neighbours of v. Degree-biased --
+                      the stationary velocity distribution favours low-speed
+                      interior states, so mean |v| drifts with difficulty.
+        "symmetric" : propose v + eps with eps uniform over the eight unit
+                      offsets, and HOLD if the proposal leaves the grid.
+                      Symmetric, hence doubly stochastic, hence uniform
+                      stationary distribution -- mean |v| is constant across
+                      the whole difficulty sweep.
+
+        A held proposal is not a change, so the realised switch count under
+        "symmetric" is below p_change * T. That is expected.
+
+        "legacy" is the default because "symmetric" draws a different number of
+        RNG values per call and therefore does not reproduce previously
+        generated fixed benchmarks byte-for-byte.
+        """
+        if self.neighbor_kernel == "symmetric":
+            dx, dy = self._choice(self._unit_offsets)
+            cand = (velocity[0] + dx, velocity[1] + dy)
+            return cand if cand in self._velocity_set else velocity
+
         vx, vy = velocity
         neighbors = [
             u for u in self.velocity_grid

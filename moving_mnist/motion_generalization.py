@@ -84,7 +84,60 @@ MOTION_PRESETS = {
 
     # ---- changing speed: |v| ramps toward the extremes during the context --
     "accelerating_v4":    dict(motion_mode="accelerate", data_v_range=4),
+
+    # ======================================================================
+    # Extended sweep. The ten above are the paper set (PAPER_MOTIONS below);
+    # everything here fills in the axes between them. All of it is opt-in per
+    # run via --motions, because each preset costs a full pass over
+    # --n_sequences for every model.
+    # ======================================================================
+
+    # ---- (a) inference difficulty, finer grained -------------------------
+    # How often the velocity changes, from "almost never" to "every frame",
+    # holding the magnitude at the trained range.
+    #
+    # slow_changes: segments long enough to change only about once inside a
+    # 15-frame context. Longer ones (15-30) never change there at all and just
+    # duplicate static_velocity.
+    "slow_changes":       dict(min_segment=7, max_segment=14),
+    "change_every_step":  dict(min_segment=1, max_segment=1),
+    "stochastic_rare":    dict(motion_mode="stochastic", p_change=0.05),
+    "stochastic_mid":     dict(motion_mode="stochastic", p_change=0.30),
+
+    # How far each change jumps: "smooth" at probability 1.0 only ever steps
+    # to an adjacent velocity, which is the gentlest non-constant context.
+    "always_smooth":      dict(smooth_probability=1.0),
+    "half_smooth":        dict(smooth_probability=0.5),
+
+    # ---- (b) magnitude, finer grained ------------------------------------
+    "fast_v5":            dict(data_v_range=5),
+    "fast_v6":            dict(data_v_range=6),
+
+    # ---- crossed: magnitude x inference difficulty -----------------------
+    # The paper set only crosses "trivial to infer" with v4. These fill the
+    # rest of the square, separating "cannot represent this velocity" from
+    # "cannot read this velocity off the context" at several magnitudes.
+    "slow_v1_static":     dict(motion_mode="constant", data_v_range=1),
+    "fast_v3_static":     dict(motion_mode="constant", data_v_range=3),
+    "fast_v6_static":     dict(motion_mode="constant", data_v_range=6),
+    "fast_v4_jumpy":      dict(transition_mode="uniform", data_v_range=4),
+    "fast_v4_boundary":   dict(min_segment=1, max_segment=2, data_v_range=4),
+    "fast_v4_churn":      dict(motion_mode="stochastic", transition_mode="uniform",
+                               p_change=0.6, data_v_range=4),
+
+    # ---- changing speed at other magnitudes ------------------------------
+    "accelerating_v2":    dict(motion_mode="accelerate"),
+    "accelerating_v6":    dict(motion_mode="accelerate", data_v_range=6),
 }
+
+# The presets the paper figures use. --motions defaults to this rather than to
+# every preset above, so adding to the extended sweep never silently multiplies
+# the cost of a default run.
+PAPER_MOTIONS = [
+    "as_trained", "static_velocity", "abrupt_jumps", "change_at_boundary",
+    "rapid_changes", "slow_v1", "fast_v3", "fast_v4", "fast_v4_static",
+    "accelerating_v4",
+]
 
 
 def find_runs(save_dir, models):
@@ -171,8 +224,10 @@ def main():
                         "motion_gen/ is created alongside them")
     p.add_argument('--models', nargs='+', default=['lstm', 'felstm', 'melstm'],
                    choices=['lstm', 'felstm', 'melstm'])
-    p.add_argument('--motions', nargs='+', default=list(MOTION_PRESETS),
-                   choices=list(MOTION_PRESETS))
+    p.add_argument('--motions', nargs='+', default=PAPER_MOTIONS,
+                   choices=['all'] + list(MOTION_PRESETS),
+                   help='Motion presets to sweep. Defaults to the paper set; '
+                        'pass "all" for every preset in MOTION_PRESETS.')
     p.add_argument('--n_sequences', type=int, default=10000,
                    help='Benchmark sequences per motion preset')
     p.add_argument('--batch_size', type=int, default=100,
@@ -187,6 +242,8 @@ def main():
     p.add_argument('--device', type=str, default=None,
                    help="cuda / mps / cpu (default: best available)")
     args = p.parse_args()
+    if 'all' in args.motions:
+        args.motions = list(MOTION_PRESETS)
 
     if args.device:
         device = torch.device(args.device)
