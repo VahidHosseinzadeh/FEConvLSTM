@@ -52,7 +52,8 @@ def build_model(cfg):
             vel_dyn_state_dim=get("vel_dyn_state_dim", 32),
             vel_dyn_use_h=get("vel_dyn_use_h", False),
             vel_dyn_gain=get("vel_dyn_gain", "fixed"),
-            vel_dyn_openloop_k=get("vel_dyn_openloop_k", 0))
+            vel_dyn_openloop_k=get("vel_dyn_openloop_k", 0),
+            track_corr_alpha=get("track_corr_alpha", None))
 
     raise ValueError(f"unknown model {name!r}")
 

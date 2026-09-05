@@ -146,6 +146,18 @@ def main():
     parser.add_argument('--image_size', type=int, default=28)
     parser.add_argument('--v_range', type=int, default=2)
     parser.add_argument('--num_vel_modes', type=int, default=2, help='Number of velocity modes for MEConvLSTM')
+    parser.add_argument('--track_corr_alpha', type=float, default=None,
+                        help="MELSTM only: whitening exponent of the TRACKING correlator "
+                             "(track(h, X_t)), leaving the bootstrap correlator untouched. "
+                             "1.0 = classic phase correlation (the default, and what every "
+                             "previous run used); 0.0 = plain cross-correlation. Phase "
+                             "correlation divides each frequency by its own magnitude, so a "
+                             "SMOOTH template -- which h.mean(dim=2) is -- has its empty "
+                             "high-frequency bands amplified to unit gain and the peak "
+                             "collapses. Measured on a 2-digit 64x64 scene with a blurred, "
+                             "tanh-squashed template: 0%% at alpha=1 versus 65%% at alpha=0, "
+                             "while a sharp template scores 100%% either way. Default None "
+                             "= follow the bootstrap correlator, i.e. unchanged.")
     parser.add_argument('--data_v_range', type=int, default=2)
     parser.add_argument('--motion_mode', choices=['constant', 'piecewise', 'stochastic', 'accelerate', 'harmonic'], default='piecewise',
                         help="How digit velocity evolves over time: 'constant' = fixed for the whole "

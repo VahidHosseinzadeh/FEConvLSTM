@@ -300,6 +300,31 @@ VEL_DYN_OPENLOOP_K=10   # extra multi-step supervision: for the last K encoder
                         # 5.8 -> 1.9. Internally the fork cannot start before the
                         # second measurement, so K is effectively capped at
                         # INPUT_FRAMES-2.
+TRACK_CORR_ALPHA=0.0    # Whitening of the TRACKING correlator, track(h, X_t).
+                        # The bootstrap correlator is untouched and stays at 1.0.
+                        #   1.0 = classic phase correlation -- what every run
+                        #         before this one used.
+                        #   0.0 = plain cross-correlation.
+                        # Phase correlation divides every frequency by its own
+                        # magnitude, so bands the template barely occupies get
+                        # amplified to unit gain. That is exact for a sharp
+                        # template and catastrophic for a smooth one -- and
+                        # h.mean(dim=2), the tracking template, is smooth.
+                        # Measured on a 2-digit 64x64 scene:
+                        #
+                        #   template            alpha=1   alpha=0
+                        #   sharp digit           100%       99%
+                        #   3x3 blur                0%       92%
+                        #   5x5 blur + tanh         0%       65%
+                        #
+                        # The first MELSTM run plateaued at 60% velocity
+                        # accuracy from epoch ~9 onward and never moved, which
+                        # is what this is meant to break. Set back to 1.0 to
+                        # reproduce that run.
+                        #
+                        # NOTE this cannot affect motion equivariance: |R| is
+                        # invariant to a shift of either input, so alpha changes
+                        # how reliably the peak is found, never where it is.
 EVAL_VEL_MODE=all       # frozen    : honest inference only (cheapest)
                         # both      : + oracle GT-tracked val
                         # all       : + head-predicted val. Logs val_loss,
@@ -392,6 +417,13 @@ case $MODEL in
         ME_EVAL_MODE=frozen
       fi
       ME_TAG="_novd"
+    fi
+
+    # Applies to melstm regardless of the dynamics head: it is the measurement,
+    # not the predictor. Tagged so a run's name says which correlator it used.
+    EXTRA+=(--track_corr_alpha "$TRACK_CORR_ALPHA")
+    if [ "$TRACK_CORR_ALPHA" != 1.0 ]; then
+      ME_TAG="${ME_TAG}_a${TRACK_CORR_ALPHA}"
     fi
 
     EXTRA+=(--eval_velocity_mode "$ME_EVAL_MODE"

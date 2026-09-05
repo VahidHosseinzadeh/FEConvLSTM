@@ -171,6 +171,7 @@ class Seq2SeqMEConvLSTM(nn.Module):
                  bias=True,
                  batch_first=True,
                  phase_corr_kwargs=None,
+                 track_corr_alpha=None,
                  use_velocity_dynamics=False,
                  vel_dyn_state_dim=32,
                  vel_dyn_use_h=False,
@@ -195,8 +196,26 @@ class Seq2SeqMEConvLSTM(nn.Module):
 
         pc_kw = phase_corr_kwargs or {}
 
+        # The two correlators do genuinely different jobs and want different
+        # whitening (see PhaseCorrelation's docstring):
+        #
+        #   bootstrap  frame vs frame -- both SHARP. Full phase correlation
+        #              (alpha=1) is exact here and measures 100% on this data.
+        #   track      h vs frame -- the template is h.mean(dim=2), a smooth
+        #              tanh-saturated map. alpha=1 whitens bands that h barely
+        #              occupies up to unit gain, which is noise, and the peak
+        #              collapses: 0% on a blur+tanh template where plain
+        #              cross-correlation gets 65%.
+        #
+        # track_corr_alpha=None keeps them identical, i.e. exactly the previous
+        # behaviour; set it (0.0 is the measured best) to decouple them.
+        track_kw = dict(pc_kw)
+        if track_corr_alpha is not None:
+            track_kw["alpha"] = track_corr_alpha
+        self.track_corr_alpha = track_corr_alpha
+
         self.phase_corr_bootstrap = PhaseCorrelation(n_modes=n_slots, **pc_kw)
-        self.phase_corr_track     = PhaseCorrelation(n_modes=1,       **pc_kw)
+        self.phase_corr_track     = PhaseCorrelation(n_modes=1,       **track_kw)
 
         self.cell = MEConvLSTMCell(input_channels, hidden_channels,
                                    kernel_size, bias)
