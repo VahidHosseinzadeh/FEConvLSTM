@@ -85,7 +85,11 @@ GEN_INPUT=15       # = INPUT_FRAMES so len-gen isolates horizon only: evaluating
                    # steps), which shows up as inflated error from the very first
                    # predicted frame rather than as a horizon effect.
 GEN_SEQ_LEN=100    # 90 predicted frames in the len-gen benchmark (9x trained horizon)
-IMAGE=36
+IMAGE=64           # The MNIST digit is 28 px and is CENTRED, never scaled, at any
+                   # image_size -- so this is really "how much room does the motion
+                   # have relative to the digit". At 36 an orbit of radius ~13 px is
+                   # smaller than the digit and reads as a wobble; at 64 the same
+                   # motion is plainly an orbit. Costs ~3x the pixels.
 EPOCHS=50          # generous shared ceiling; early stopping (below) ends lstm/melstm
                    # well before this once converged. felstm's real limit is wall-clock,
                    # not this number.
@@ -117,15 +121,23 @@ TRANSITION_MODE=smooth  # what a change jumps TO. uniform = anywhere on the grid
                         # smooth = a neighbouring velocity (each component moves by
                         # at most 1) with probability SMOOTH_PROB. Applies to
                         # piecewise/stochastic only; accelerate defines its own step.
-DATA_V_RANGE=4          # velocity grid is [-N..N]^2 minus (0,0), in pixels/frame.
-                        # Raising this makes felstm markedly more expensive (see
-                        # FE_V_RANGE below) -- (2N+1)^2-1 candidate slots: 24 at N=2,
-                        # 48 at N=3, 80 at N=4.
+DATA_V_RANGE=8          # velocity grid is [-N..N]^2 minus (0,0), in pixels/frame.
                         # In harmonic mode this ALSO sets the oscillation scale
-                        # (amplitude = HARMONIC_AMP_* x this). Velocities are
-                        # integers, so at 2 the rounded sinusoid only has 5 levels
-                        # and is coarse; 4 resolves it properly. Frozen-decoder
-                        # error for orbit: 19.6 px at N=2, 38.6 px at N=4.
+                        # (amplitude = HARMONIC_AMP_* x this), and the orbit radius
+                        # is roughly amplitude x period / 2pi -- so this is the main
+                        # "how bold is the motion" knob. Velocities are integers, so
+                        # a small range is destroyed by rounding: at 2 the sinusoid
+                        # has only 5 levels.
+                        #
+                        # ONLY felstm pays for a large range ((2N+1)^2-1 candidate
+                        # slots: 24 at N=2, 288 at N=8). melstm carries
+                        # NUM_VEL_MODES slots regardless and lstm has none, so for
+                        # the melstm-vs-lstm comparison this is free. Drop it back
+                        # to 2-4 before running felstm.
+                        #
+                        # Measured at IMAGE=64, context 15 / rollout 10: path radius
+                        # 43 px (vs a 28 px digit), frozen-decoder end-of-rollout
+                        # error 72 px against a 11 px one-step-lag bound.
 MIN_SEGMENT=3           # piecewise/accelerate: frames held before a velocity change.
 MAX_SEGMENT=6           # For accelerate, this is the ramp interval: smaller = faster
                         # acceleration. Ignored by constant/stochastic.
@@ -133,10 +145,13 @@ P_CHANGE=0.25           # stochastic only: per-step probability of a change.
 SMOOTH_PROB=0.8         # TRANSITION_MODE=smooth only. 0.0 is exactly equivalent to
                         # TRANSITION_MODE=uniform.
 # ---- harmonic motion: shape of the velocity signal (MOTION_MODE=harmonic) --
-HARMONIC_SHAPES="constant orbit axis lissajous"
-                        # Mixed by default so one dataset spans constant flow
-                        # through to two-frequency Lissajous motion. Pass a
-                        # single shape to isolate it.
+HARMONIC_SHAPES="orbit axis lissajous"
+                        # Default is the OSCILLATING shapes only, so every digit
+                        # actually moves in a non-trivial way. Add "constant" back
+                        # to include the control member -- worth doing at least
+                        # once, since it is the case where freezing the last
+                        # velocity is exactly right and the head can therefore only
+                        # cost something. Pass a single shape to isolate it.
                         #   constant  : pure constant flow. The degenerate
                         #               member, and the control: freezing is
                         #               already optimal, so the head must not
@@ -149,15 +164,18 @@ HARMONIC_SHAPES="constant orbit axis lissajous"
                         #               sinusoidal along the other.
                         #   lissajous : both axes oscillate independently.
                         #               Direction AND magnitude change.
-HARMONIC_PERIOD_MIN=12  # velocity period in frames. Keep this range comparable
-HARMONIC_PERIOD_MAX=30  # to INPUT_FRAMES: a period much longer than the context
-                        # is not identifiable from what the model saw, and the
-                        # head correctly falls back to freezing.
-HARMONIC_AMP_MIN=0.6    # oscillation amplitude as a fraction of DATA_V_RANGE.
+HARMONIC_PERIOD_MIN=12  # velocity period in frames. Two things pull against each
+HARMONIC_PERIOD_MAX=30  # other here: the orbit RADIUS grows with the period
+                        # (radius ~ amplitude x period / 2pi), but a period much
+                        # longer than INPUT_FRAMES is not identifiable from the
+                        # context and the head correctly falls back to freezing.
+                        # 12-30 against a 15-frame context spans "one and a half
+                        # cycles visible" to "half a cycle visible".
+HARMONIC_AMP_MIN=0.7    # oscillation amplitude as a fraction of DATA_V_RANGE.
 HARMONIC_AMP_MAX=1.0    # Velocities are integers, so a small amplitude is
                         # destroyed by rounding -- below ~0.5 the sinusoid stops
-                        # being resolvable. This is why DATA_V_RANGE matters more
-                        # in this mode than it used to (see below).
+                        # being resolvable. Kept high by default so the motion is
+                        # bold; lower the floor to mix gentle and violent digits.
 HARMONIC_DRIFT=1        # 1 = add a constant velocity offset, so paths become
                         # looping trochoids. The offset is INTEGER and therefore
                         # cancels exactly in the velocity differences -- it is

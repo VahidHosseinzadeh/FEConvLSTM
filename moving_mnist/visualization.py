@@ -255,7 +255,62 @@ def log_state_evolution(
         plt.close(fig)
 
 
-def log_velocity_report(summary, split_name="train", epoch=None):
+def _velocity_accuracy_figure(summary, split_name, input_frames=None):
+    """
+    Velocity quality as a function of position in the sequence.
+
+    The scalars logged alongside this collapse the whole horizon into one
+    number, which hides the thing that actually matters for the velocity
+    dynamics head: WHERE along the horizon the estimate degrades. The encoder
+    is measured (phase correlation against a real next frame) and should be
+    strong; the decoder is extrapolated and is where a frozen velocity falls
+    apart and the head has to earn its place. Those two regimes have to be
+    read separately or the average hides both.
+
+    input_frames : marks the true context/rollout boundary. estimated
+        velocities are indexed so entry i is printed as t=i+1, with encoder
+        entries at t=1..input_frames-1 and decoder entries from t=input_frames
+        -- so the boundary sits at x = input_frames - 0.5. Without it the plot
+        is still drawn, just unmarked.
+
+        (Note the *scalars* encoder_acc/decoder_acc in the dict below split at
+        T//2 instead, a heuristic that predates this plot and does not match
+        the real boundary when the context and horizon differ in length. This
+        figure uses the real one.)
+    """
+    T = summary["T"]
+    t = np.arange(1, T + 1)
+    fig, (ax_a, ax_l) = plt.subplots(2, 1, figsize=(7, 5), sharex=True)
+
+    ax_a.plot(t, summary["per_t_acc_stepwise"], color="#2a78d6", lw=2,
+              marker="o", ms=3.5, label="per-step assignment")
+    ax_a.plot(t, summary["per_t_acc"], color="#eb6834", lw=1.5, ls="--",
+              alpha=0.9, label="sequence-locked")
+    ax_a.set_ylabel("exact-match accuracy (%)")
+    ax_a.set_ylim(-3, 103)
+    ax_a.legend(loc="lower left", fontsize=8, frameon=False)
+
+    ax_l.plot(t, summary["per_t_l2_stepwise"], color="#2a78d6", lw=2,
+              marker="o", ms=3.5)
+    ax_l.set_ylabel("mean L2 error (px/frame)")
+    ax_l.set_xlabel("velocity estimate index t")
+    ax_l.set_ylim(bottom=0)
+
+    for ax in (ax_a, ax_l):
+        ax.grid(alpha=0.3)
+        ax.set_axisbelow(True)
+        if input_frames is not None and 1 < input_frames <= T:
+            ax.axvline(input_frames - 0.5, color="#52514e", lw=1.2, ls=":")
+    if input_frames is not None and 1 < input_frames <= T:
+        ax_a.text(input_frames - 0.35, 4, "rollout starts", fontsize=8,
+                  color="#52514e")
+
+    fig.suptitle(f"{split_name}: velocity estimate vs position in the sequence")
+    fig.tight_layout()
+    return fig
+
+
+def log_velocity_report(summary, split_name="train", epoch=None, input_frames=None):
     """
     Log a VelocityMetrics.summary() dict to wandb: a per-timestep table
     (accuracy/mean-L2/correct/total, one row per t) plus overall/encoder/
@@ -307,6 +362,17 @@ def log_velocity_report(summary, split_name="train", epoch=None):
         f"{split_name}_vel_encoder_acc_seq" : summary["encoder_acc"],
         f"{split_name}_vel_decoder_acc_seq" : summary["decoder_acc"],
     }
+    # The table alone does not render as a chart in wandb -- add both a native
+    # interactive line plot and a rendered figure, so the horizon profile is
+    # visible without building a custom panel by hand.
+    log_dict[f"{split_name}_vel_acc_over_horizon"] = wandb.plot.line(
+        table, x="t", y="acc_pct",
+        title=f"{split_name}: velocity accuracy vs horizon")
+
+    fig = _velocity_accuracy_figure(summary, split_name, input_frames)
+    log_dict[f"{split_name}_vel_accuracy_curve"] = wandb.Image(fig)
+    plt.close(fig)
+
     if epoch is not None:
         log_dict["epoch"] = epoch
 

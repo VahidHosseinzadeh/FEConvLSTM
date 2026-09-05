@@ -319,7 +319,8 @@ def train_epoch(model, dataloader, optimizer, criterion, device, input_frames, g
 
     if has_velocity_data:
         velocity_metrics.report("Training Velocity")
-        log_velocity_report(velocity_metrics.summary(), split_name="train")
+        log_velocity_report(velocity_metrics.summary(), split_name="train",
+                            input_frames=input_frames)
 
     n = len(dataloader.dataset)
     # (pixel loss, dynamics loss). The second is None when the head is absent
@@ -388,7 +389,8 @@ def eval_epoch(model, dataloader, criterion, device, input_frames, epoch, split_
 
     if has_velocity_data:
         velocity_metrics.report(f"{split_name} Velocity")
-        log_velocity_report(velocity_metrics.summary(), split_name=split_name, epoch=epoch)
+        log_velocity_report(velocity_metrics.summary(), split_name=split_name, epoch=epoch,
+                            input_frames=input_frames)
 
     return running_loss / len(dataloader.dataset)
 
@@ -490,7 +492,8 @@ def eval_len_generalization(model, dataloader, device, input_frames, subsample_t
 
     if has_velocity_data:
         velocity_metrics.report("Length Generalization Velocity")
-        log_velocity_report(velocity_metrics.summary(), split_name="len_gen")
+        log_velocity_report(velocity_metrics.summary(), split_name="len_gen",
+                            input_frames=input_frames)
 
     per_seq_err = torch.cat(per_seq_chunks, dim=0).numpy()   # [N, T]
     mean = per_seq_err.mean(axis=0)
