@@ -24,16 +24,31 @@
 # CURRENT DEFAULTS = the velocity-dynamics-head experiment, NOT the old
 # baseline. Two data settings were changed from what this script used to run:
 #
-#     MOTION_MODE   piecewise -> accelerate
+#     MOTION_MODE   piecewise -> harmonic
 #     FREEZE_AFTER  (new)     -> 0
 #
-# Both are required for the experiment to mean anything. The dataset normally
-# freezes the ground-truth velocity at the context/prediction boundary
-# (FREEZE_AFTER=-1), which makes "decoder freezes its last encoder velocity"
-# the EXACTLY correct policy and leaves a velocity predictor precisely zero
-# headroom -- you would measure "no effect" and learn nothing. FREEZE_AFTER=0
-# turns the freeze off so the velocity keeps ramping through the rollout, and
-# accelerate makes it ramp systematically rather than random-walk.
+# Both are required for the experiment to mean anything.
+#
+# FREEZE_AFTER: the dataset normally freezes the ground-truth velocity at the
+# context/prediction boundary (FREEZE_AFTER=-1), which makes "decoder freezes
+# its last encoder velocity" the EXACTLY correct policy and leaves a velocity
+# predictor precisely zero headroom. FREEZE_AFTER=0 turns that off.
+#
+# MOTION_MODE: turning the freeze off is not enough on its own -- the velocity
+# also has to be PREDICTABLE. An exactly motion-equivariant dynamics head sees
+# only the history of velocity DIFFERENCES, never the absolute velocity, so it
+# can only learn dynamics whose next increment is a function of past
+# increments. piecewise/stochastic have i.i.d. increments (no signal at all --
+# the best possible prediction IS freeze) and accelerate reverses when |v|
+# hits max_speed (a rule about the ABSOLUTE speed, which the head cannot see).
+# harmonic is the family that satisfies the requirement. Measured end-of-
+# rollout position error, 36 px frame, context 15, rollout 10:
+#
+#     shape        frozen   1-step-lagged
+#     constant       0.0 px     0.0 px   <- freezing is exactly right, by design
+#     orbit         38.6        5.8
+#     axis          25.4        3.7
+#     lissajous     37.2        5.5
 #
 # To get the old baseline back: MOTION_MODE=piecewise, FREEZE_AFTER=-1,
 # USE_VEL_DYN=0. All three models still see identical data either way, so the
@@ -85,27 +100,73 @@ SAVE_DIR=./experiments
 # models saw the same motion. Only the parameters that apply to the chosen
 # MOTION_MODE are passed through (see the case block below) -- the rest are
 # left at train.py's defaults rather than silently pretending to matter.
-MOTION_MODE=accelerate  # constant   : one velocity for the whole sequence
+MOTION_MODE=harmonic    # constant   : one velocity for the whole sequence
                         # piecewise  : held MIN_SEGMENT..MAX_SEGMENT frames, then changes
                         # stochastic : P_CHANGE chance of changing at every step
                         # accelerate : speed ramps by a per-digit constant sign every
                         #              MIN_SEGMENT..MAX_SEGMENT frames, clipped to
                         #              DATA_V_RANGE -- systematic, not a random walk,
                         #              so |v| changes over the context window
+                        # harmonic   : constant drift + a sinusoid per axis, drawn
+                        #              per digit then DETERMINISTIC. The only mode
+                        #              whose future velocity is predictable from
+                        #              the velocity history alone, hence the only
+                        #              one where USE_VEL_DYN can win. See the
+                        #              HARMONIC block below.
 TRANSITION_MODE=smooth  # what a change jumps TO. uniform = anywhere on the grid;
                         # smooth = a neighbouring velocity (each component moves by
                         # at most 1) with probability SMOOTH_PROB. Applies to
                         # piecewise/stochastic only; accelerate defines its own step.
-DATA_V_RANGE=2          # velocity grid is [-N..N]^2 minus (0,0), in pixels/frame.
+DATA_V_RANGE=4          # velocity grid is [-N..N]^2 minus (0,0), in pixels/frame.
                         # Raising this makes felstm markedly more expensive (see
                         # FE_V_RANGE below) -- (2N+1)^2-1 candidate slots: 24 at N=2,
-                        # 48 at N=3.
+                        # 48 at N=3, 80 at N=4.
+                        # In harmonic mode this ALSO sets the oscillation scale
+                        # (amplitude = HARMONIC_AMP_* x this). Velocities are
+                        # integers, so at 2 the rounded sinusoid only has 5 levels
+                        # and is coarse; 4 resolves it properly. Frozen-decoder
+                        # error for orbit: 19.6 px at N=2, 38.6 px at N=4.
 MIN_SEGMENT=3           # piecewise/accelerate: frames held before a velocity change.
 MAX_SEGMENT=6           # For accelerate, this is the ramp interval: smaller = faster
                         # acceleration. Ignored by constant/stochastic.
 P_CHANGE=0.25           # stochastic only: per-step probability of a change.
 SMOOTH_PROB=0.8         # TRANSITION_MODE=smooth only. 0.0 is exactly equivalent to
                         # TRANSITION_MODE=uniform.
+# ---- harmonic motion: shape of the velocity signal (MOTION_MODE=harmonic) --
+HARMONIC_SHAPES="constant orbit axis lissajous"
+                        # Mixed by default so one dataset spans constant flow
+                        # through to two-frequency Lissajous motion. Pass a
+                        # single shape to isolate it.
+                        #   constant  : pure constant flow. The degenerate
+                        #               member, and the control: freezing is
+                        #               already optimal, so the head must not
+                        #               make things WORSE here.
+                        #   orbit     : velocity rotates at a constant rate,
+                        #               digit circles. Cleanest case -- one
+                        #               parameter, identifiable from two
+                        #               consecutive velocity differences.
+                        #   axis      : constant flow along one axis,
+                        #               sinusoidal along the other.
+                        #   lissajous : both axes oscillate independently.
+                        #               Direction AND magnitude change.
+HARMONIC_PERIOD_MIN=12  # velocity period in frames. Keep this range comparable
+HARMONIC_PERIOD_MAX=30  # to INPUT_FRAMES: a period much longer than the context
+                        # is not identifiable from what the model saw, and the
+                        # head correctly falls back to freezing.
+HARMONIC_AMP_MIN=0.6    # oscillation amplitude as a fraction of DATA_V_RANGE.
+HARMONIC_AMP_MAX=1.0    # Velocities are integers, so a small amplitude is
+                        # destroyed by rounding -- below ~0.5 the sinusoid stops
+                        # being resolvable. This is why DATA_V_RANGE matters more
+                        # in this mode than it used to (see below).
+HARMONIC_DRIFT=1        # 1 = add a constant velocity offset, so paths become
+                        # looping trochoids. The offset is INTEGER and therefore
+                        # cancels exactly in the velocity differences -- it is
+                        # invisible to the equivariant head, so it costs that
+                        # head nothing while making the motion strictly richer
+                        # for any model carrying velocity implicitly. That is the
+                        # inductive-bias argument, made visible in the data.
+                        # 0 = oscillations centred on zero (isolation ablation).
+
 FREEZE_AFTER=0          # When the dataset stops letting the velocity evolve.
                         #  -1 = freeze at the context/prediction boundary
                         #       (INPUT_FRAMES for train/val/test, GEN_INPUT for
@@ -141,8 +202,24 @@ case $MOTION_MODE in
     # transition_mode/smooth_probability/p_change are unused by this mode
     MOTION+=(--min_segment "$MIN_SEGMENT" --max_segment "$MAX_SEGMENT")
     MOTION_TAG="acc${MIN_SEGMENT}-${MAX_SEGMENT}" ;;
+  harmonic)
+    # min/max_segment, transition_mode, smooth_probability and p_change are all
+    # unused by this mode -- the trajectory is parametric, not step-by-step.
+    MOTION+=(--harmonic_shapes $HARMONIC_SHAPES
+             --harmonic_period_min "$HARMONIC_PERIOD_MIN"
+             --harmonic_period_max "$HARMONIC_PERIOD_MAX"
+             --harmonic_amp_min "$HARMONIC_AMP_MIN"
+             --harmonic_amp_max "$HARMONIC_AMP_MAX")
+    if [ "$HARMONIC_DRIFT" != 1 ]; then
+      MOTION+=(--no_harmonic_drift)
+    fi
+    # shape initials, e.g. "coal" for all four; keeps run names short
+    SHAPE_TAG=""
+    for sh in $HARMONIC_SHAPES; do SHAPE_TAG="${SHAPE_TAG}${sh:0:1}"; done
+    MOTION_TAG="hrm${SHAPE_TAG}${HARMONIC_PERIOD_MIN}-${HARMONIC_PERIOD_MAX}"
+    if [ "$HARMONIC_DRIFT" != 1 ]; then MOTION_TAG="${MOTION_TAG}nod"; fi ;;
   *)
-    echo "unknown MOTION_MODE: $MOTION_MODE (constant|piecewise|stochastic|accelerate)"; exit 1 ;;
+    echo "unknown MOTION_MODE: $MOTION_MODE (constant|piecewise|stochastic|accelerate|harmonic)"; exit 1 ;;
 esac
 # smooth_probability only bites when a transition_mode is actually in play.
 # Written as an if, not `[ ... ] && MOTION+=(...)`: a trailing test that fails

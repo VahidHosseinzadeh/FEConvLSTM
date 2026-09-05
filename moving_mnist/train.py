@@ -147,7 +147,7 @@ def main():
     parser.add_argument('--v_range', type=int, default=2)
     parser.add_argument('--num_vel_modes', type=int, default=2, help='Number of velocity modes for MEConvLSTM')
     parser.add_argument('--data_v_range', type=int, default=2)
-    parser.add_argument('--motion_mode', choices=['constant', 'piecewise', 'stochastic', 'accelerate'], default='piecewise',
+    parser.add_argument('--motion_mode', choices=['constant', 'piecewise', 'stochastic', 'accelerate', 'harmonic'], default='piecewise',
                         help="How digit velocity evolves over time: 'constant' = fixed for the whole "
                              "sequence; 'piecewise' = held for a random --min_segment..--max_segment window "
                              "then changes (--p_change has no effect in this mode); 'stochastic' = --p_change "
@@ -155,7 +155,12 @@ def main():
                              "--min_segment..--max_segment steps the speed is incremented by a per-digit "
                              "constant sign and clipped to --data_v_range, so |v| ramps systematically "
                              "instead of random-walking (--transition_mode, --smooth_probability and "
-                             "--p_change are all unused in this mode).")
+                             "--p_change are all unused in this mode); 'harmonic' = constant drift plus "
+                             "a sinusoid per axis, with amplitude/period/phase drawn per digit and the "
+                             "trajectory then deterministic. This is the only mode whose future velocity "
+                             "is predictable from the velocity history alone, and therefore the only one "
+                             "where --use_velocity_dynamics can beat a frozen decoder. See "
+                             "--harmonic_shapes.")
     parser.add_argument('--transition_mode', choices=['uniform', 'smooth'], default='smooth',
                         help="What the new velocity is when a change happens: 'uniform' = uniformly random "
                              "pick from the whole velocity grid; 'smooth' = with probability "
@@ -175,6 +180,37 @@ def main():
                              "which is the only regime where predicting the velocity can beat "
                              "freezing it (see --use_velocity_dynamics). >0 = freeze at that "
                              "explicit step for every split.")
+    # ---- motion_mode=harmonic only ----
+    parser.add_argument('--harmonic_shapes', nargs='+',
+                        choices=['constant', 'orbit', 'axis', 'lissajous'],
+                        default=['constant', 'orbit', 'axis', 'lissajous'],
+                        help="motion_mode=harmonic: which velocity shapes to mix, drawn uniformly per "
+                             "digit. 'constant' = pure constant flow (the degenerate member; freezing "
+                             "the last velocity is already optimal for it); 'orbit' = both axes share "
+                             "one amplitude and period a quarter cycle apart, so the velocity rotates "
+                             "and the digit circles; 'axis' = constant flow along one axis, sinusoidal "
+                             "along the other; 'lissajous' = both axes oscillate with independent "
+                             "amplitude, period and phase. Pass a single shape to isolate it.")
+    parser.add_argument('--harmonic_period_min', type=int, default=12,
+                        help='motion_mode=harmonic: shortest velocity period, in frames. Periods much '
+                             'longer than --input_frames are not identifiable from the context, so the '
+                             'dynamics head cannot beat freezing there -- keep this range comparable to '
+                             'the context length.')
+    parser.add_argument('--harmonic_period_max', type=int, default=30,
+                        help='motion_mode=harmonic: longest velocity period, in frames')
+    parser.add_argument('--harmonic_amp_min', type=float, default=0.6,
+                        help='motion_mode=harmonic: minimum oscillation amplitude, as a fraction of '
+                             '--data_v_range. Velocities are integers, so a small amplitude is destroyed '
+                             'by rounding -- below ~0.5 the sinusoid stops being resolvable.')
+    parser.add_argument('--harmonic_amp_max', type=float, default=1.0,
+                        help='motion_mode=harmonic: maximum oscillation amplitude, as a fraction of '
+                             '--data_v_range')
+    parser.add_argument('--no_harmonic_drift', action='store_true',
+                        help='motion_mode=harmonic: drop the constant velocity offset, so oscillations '
+                             'are centred on zero. The drift is INTEGER and therefore cancels exactly in '
+                             'the velocity differences, which is the only thing an equivariant dynamics '
+                             'head sees -- so it costs that head nothing while making the paths looping '
+                             'trochoids. Turn it off only to isolate the pure oscillation.')
     parser.add_argument('--gen_seq_len', type=int, default=40, help='Sequence length used **only** for length‑generalization evaluation (must be > seq_len)')
     parser.add_argument('--data_seed', type=int, default=42, help='Random seed for dataset splitting')
     parser.add_argument('--model_seed', type=int, default=None, help='Random seed for model initialization (default: random)')
@@ -326,6 +362,21 @@ def main():
         freeze_after = gen_freeze_after = args.freeze_after
     print(f"Dataset freeze_after: train/val/test={freeze_after}, len_gen={gen_freeze_after}")
 
+    # motion_mode=harmonic knobs, shared by all three dataset constructions.
+    # Inert for every other mode (the dataset only reads them in the harmonic
+    # branch), so they can be passed unconditionally.
+    harmonic_kwargs = dict(
+        harmonic_shapes=tuple(args.harmonic_shapes),
+        harmonic_period=(args.harmonic_period_min, args.harmonic_period_max),
+        harmonic_amp=(args.harmonic_amp_min, args.harmonic_amp_max),
+        harmonic_drift=not args.no_harmonic_drift,
+    )
+    if args.motion_mode == 'harmonic':
+        print(f"Harmonic motion: shapes={args.harmonic_shapes} "
+              f"period={harmonic_kwargs['harmonic_period']} frames "
+              f"amp={harmonic_kwargs['harmonic_amp']} x {args.data_v_range} px/frame "
+              f"drift={'on' if harmonic_kwargs['harmonic_drift'] else 'off'}")
+
     
 
     # # Dataset and splits
@@ -379,6 +430,7 @@ def main():
 
         motion_difficulty=None,
         freeze_after=freeze_after,
+        **harmonic_kwargs,
 
         min_center_distance=20,
         reject_overlap=True,
@@ -415,6 +467,7 @@ def main():
 
         motion_difficulty=None,
         freeze_after=freeze_after,
+        **harmonic_kwargs,
 
         min_center_distance=20,
         reject_overlap=True,
@@ -450,6 +503,7 @@ def main():
         smooth_probability=args.smooth_probability,
 
         motion_difficulty=None,
+        **harmonic_kwargs,
 
         freeze_after=gen_freeze_after,
 

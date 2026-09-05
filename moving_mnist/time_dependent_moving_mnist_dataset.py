@@ -27,6 +27,16 @@ class TDMovingMNISTDataset(Dataset):
                     systematic, not a random walk -- use it to test motion whose
                     *magnitude* changes over the context. transition_mode,
                     smooth_probability and p_change are unused here.
+    "harmonic"    : velocity = constant drift + sinusoid, per axis, with the
+                    amplitude/period/phase drawn per digit and the trajectory
+                    then DETERMINISTIC. Covers constant flow, circular orbits,
+                    "constant along one axis, oscillating along the other", and
+                    Lissajous figures in one family (harmonic_shapes). This is
+                    the only mode whose future velocity is predictable from the
+                    velocity history alone -- see _generate_harmonic_trajectory
+                    for why that distinction matters and why the other four
+                    modes do not have it. transition_mode, smooth_probability,
+                    p_change and min/max_segment are all unused here.
 
     Which parameters apply to which mode
     ------------------------------------
@@ -36,6 +46,10 @@ class TDMovingMNISTDataset(Dataset):
         smooth_probability      : only when transition_mode == "smooth"
                                   ("smooth" with probability 0.0 is exactly
                                    equivalent to "uniform")
+        harmonic_shapes         : harmonic only
+        harmonic_period         : harmonic only
+        harmonic_amp            : harmonic only
+        harmonic_drift          : harmonic only
 
     All modes support freeze_after (see below).
 
@@ -139,6 +153,14 @@ class TDMovingMNISTDataset(Dataset):
         neighbor_kernel="legacy",       # "legacy" | "symmetric", see
                                         # _sample_neighbor_velocity
 
+        # motion_mode="harmonic" only -- see _generate_harmonic_trajectory
+        harmonic_shapes=("constant", "orbit", "axis", "lissajous"),
+        harmonic_period=(12, 30),       # integer period, in frames, inclusive
+        harmonic_amp=(0.6, 1.0),        # oscillation amplitude, as a FRACTION
+                                        # of max_speed
+        harmonic_drift=True,            # add a constant velocity offset on top
+                                        # of the oscillation
+
         motion_difficulty=None,
 
         # Two-phase motion: run dynamic motion for freeze_after steps,
@@ -201,6 +223,16 @@ class TDMovingMNISTDataset(Dataset):
             for vy in range(-max_speed, max_speed + 1)
             if (vx, vy) != (0, 0)
         ]
+
+        self.harmonic_shapes  = tuple(harmonic_shapes)
+        self.harmonic_period  = tuple(harmonic_period)
+        self.harmonic_amp     = tuple(harmonic_amp)
+        self.harmonic_drift   = harmonic_drift
+        if not self.harmonic_shapes:
+            raise ValueError("harmonic_shapes must not be empty")
+        unknown = set(self.harmonic_shapes) - {"constant", "orbit", "axis", "lissajous"}
+        if unknown:
+            raise ValueError(f"unknown harmonic shape(s): {sorted(unknown)}")
 
         self.neighbor_kernel = neighbor_kernel
         self._velocity_set   = set(self.velocity_grid)
@@ -463,6 +495,16 @@ class TDMovingMNISTDataset(Dataset):
         T = self.seq_len
         N = self.num_digits
 
+        # Harmonic is parametric rather than step-by-step: the whole
+        # trajectory follows from a handful of per-digit constants, so it does
+        # not use the initial-velocity draw or the segment machinery below.
+        # Branching out here (rather than after them) also keeps it from
+        # consuming RNG draws it would only discard, which would shift the
+        # stream for every other mode and silently change existing fixed
+        # benchmarks -- the same reason accel_sign is drawn conditionally.
+        if self.motion_mode == "harmonic":
+            return self._apply_freeze(self._generate_harmonic_trajectory(T, N))
+
         motions = torch.zeros(T, N, 2, dtype=torch.long)
 
         # Initial velocities (distinct if required)
@@ -579,6 +621,176 @@ class TDMovingMNISTDataset(Dataset):
             motions[f - 1:] = last_v.unsqueeze(0).expand(T - (f - 1), -1, -1)
 
         return motions
+
+    # ------------------------------------------------------------------
+    # Harmonic (parametric, deterministic-given-parameters) motion
+    # ------------------------------------------------------------------
+
+    def _generate_harmonic_trajectory(self, T, N):
+        """
+        Velocity as a sum of a constant drift and a sinusoid, per axis:
+
+            vx(t) = dx + round( Ax * cos(wx t + px) )
+            vy(t) = dy + round( Ay * cos(wy t + py) )
+
+        Why this family, and not another "changing velocity" mode
+        ---------------------------------------------------------
+        A velocity predictor that is exactly motion-equivariant can only see
+        the history of velocity DIFFERENCES du = u_t - u_{t-1}; the absolute
+        velocity is invisible to it by construction (that is what buys the
+        equivariance). So a dynamics is learnable by such a model iff the next
+        increment is a function of past increments.
+
+        Any linear time-invariant recurrence has that property: the difference
+        operator commutes with LTI operators, so if u obeys the recurrence then
+        du obeys the SAME one. Sinusoids are the canonical such signals, which
+        is why this family is the right target and why the older modes are not:
+
+            constant             du = 0            -- learnable, but freezing
+                                                      the last velocity is
+                                                      already optimal
+            piecewise/stochastic increments i.i.d. -- no signal at all; the
+                                                      best prediction IS freeze
+            accelerate           reverses when |v| -- NOT a function of du:
+                                 hits max_speed       the switch depends on the
+                                                      absolute speed, which an
+                                                      equivariant head cannot
+                                                      see
+
+        Rounding makes the quantized system only approximately LTI, but the
+        trajectory stays fully determined by the du history: a model-free
+        nearest-neighbour predictor matched on context increments alone
+        recovers the rollout to ~6 px of end-position error against ~42 px for
+        freezing (36 px frame, context 15, rollout 10).
+
+        Shapes (sampled per digit from harmonic_shapes)
+        ----------------------------------------------
+            "constant"  : Ax = Ay = 0. Pure constant flow -- the degenerate
+                          member, kept in the family so one dataset can mix
+                          flows and oscillations.
+            "orbit"     : both axes share one amplitude and frequency, a
+                          quarter period apart, so u ROTATES at a constant rate
+                          and the digit traces a circle. |u| is constant; only
+                          the direction turns. The cleanest case: u_{t+1} =
+                          R(w) u_t implies du_{t+1} = R(w) du_t, so a single
+                          parameter is identifiable from two consecutive
+                          increments.
+            "axis"      : one axis oscillates, the other carries only drift --
+                          constant flow in one direction, sinusoidal in the
+                          other.
+            "lissajous" : both axes oscillate with independent amplitude,
+                          frequency and phase. Direction AND magnitude change;
+                          two frequencies to identify instead of one.
+
+        Drift
+        -----
+        The offset (dx, dy) is INTEGER, which makes it exactly separable from
+        the rounded oscillation: round(d + A cos) == d + round(A cos). It
+        therefore cancels completely in du, so it is invisible to an
+        equivariant velocity model -- it costs such a model nothing while
+        making the path a looping trochoid and the motion strictly richer for
+        any model that has to carry velocity implicitly. That is the whole
+        inductive-bias argument, made visible in the data.
+
+        Speed budget
+        ------------
+        |d| + peak|round(A cos)| <= max_speed BY CONSTRUCTION, so the velocity
+        is never clipped. This matters more than it looks: a clip is a rule
+        about the ABSOLUTE speed, exactly the kind of non-equivariant switch
+        that makes "accelerate" unlearnable here. Reintroducing one would
+        undo the point of the mode.
+
+        (0, 0) is allowed, unlike in the random modes: here a momentary pause
+        is a predictable part of a deterministic trajectory rather than a
+        degenerate "digit stopped" state, and the model can anticipate it.
+        """
+        t = np.arange(T)
+        motions = torch.zeros(T, N, 2, dtype=torch.long)
+
+        seen = []
+        for i in range(N):
+            # require_distinct_velocities is about the FIRST frame: the K
+            # tracking slots are bootstrapped from one frame pair, so digits
+            # sharing v(0) cannot be separated there. Later coincidences are
+            # fine -- the trajectories diverge again on their own.
+            for _ in range(max(1, self.max_tries)):
+                vx, vy = self._sample_harmonic_digit(t)
+                v0 = (int(vx[0]), int(vy[0]))
+                if not self.require_distinct_velocities or v0 not in seen:
+                    break
+            seen.append(v0)
+            motions[:, i, 0] = torch.from_numpy(vx)
+            motions[:, i, 1] = torch.from_numpy(vy)
+
+        return motions
+
+    def _sample_harmonic_digit(self, t):
+        """One digit's parameters -> its (T,) integer vx, vy. See
+        _generate_harmonic_trajectory for what the shapes mean."""
+        ms    = self.max_speed
+        shape = self._choice(self.harmonic_shapes)
+
+        def amp():
+            lo, hi = self.harmonic_amp
+            return (lo + (hi - lo) * self._random()) * ms
+
+        def omega():
+            # Integer period => the velocity sequence is exactly periodic,
+            # which is the most learnable version of this signal.
+            period = self._randint(self.harmonic_period[0],
+                                   self.harmonic_period[1] + 1)
+            return 2.0 * np.pi / period * self._choice([-1, +1])
+
+        def phase():
+            return 2.0 * np.pi * self._random()
+
+        if shape == "constant":
+            ax = ay = 0.0
+            wx = wy = px = py = 0.0
+        elif shape == "orbit":
+            a, w, ph = amp(), omega(), phase()
+            ax = ay = a
+            wx = wy = w
+            px, py = ph, ph - np.pi / 2      # (cos, sin) -> a rotating vector
+        elif shape == "axis":
+            a, w, ph = amp(), omega(), phase()
+            if self._choice([0, 1]) == 0:
+                ax, ay = a, 0.0
+            else:
+                ax, ay = 0.0, a
+            wx = wy = w
+            px = py = ph
+        else:                                 # "lissajous"
+            ax, ay = amp(), amp()
+            wx, wy = omega(), omega()
+            px, py = phase(), phase()
+
+        osc_x = np.round(ax * np.cos(wx * t + px)).astype(np.int64)
+        osc_y = np.round(ay * np.cos(wy * t + py)).astype(np.int64)
+
+        # round() is monotone, so the peak of round(A cos .) is exactly
+        # round(A) -- the leftover budget below is therefore tight, not
+        # approximate, and no clipping is ever needed.
+        dx = self._harmonic_drift(ax, shape)
+        dy = self._harmonic_drift(ay, shape)
+
+        if shape == "constant" and (dx, dy) == (0, 0):
+            # A "constant" digit with zero drift would not move at all. Draw
+            # from the velocity grid instead, which already excludes (0, 0).
+            dx, dy = self._sample_velocity()
+
+        return osc_x + dx, osc_y + dy
+
+    def _harmonic_drift(self, amplitude, shape):
+        """Integer offset that fits in whatever speed budget the oscillation
+        on this axis leaves. Always drawn for "constant" (it IS the velocity
+        there); otherwise only when harmonic_drift is on."""
+        if shape != "constant" and not self.harmonic_drift:
+            return 0
+        budget = self.max_speed - int(np.round(amplitude))
+        if budget <= 0:
+            return 0
+        return self._randint(-budget, budget + 1)
 
     # ------------------------------------------------------------------
     # Velocity sampling helpers
