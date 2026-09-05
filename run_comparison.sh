@@ -265,12 +265,23 @@ VEL_DYN_USE_H=0         # 1 = also condition on a globally pooled (translation
                         # it lets the head explain velocity by appearance and
                         # stop extrapolating, which is the failure mode this
                         # experiment is trying to avoid.
-VEL_DYN_OPENLOOP_K=3    # extra multi-step supervision: for the last K encoder
+VEL_DYN_OPENLOOP_K=10   # extra multi-step supervision: for the last K encoder
                         # steps, replay the head open-loop (fed its own
                         # predictions) against velocities already measured for
                         # those steps. Trains exactly the extrapolation regime
                         # the decoder runs in, at no image-rollout cost. 0 = off.
-                        # Keep well below INPUT_FRAMES.
+                        #
+                        # Set to the ROLLOUT length (SEQ_LEN - INPUT_FRAMES).
+                        # Without it the head is only ever trained ONE step ahead,
+                        # always restarted from a real measurement, while at
+                        # evaluation it has to run the whole rollout on its own
+                        # output -- the mismatch that open-loop supervision exists
+                        # to close. The standalone test
+                        # (motiond_test_velocity_rnn.ipynb) measured it mattering:
+                        # 'axis' end-of-rollout drift 11.2 -> 8.6 px, 'constant'
+                        # 5.8 -> 1.9. Internally the fork cannot start before the
+                        # second measurement, so K is effectively capped at
+                        # INPUT_FRAMES-2.
 EVAL_VEL_MODE=all       # frozen    : honest inference only (cheapest)
                         # both      : + oracle GT-tracked val
                         # all       : + head-predicted val. Logs val_loss,
