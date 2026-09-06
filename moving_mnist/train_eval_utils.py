@@ -11,8 +11,40 @@ from visualization import (
     log_velocity_report,
 )
 from velocity_metrics import VelocityMetrics
+from fourier_loss import FourierShapePhaseLoss
 from velocity_model_based_MEConvLSTM_model import Seq2SeqMEConvLSTM
 from channel_based_FEConvLSTM_model import Seq2SeqFEConvLSTM
+
+
+# Parameter-name prefixes owned by the velocity process model. Everything else
+# -- cell.* (the recurrent encoder) and decoder.* -- is the renderer. The
+# correlators (phase_corr_*) hold no parameters at all: they read a velocity
+# off an argmax, so they neither have weights to route gradient to nor pass
+# gradient through. Verified, not assumed.
+_VELOCITY_PARAM_PREFIXES = ("vel_dyn",)
+
+
+def split_parameters(model):
+    """(velocity-model params, encoder/decoder params) by name prefix.
+
+    Used by --loss_routing split to send each half of the Fourier-decomposed
+    pixel loss only to the parameters it is a statement about.
+    """
+    vel, enc = [], []
+    for name, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        (vel if name.startswith(_VELOCITY_PARAM_PREFIXES) else enc).append(p)
+    return vel, enc
+
+
+def _accumulate_grads(params, grads):
+    """.grad += g, tolerating the None that zero_grad(set_to_none=True) leaves
+    and the None autograd returns for a parameter outside the graph."""
+    for p, g in zip(params, grads):
+        if g is None:
+            continue
+        p.grad = g if p.grad is None else p.grad + g
 
 
 def build_model(cfg):
@@ -254,21 +286,41 @@ class ValCurveRecorder:
 
 def train_epoch(model, dataloader, optimizer, criterion, device, input_frames, grad_clip=None,
                 curve_recorder=None, show_h_state=False, vel_dyn_loss_weight=0.0,
-                decoder_sampling_p=0.0):
+                decoder_sampling_p=0.0, loss_routing='shared'):
     """
     vel_dyn_loss_weight : weight on the velocity dynamics head's one-step-ahead
         loss (--vel_dyn_loss_weight). 0.0 (default) leaves both the objective
         and the model call identical to before this feature existed; with a
         head present but zero weight the head simply never trains.
+
+    loss_routing : 'shared' (default) backpropagates the whole pixel loss into
+        every parameter, as always. 'split' sends the Fourier shape term (plus
+        L1) only to the encoder/decoder and the location term only to the
+        velocity head -- same objective value, two restricted backward passes
+        instead of one. Requires a criterion exposing routed_terms(), i.e.
+        --fourier_loss.
     """
     model.train()
     running_loss = 0.0
     running_dyn_loss = 0.0
+    running_shape = 0.0
+    running_location = 0.0
     velocity_metrics = VelocityMetrics()
     has_velocity_data = False
 
     want_dyn_loss = (vel_dyn_loss_weight > 0.0
                      and getattr(model, "vel_dyn", None) is not None)
+
+    routed = loss_routing == 'split'
+    if routed:
+        if not hasattr(criterion, "routed_terms"):
+            raise ValueError("--loss_routing split needs the Fourier-decomposed "
+                             "criterion; pass --fourier_loss.")
+        vel_params, enc_params = split_parameters(model)
+        if not vel_params:
+            raise ValueError("--loss_routing split found no velocity-model "
+                             "parameters to route the location term to; the "
+                             "head is off (pass --use_velocity_dynamics).")
 
     pbar = tqdm(dataloader, desc="Training", leave=False, disable=True)
     for i, batch in enumerate(pbar):
@@ -290,12 +342,37 @@ def train_epoch(model, dataloader, optimizer, criterion, device, input_frames, g
         # turning the dynamics head on would shift the training curve for
         # reasons that have nothing to do with prediction quality and make it
         # incomparable with every previous run.
-        loss = criterion(output_seq, target_seq)
-        total_loss = loss
-        if dyn_loss is not None:
-            running_dyn_loss += dyn_loss.item() * seq.size(0)
-            total_loss = loss + vel_dyn_loss_weight * dyn_loss
-        total_loss.backward()
+        if routed:
+            # Same objective, restricted gradients. Two autograd.grad calls
+            # rather than one .backward(): the halves have to be differentiated
+            # separately, because once they are summed there is no way to tell
+            # which parameter's gradient came from which term. Costs one extra
+            # backward traversal per batch.
+            enc_term, vel_term, _ = criterion.routed_terms(output_seq, target_seq)
+            loss = enc_term + vel_term          # == criterion(...), reported as before
+            _accumulate_grads(enc_params, torch.autograd.grad(
+                enc_term, enc_params, retain_graph=True, allow_unused=True))
+            _accumulate_grads(vel_params, torch.autograd.grad(
+                vel_term, vel_params,
+                retain_graph=dyn_loss is not None, allow_unused=True))
+            # The head's own supervision is deliberately NOT routed: it is a
+            # velocity-space target, and letting it shape h through the encoder
+            # is the point of --vel_dyn_use_h.
+            if dyn_loss is not None:
+                running_dyn_loss += dyn_loss.item() * seq.size(0)
+                (vel_dyn_loss_weight * dyn_loss).backward()
+        else:
+            loss = criterion(output_seq, target_seq)
+            total_loss = loss
+            if dyn_loss is not None:
+                running_dyn_loss += dyn_loss.item() * seq.size(0)
+                total_loss = loss + vel_dyn_loss_weight * dyn_loss
+            total_loss.backward()
+
+        with torch.no_grad():
+            sh, lo = FourierShapePhaseLoss.decompose(output_seq.detach(), target_seq)
+        running_shape += sh.item() * seq.size(0)
+        running_location += lo.item() * seq.size(0)
 
         if grad_clip is not None:
             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
@@ -331,6 +408,11 @@ def train_epoch(model, dataloader, optimizer, criterion, device, input_frames, g
                             input_frames=input_frames)
 
     n = len(dataloader.dataset)
+    # Shape/location are logged unweighted and in pixel-MSE units, whatever the
+    # criterion is, so they sum to the plain MSE and stay comparable across
+    # runs with different --shape_weight (or with --fourier_loss off entirely).
+    wandb.log({"train_shape_loss": running_shape / n,
+               "train_location_loss": running_location / n})
     # (pixel loss, dynamics loss). The second is None when the head is absent
     # or unweighted, so the caller can tell "not measured" from "measured 0".
     return running_loss / n, (running_dyn_loss / n if want_dyn_loss else None)
@@ -356,6 +438,8 @@ def eval_epoch(model, dataloader, criterion, device, input_frames, epoch, split_
     predict = decoder_velocity_mode == "predicted"
     running_loss = 0.0
     running_trivial = 0.0
+    running_shape = 0.0
+    running_location = 0.0
     velocity_metrics = VelocityMetrics()
     has_velocity_data = False
 
@@ -386,6 +470,12 @@ def eval_epoch(model, dataloader, criterion, device, input_frames, epoch, split_
             # makes "are we beating nothing at all?" impossible to miss.
             running_trivial += criterion(torch.zeros_like(target_seq),
                                          target_seq).item() * seq.size(0)
+            # Logged for every split and every criterion, so the two halves of
+            # the error are trackable side by side: shape is what the renderer
+            # owns, location is what a velocity owns.
+            sh, lo = FourierShapePhaseLoss.decompose(output_seq, target_seq)
+            running_shape += sh.item() * seq.size(0)
+            running_location += lo.item() * seq.size(0)
             pbar.set_postfix({"loss": f"{batch_loss:.4f}"})
 
             if want_velocity:
@@ -413,7 +503,9 @@ def eval_epoch(model, dataloader, criterion, device, input_frames, epoch, split_
     trivial = running_trivial / n
     loss = running_loss / n
     wandb.log({f"{split_name}_trivial_baseline": trivial,
-               f"{split_name}_vs_trivial": trivial - loss})
+               f"{split_name}_vs_trivial": trivial - loss,
+               f"{split_name}_shape_loss": running_shape / n,
+               f"{split_name}_location_loss": running_location / n})
     if loss > trivial:
         print(f"  WARNING: {split_name} loss {loss:.4f} is WORSE than predicting all zeros "
               f"({trivial:.4f}). The model is being penalised for drawing anything at all -- "

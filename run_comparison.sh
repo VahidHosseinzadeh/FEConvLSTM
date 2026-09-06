@@ -136,6 +136,29 @@ FOURIER_LOSS=1
 SHAPE_WEIGHT=3.0        # >1 punishes blur and blankness harder
 LOCATION_WEIGHT=1.0     # where a pure translation puts ALL of its error
 
+# LOSS_ROUTING decides WHERE each half's gradient is allowed to land. It never
+# changes the objective's value -- shared and split optimise the same number,
+# so every reported loss stays comparable.
+#
+#   shared  the whole pixel loss reaches every parameter. Default, and what
+#           every run so far has done.
+#   split   shape(+L1) -> encoder/decoder only; location -> velocity head only.
+#
+# The case for split: under a pure translation the Fourier magnitude spectrum
+# is unchanged, so a displacement's error is ENTIRELY location and the shape
+# term is exactly zero -- shape is error a velocity structurally cannot fix.
+# But the warp is bilinear grid_sample, so a fractional velocity blurs, and the
+# shape term therefore DOES reach the head, rewarding near-integer velocities
+# whether or not they are correct. Split removes that pressure.
+#
+# The catch, measured: with VEL_DYN_GAIN=fixed and DECODER_SAMPLING_P=0 the
+# head is not on the pixel path at all -- every velocity fed to the warp during
+# training is a phase-correlation argmax, which carries no gradient -- so
+# d(pixel loss)/d(head) is exactly 0.0 and split routes the location term to
+# nothing. Turn DECODER_SAMPLING_P up before expecting split to do anything.
+# train.py prints a warning if you ask for split in the dead-path config.
+LOSS_ROUTING=shared
+
 # ---- motion settings: ALSO must be identical across the three runs --------
 # These define the data, so a comparison is only meaningful if all three
 # models saw the same motion. Only the parameters that apply to the chosen
@@ -489,7 +512,8 @@ FE_V_RANGE=$DATA_V_RANGE
 RECON=()
 if [ "$FOURIER_LOSS" = 1 ]; then
   RECON=(--fourier_loss --shape_weight "$SHAPE_WEIGHT"
-         --location_weight "$LOCATION_WEIGHT")
+         --location_weight "$LOCATION_WEIGHT"
+         --loss_routing "$LOSS_ROUTING")
 fi
 
 COMMON=(

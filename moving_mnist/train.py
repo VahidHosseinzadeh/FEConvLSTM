@@ -55,6 +55,29 @@ class FourierPlusL1Loss(nn.Module):
         self.last_parts = parts
         return f + self.l1_weight * self.l1(input_seq, target_seq)
 
+    def routed_terms(self, input_seq, target_seq):
+        """The two halves of forward(), as separate tensors: (enc_dec, vel, parts).
+
+        enc_dec + vel is EXACTLY the scalar forward() returns, so routing
+        changes only WHERE each half's gradient is allowed to land -- never the
+        value of the objective, and never the reported loss.
+
+        The split follows the Fourier identity: under a pure translation the
+        magnitude spectrum is unchanged, so ALL of a displacement's error sits
+        in the location term and NONE in the shape term. Location is therefore
+        the half a velocity is able to act on, and shape the half it is not.
+        L1 goes with the shape half: it is a rendering/sparsity term on pixel
+        values, not a statement about where the ink belongs.
+        """
+        shape, location = FourierShapePhaseLoss.decompose(input_seq, target_seq)
+        enc_dec = (self.fourier.shape_weight * shape
+                   + self.l1_weight * self.l1(input_seq, target_seq))
+        vel = self.fourier.location_weight * location
+        self.last_parts = {"shape": shape.detach(),
+                           "location": location.detach(),
+                           "mse": (shape + location).detach()}
+        return enc_dec, vel, self.last_parts
+
 
 def log_length_generalization_curve(gen_mean, gen_std, gen_pred_frames, args):
     steps = np.arange(1, gen_pred_frames + 1)
@@ -283,6 +306,20 @@ def main():
     parser.add_argument('--location_weight', type=float, default=1.0,
                         help='--fourier_loss only: weight on the location term, which is where a '
                              'pure translation puts ALL of its error.')
+    parser.add_argument('--loss_routing', choices=['shared', 'split'], default='shared',
+                        help="Where each half of the decomposed pixel loss is allowed to send "
+                             "gradient. 'shared' (default) backpropagates the whole loss into "
+                             "every parameter, as always. 'split' sends the shape term (+L1) only "
+                             "to the encoder/decoder and the location term only to the velocity "
+                             "head. The objective VALUE is identical either way -- only the "
+                             "gradient paths differ -- so the reported losses stay comparable. "
+                             "Rationale: under a pure translation the magnitude spectrum is "
+                             "unchanged, so location is the entire error a velocity can act on "
+                             "and shape is error it cannot. Because the warp is bilinear, though, "
+                             "the shape term DOES reach the head through interpolation blur, "
+                             "which rewards near-integer velocities regardless of whether they "
+                             "are right; 'split' removes that. Needs --fourier_loss and "
+                             "--use_velocity_dynamics. Costs one extra backward pass per batch.")
     parser.add_argument('--grad_clip', type=float, default=1.0, help='Gradient clipping value (default: 1.0, None for no clipping)')
     parser.add_argument('--wandb_entity', type=str, default=None, help='Wandb entity')
     parser.add_argument('--wandb_project', type=str, default="FERNN", help='Wandb project')
@@ -800,6 +837,22 @@ def main():
               f"location x{args.location_weight} (+ L1). "
               f"{'== plain MSE+L1' if args.shape_weight == args.location_weight == 1.0 else ''}")
 
+    if args.loss_routing == 'split':
+        print("Gradient routing: SPLIT -- shape(+L1) -> encoder/decoder, "
+              "location -> velocity head. Objective value unchanged.")
+        # Routing the location term at the head is only meaningful if the head
+        # is ON the pixel path. With a fixed gain and no scheduled sampling it
+        # is not: every velocity fed to the warp during training is a phase
+        # correlation measurement, which is an argmax and carries no gradient,
+        # so d(pixel loss)/d(head) is exactly zero and the routed half lands
+        # nowhere. Measured, not assumed -- see tests/test_loss_routing.py.
+        if args.decoder_sampling_p == 0.0 and args.vel_dyn_gain == 'fixed':
+            print("  WARNING: the velocity head is not on the pixel path "
+                  "(--decoder_sampling_p 0 and --vel_dyn_gain fixed), so the "
+                  "pixel loss gives it ZERO gradient and routing the location "
+                  "term to it is a no-op. It still trains from --vel_dyn_loss_weight. "
+                  "Raise --decoder_sampling_p to make the routing bite.")
+
     scheduler = None
     if args.use_lr_scheduler:
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -885,7 +938,8 @@ def main():
                                         args.grad_clip, curve_recorder=curve_recorder,
                                         show_h_state=args.show_h_state,
                                         vel_dyn_loss_weight=args.vel_dyn_loss_weight,
-                                        decoder_sampling_p=samp_p)
+                                        decoder_sampling_p=samp_p,
+                                        loss_routing=args.loss_routing)
         epoch_time = time.time() - epoch_start
         val_loss = eval_fn(model, val_loader, criterion, device, args.input_frames, epoch, split_name="val",
                            show_h_state=args.show_h_state)
