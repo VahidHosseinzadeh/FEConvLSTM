@@ -90,6 +90,14 @@ GEN_SEQ_LEN=35     # = GEN_INPUT + 20 predicted frames, i.e. 2x the trained hori
                    # misplaced digit already scores worse than a blank frame,
                    # so most of an 85-frame curve measures how fast the model
                    # gives up, not how well it extrapolates.
+NUM_DIGITS=1       # Digits per sequence, and NUM_VEL_MODES follows it below.
+                   # 1 is the DEBUGGING configuration and the current default:
+                   # with a single digit the correlation surface has one
+                   # unambiguous peak, so the velocity measurement is exact
+                   # (verified: 100% frame-to-frame) and any remaining failure
+                   # belongs to the model rather than to the measurement. If the
+                   # velocity head cannot be made to work at one digit it
+                   # certainly cannot at two. Raise to 2 once it does.
 IMAGE=64           # The MNIST digit is 28 px and is CENTRED, never scaled, at any
                    # image_size -- so this is really "how much room does the motion
                    # have relative to the digit". At 36 an orbit of radius ~13 px is
@@ -309,10 +317,10 @@ USE_VEL_DYN=1           # 0 = off, exactly the pre-head melstm. The ablation
 VEL_DYN_LOSS_W=1.0      # weight on smooth_l1(u_pred, v_measured). MUST be > 0
                         # or the head never trains and predicts the frozen
                         # velocity forever -- the "on but useless" trap.
-VEL_DYN_STATE_DIM=64    # GRU hidden size, per slot. Tiny next to the cell,
+VEL_DYN_STATE_DIM=32    # GRU hidden size, per slot. Tiny next to the cell,
                         # so this is cheap: 3.5k params at 32/1 layer,
                         # 9.9k at 32/2 layers.
-VEL_DYN_ARCH=recurrence # gru        : emit the velocity increment directly.
+VEL_DYN_ARCH=gru        # gru        : emit the velocity increment directly.
                         # recurrence : emit the COEFFICIENTS of a stable
                         #              second-order linear recurrence
                         #              du_{t+1} = a1 du_t + a2 du_{t-1}, with
@@ -324,7 +332,15 @@ VEL_DYN_ARCH=recurrence # gru        : emit the velocity increment directly.
                         # weakness: the gru head reached 0.1179 val_predicted
                         # against a ONE-STEP-LAGGED ceiling of 0.1149 -- i.e.
                         # it had learned to lag rather than to extrapolate.
-VEL_DYN_LAYERS=2        # stacked GRU layers in the head
+VEL_DYN_LAYERS=1        # stacked GRU layers in the head
+                        #
+                        # ARCH/LAYERS/STATE_DIM and DECODER_SAMPLING_P below are
+                        # all back at the configuration that produced
+                        # val_predicted_loss = 0.1179 (against a frozen ceiling
+                        # of 0.1574 and a one-step-lag ceiling of 0.1149). The
+                        # follow-up run changed all four AT ONCE plus the eval
+                        # protocol, so nothing in it could be attributed. Change
+                        # ONE of them per run from here.
 VEL_DYN_V_MAX=$DATA_V_RANGE
                         # Hard clamp on the predicted speed. The data is bounded
                         # by |v| <= DATA_V_RANGE by construction, so anything
@@ -395,7 +411,7 @@ TRACK_CORR_ALPHA=1.0    # Whitening of the TRACKING correlator, track(h, X_t).
                         # NOTE this cannot affect motion equivariance: |R| is
                         # invariant to a shift of either input, so alpha changes
                         # how reliably the peak is found, never where it is.
-DECODER_SAMPLING_P=0.25 # Scheduled sampling on the decoder velocity: fraction of
+DECODER_SAMPLING_P=0.0  # Scheduled sampling on the decoder velocity: fraction of
 DECODER_SAMPLING_RAMP=10 # training rollouts that use the head's own predicted
                         # velocity instead of the tracked measurement, ramped in
                         # over this many epochs.
@@ -408,7 +424,7 @@ DECODER_SAMPLING_RAMP=10 # training rollouts that use the head's own predicted
                         # the model was actively learning to need the oracle,
                         # and had no gradient path that could teach it otherwise.
                         # 0 = off.
-EVAL_VEL_MODE=predicted # frozen    : honest inference only (cheapest)
+EVAL_VEL_MODE=all       # frozen    : honest inference only (cheapest)
                         # both      : + oracle GT-tracked val
                         # all       : + head-predicted val. Logs val_loss,
                         #             val_predicted_loss and val_tracked_loss
@@ -417,7 +433,15 @@ EVAL_VEL_MODE=predicted # frozen    : honest inference only (cheapest)
                         #             tracked < predicted < frozen.
                         #             Costs two extra val passes per epoch.
                         #
-                        # DEFAULT IS NOW 'predicted', because 'frozen' is a
+                        # NOTE the mode changes what the VELOCITY TABLE reports
+                        # for decoder steps: under 'tracked' it is the measured
+                        # velocity, under 'predicted' it is the head's own
+                        # output. Those are different quantities and are not
+                        # comparable across runs -- and exact-match accuracy is
+                        # a poor metric for a continuous predictor anyway, so
+                        # read mean_l2 for the predicted arm.
+                        #
+                        # 'frozen' should never DRIVE selection, because it is a
                         # SATURATED metric here: a model with PERFECT appearance
                         # but a frozen velocity scores 0.1574, and the trained
                         # model already scores 0.1561. It cannot improve, yet it
@@ -446,6 +470,7 @@ fi
 
 COMMON=(
   "${MOTION[@]}"
+  --num_digits "$NUM_DIGITS"
   "${RECON[@]}"
   --hidden_size "$HIDDEN"
   --decoder_hidden_size "$DEC_HIDDEN"
@@ -475,7 +500,7 @@ COMMON=(
 # Expensive: full fixed-velocity test set per (vx,vy) pair, at every new best.
 # COMMON+=(--run_velocity_generalization --gen_vel_min -3 --gen_vel_max 3)
 
-RUN_TAG="h${HIDDEN}_${MOTION_TAG}_s${SEED}"   # motion is in the name so a sweep
+RUN_TAG="h${HIDDEN}_n${NUM_DIGITS}_${MOTION_TAG}_s${SEED}"   # motion is in the name so a sweep
                                            # gives distinguishable wandb runs
 # the objective is part of the run's identity too -- two runs with different
 # loss weights are not comparable and should not look alike in wandb
@@ -495,7 +520,7 @@ case $MODEL in
     # velocity-vs-rendering decomposition. MELSTM-only effect.
     ME_EVAL_MODE=$EVAL_VEL_MODE
     ME_TAG=""
-    EXTRA=(--model melstm --num_vel_modes 2)
+    EXTRA=(--model melstm --num_vel_modes "$NUM_DIGITS")
 
     if [ "$USE_VEL_DYN" = 1 ]; then
       EXTRA+=(--use_velocity_dynamics

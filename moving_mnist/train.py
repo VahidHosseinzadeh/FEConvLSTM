@@ -169,7 +169,14 @@ def main():
     parser.add_argument('--max_train_samples', type=int, default=None, help='Maximum number of training samples to use (default: use all)')
     parser.add_argument('--image_size', type=int, default=28)
     parser.add_argument('--v_range', type=int, default=2)
-    parser.add_argument('--num_vel_modes', type=int, default=2, help='Number of velocity modes for MEConvLSTM')
+    parser.add_argument('--num_digits', type=int, default=2,
+                        help='Digits per sequence. 1 is the debugging configuration: with a single '
+                             'digit the correlation surface has one unambiguous peak, so the '
+                             'velocity measurement is exact (verified 100%% frame-to-frame) and any '
+                             "remaining failure belongs to the model rather than the measurement. "
+                             'If it cannot be made to work at 1 it will not work at 2.')
+    parser.add_argument('--num_vel_modes', type=int, default=2,
+                        help='Number of velocity slots for MEConvLSTM (must be >= --num_digits)')
     parser.add_argument('--track_corr_alpha', type=float, default=None,
                         help="MELSTM only: whitening exponent of the TRACKING correlator "
                              "(track(h, X_t)), leaving the bootstrap correlator untouched. "
@@ -428,6 +435,10 @@ def main():
               f"--use_velocity_dynamics; without it the 'predicted' evaluation degrades to "
               f"'frozen' and will report the same number as val_loss.")
 
+    assert args.num_vel_modes >= args.num_digits, (
+        f"--num_vel_modes ({args.num_vel_modes}) must be >= --num_digits ({args.num_digits}): "
+        f"the velocity metrics map digits to slots injectively, and a digit with no slot "
+        f"cannot be tracked at all.")
     assert args.input_frames < args.seq_len, "input_frames must be less than seq_len"
     assert args.gen_input_frames < args.gen_seq_len, "gen_input_frames must be less than gen_seq_len"
     pred_frames = args.seq_len - args.input_frames
@@ -502,7 +513,7 @@ def main():
         root=args.root,
         train=True,
         seq_len=args.seq_len,
-        num_digits=2,
+        num_digits=args.num_digits,
         image_size=args.image_size,
         max_speed=args.data_v_range,
 
@@ -539,7 +550,7 @@ def main():
         root=args.root,
         train=False,
         seq_len=args.seq_len,
-        num_digits=2,
+        num_digits=args.num_digits,
         image_size=args.image_size,
         max_speed=args.data_v_range,
 
@@ -576,7 +587,7 @@ def main():
         root=args.root,
         train=False,
         seq_len=args.gen_seq_len,
-        num_digits=2,
+        num_digits=args.num_digits,
         image_size=args.image_size,
         max_speed=args.data_v_range,
 
