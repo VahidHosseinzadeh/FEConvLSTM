@@ -53,6 +53,9 @@ def build_model(cfg):
             vel_dyn_use_h=get("vel_dyn_use_h", False),
             vel_dyn_gain=get("vel_dyn_gain", "fixed"),
             vel_dyn_openloop_k=get("vel_dyn_openloop_k", 0),
+            vel_dyn_arch=get("vel_dyn_arch", "gru"),
+            vel_dyn_layers=get("vel_dyn_layers", 1),
+            vel_dyn_v_max=get("vel_dyn_v_max", None),
             track_corr_alpha=get("track_corr_alpha", None))
 
     raise ValueError(f"unknown model {name!r}")
@@ -70,7 +73,8 @@ def _unpack_batch(batch, device):
 
 def _run_model(model, input_seq, pred_len, target_seq,
                want_velocity, want_states, track_decoder_velocity=None,
-               predict_decoder_velocity=False, want_dyn_loss=False):
+               predict_decoder_velocity=False, want_dyn_loss=False,
+               decoder_sampling_p=0.0):
     """
     Single call site for every model type.
 
@@ -105,6 +109,7 @@ def _run_model(model, input_seq, pred_len, target_seq,
             target_seq=target_seq,
             track_decoder_velocity=track_decoder_velocity,
             predict_decoder_velocity=predict_decoder_velocity,
+            decoder_sampling_p=decoder_sampling_p,
             return_velocity=want_velocity,
             return_dyn_loss=want_dyn_loss,
             return_states=want_states,
@@ -247,7 +252,8 @@ class ValCurveRecorder:
 
 
 def train_epoch(model, dataloader, optimizer, criterion, device, input_frames, grad_clip=None,
-                curve_recorder=None, show_h_state=False, vel_dyn_loss_weight=0.0):
+                curve_recorder=None, show_h_state=False, vel_dyn_loss_weight=0.0,
+                decoder_sampling_p=0.0):
     """
     vel_dyn_loss_weight : weight on the velocity dynamics head's one-step-ahead
         loss (--vel_dyn_loss_weight). 0.0 (default) leaves both the objective
@@ -276,7 +282,7 @@ def train_epoch(model, dataloader, optimizer, criterion, device, input_frames, g
         optimizer.zero_grad()
         output_seq, pred_motion, states, dyn_loss = _run_model(
             model, input_seq, pred_len, target_seq, want_velocity, want_states,
-            want_dyn_loss=want_dyn_loss,
+            want_dyn_loss=want_dyn_loss, decoder_sampling_p=decoder_sampling_p,
         )
         # Image loss and total objective are kept separate on purpose: the
         # reported/curve-recorded train_loss must stay the pixel loss, or

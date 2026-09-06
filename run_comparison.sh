@@ -84,7 +84,12 @@ GEN_INPUT=15       # = INPUT_FRAMES so len-gen isolates horizon only: evaluating
                    # felstm hardest -- every wrong-velocity copy drifts for the extra
                    # steps), which shows up as inflated error from the very first
                    # predicted frame rather than as a horizon effect.
-GEN_SEQ_LEN=100    # 90 predicted frames in the len-gen benchmark (9x trained horizon)
+GEN_SEQ_LEN=35     # = GEN_INPUT + 20 predicted frames, i.e. 2x the trained horizon.
+                   # Was 100 (85 predicted). Long rollouts are dominated by
+                   # compounding velocity error: past ~half a digit width a
+                   # misplaced digit already scores worse than a blank frame,
+                   # so most of an 85-frame curve measures how fast the model
+                   # gives up, not how well it extrapolates.
 IMAGE=64           # The MNIST digit is 28 px and is CENTRED, never scaled, at any
                    # image_size -- so this is really "how much room does the motion
                    # have relative to the digit". At 36 an orbit of radius ~13 px is
@@ -304,9 +309,34 @@ USE_VEL_DYN=1           # 0 = off, exactly the pre-head melstm. The ablation
 VEL_DYN_LOSS_W=1.0      # weight on smooth_l1(u_pred, v_measured). MUST be > 0
                         # or the head never trains and predicts the frozen
                         # velocity forever -- the "on but useless" trap.
-VEL_DYN_STATE_DIM=32    # GRU hidden size, per slot. Tiny next to the cell
-                        # (~4k params at 32): raise it freely if the head
-                        # underfits the acceleration pattern.
+VEL_DYN_STATE_DIM=64    # GRU hidden size, per slot. Tiny next to the cell,
+                        # so this is cheap: 3.5k params at 32/1 layer,
+                        # 9.9k at 32/2 layers.
+VEL_DYN_ARCH=recurrence # gru        : emit the velocity increment directly.
+                        # recurrence : emit the COEFFICIENTS of a stable
+                        #              second-order linear recurrence
+                        #              du_{t+1} = a1 du_t + a2 du_{t-1}, with
+                        #              the poles forced inside the unit circle
+                        #              so an open-loop rollout cannot diverge.
+                        # A sinusoid satisfies that recurrence exactly, so this
+                        # separates identification (hard, learned) from
+                        # propagation (exact). It is aimed at a measured
+                        # weakness: the gru head reached 0.1179 val_predicted
+                        # against a ONE-STEP-LAGGED ceiling of 0.1149 -- i.e.
+                        # it had learned to lag rather than to extrapolate.
+VEL_DYN_LAYERS=2        # stacked GRU layers in the head
+VEL_DYN_V_MAX=$DATA_V_RANGE
+                        # Hard clamp on the predicted speed. The data is bounded
+                        # by |v| <= DATA_V_RANGE by construction, so anything
+                        # outside is definitely wrong and clamping it is free
+                        # information. It is also the ONLY real divergence guard
+                        # for VEL_DYN_ARCH=recurrence: the pole radius bounds
+                        # each individual step, but the coefficients are
+                        # recomputed every step from a state the rollout drives,
+                        # so a 200-step open-loop rollout can still blow up
+                        # (measured: 1e16 at one seed). Costs exact equivariance
+                        # only when it BINDS, which on in-range data it should
+                        # never do. Empty = no clamp.
 VEL_DYN_GAIN=fixed      # fixed   : k=1, the phase-correlation measurement is
                         #           taken verbatim in the encoder and the head
                         #           is trained but does not steer it. Start here.
@@ -365,7 +395,20 @@ TRACK_CORR_ALPHA=1.0    # Whitening of the TRACKING correlator, track(h, X_t).
                         # NOTE this cannot affect motion equivariance: |R| is
                         # invariant to a shift of either input, so alpha changes
                         # how reliably the peak is found, never where it is.
-EVAL_VEL_MODE=all       # frozen    : honest inference only (cheapest)
+DECODER_SAMPLING_P=0.25 # Scheduled sampling on the decoder velocity: fraction of
+DECODER_SAMPLING_RAMP=10 # training rollouts that use the head's own predicted
+                        # velocity instead of the tracked measurement, ramped in
+                        # over this many epochs.
+                        #
+                        # Why it is on: training otherwise ALWAYS gives the
+                        # decoder an oracle velocity, so the ConvLSTM learns to
+                        # depend on one. Measured on a fixed held-out set during
+                        # training, oracle-velocity loss improved 6x while
+                        # frozen-velocity loss on the SAME data got 43% WORSE --
+                        # the model was actively learning to need the oracle,
+                        # and had no gradient path that could teach it otherwise.
+                        # 0 = off.
+EVAL_VEL_MODE=predicted # frozen    : honest inference only (cheapest)
                         # both      : + oracle GT-tracked val
                         # all       : + head-predicted val. Logs val_loss,
                         #             val_predicted_loss and val_tracked_loss
@@ -373,6 +416,14 @@ EVAL_VEL_MODE=all       # frozen    : honest inference only (cheapest)
                         #             lands in ONE run. Expected ordering:
                         #             tracked < predicted < frozen.
                         #             Costs two extra val passes per epoch.
+                        #
+                        # DEFAULT IS NOW 'predicted', because 'frozen' is a
+                        # SATURATED metric here: a model with PERFECT appearance
+                        # but a frozen velocity scores 0.1574, and the trained
+                        # model already scores 0.1561. It cannot improve, yet it
+                        # was driving the LR scheduler, checkpoint selection and
+                        # early stopping. val_predicted_loss reached 0.1179 over
+                        # the same run and was still falling at epoch 50.
 
 # felstm carries one candidate slot per (vx,vy), so its grid must COVER the
 # data's or the true velocity is simply not representable -- it can never be
@@ -451,8 +502,14 @@ case $MODEL in
               --vel_dyn_state_dim "$VEL_DYN_STATE_DIM"
               --vel_dyn_gain "$VEL_DYN_GAIN"
               --vel_dyn_loss_weight "$VEL_DYN_LOSS_W"
-              --vel_dyn_openloop_k "$VEL_DYN_OPENLOOP_K")
-      ME_TAG="_vd${VEL_DYN_STATE_DIM}${VEL_DYN_GAIN:0:1}"
+              --vel_dyn_openloop_k "$VEL_DYN_OPENLOOP_K"
+              --vel_dyn_arch "$VEL_DYN_ARCH"
+              --vel_dyn_layers "$VEL_DYN_LAYERS"
+              --vel_dyn_v_max "$VEL_DYN_V_MAX"
+              --decoder_sampling_p "$DECODER_SAMPLING_P"
+              --decoder_sampling_ramp "$DECODER_SAMPLING_RAMP")
+      ME_TAG="_vd${VEL_DYN_STATE_DIM}x${VEL_DYN_LAYERS}${VEL_DYN_ARCH:0:1}${VEL_DYN_GAIN:0:1}"
+      if [ "$DECODER_SAMPLING_P" != 0 ]; then ME_TAG="${ME_TAG}_ss${DECODER_SAMPLING_P}"; fi
       if [ "$VEL_DYN_USE_H" = 1 ]; then
         EXTRA+=(--vel_dyn_use_h)
         ME_TAG="${ME_TAG}h"

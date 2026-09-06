@@ -121,3 +121,113 @@ def test_forward_is_unchanged_at_the_default():
         b = build(track_corr_alpha=1.0)(x, pred_len=3, target_seq=None,
                                         track_decoder_velocity=False)
     assert torch.equal(a, b)
+
+
+# ----------------------------------------------------------------------
+# Head architecture and scheduled sampling (added with those features)
+# ----------------------------------------------------------------------
+
+from velocity_dynamics_model import VelocityDynamicsHead  # noqa: E402
+
+
+@pytest.mark.parametrize("arch", ["gru", "recurrence"])
+@pytest.mark.parametrize("layers", [1, 2])
+def test_head_is_identity_at_init(arch, layers):
+    """Both architectures must nest the frozen rollout exactly at init."""
+    head = VelocityDynamicsHead(state_dim=16, arch=arch, n_layers=layers)
+    u, du = torch.randn(3, 2, 2), torch.randn(3, 2, 2)
+    st = head.init_state(3, 2, u.device, u.dtype)
+    u_next, _ = head(u, du, None, st)
+    assert torch.equal(u_next, u)
+
+
+@pytest.mark.parametrize("arch", ["gru", "recurrence"])
+@pytest.mark.parametrize("layers", [1, 2])
+def test_head_equivariance(arch, layers):
+    """g(u+v, roll(h,s)) == g(u,h) + v, for every architecture."""
+    torch.manual_seed(0)
+    head = VelocityDynamicsHead(state_dim=16, arch=arch, n_layers=layers).double()
+    for p in head.parameters():
+        torch.nn.init.normal_(p, std=0.4)
+    u_hist = [torch.randn(3, 2, 2, dtype=torch.double) for _ in range(6)]
+    c = torch.randn(1, 1, 2, dtype=torch.double)
+
+    def roll(hist):
+        st = head.init_state(3, 2, torch.device("cpu"), torch.double)
+        prev, out = None, None
+        for u in hist:
+            du = torch.zeros_like(u) if prev is None else u - prev
+            out, st = head(u, du, None, st)
+            prev = u
+        return out
+
+    assert torch.allclose(roll([u + c for u in u_hist]), roll(u_hist) + c, atol=1e-5)
+
+
+def _open_loop(head, steps=200, seed=1):
+    torch.manual_seed(seed)
+    for _, p in head.named_parameters():
+        torch.nn.init.normal_(p, std=1.0)
+    u = torch.randn(4, 2, 2)
+    st = head.init_state(4, 2, u.device, u.dtype)
+    du = torch.randn(4, 2, 2)
+    with torch.no_grad():
+        for _ in range(steps):
+            nxt, st = head(u, du, None, st)
+            du, u = nxt - u, nxt
+    return u
+
+
+def test_pole_bound_alone_is_not_a_divergence_proof():
+    """
+    Documents a NEGATIVE result so nobody re-derives the wrong guarantee from
+    the parametrisation. Both poles sit at radius rho < 1, so every INDIVIDUAL
+    step contracts -- but the coefficients are recomputed each step from a
+    state the rollout itself drives, so this is a switched linear system and
+    the product of contractive matrices can still grow. Whether it actually
+    blows up is seed-dependent (measured: 7.1 at one seed, 1e16 at another),
+    which is exactly the point -- it is not bounded, so it is not a guarantee.
+    Asserted as a spread across seeds rather than a single blow-up, since any
+    one seed is flaky.
+    """
+    worst = max(_open_loop(VelocityDynamicsHead(state_dim=16, arch="recurrence"),
+                           seed=s).abs().max().item()
+                for s in range(6))
+    assert worst > 50.0, (
+        f"worst-case open-loop magnitude over 6 seeds was only {worst:.1f}; if the "
+        f"rollout is now genuinely bounded the guarantee may be real and this "
+        f"test should be replaced by a positive one")
+
+
+@pytest.mark.parametrize("arch", ["gru", "recurrence"])
+def test_v_max_is_what_actually_bounds_the_rollout(arch):
+    """v_max is the hard guard, and the data's own speed limit is its natural
+    value. It costs exact equivariance only when it binds, which on in-range
+    data it never should."""
+    u = _open_loop(VelocityDynamicsHead(state_dim=16, arch=arch, v_max=8.0))
+    assert torch.isfinite(u).all()
+    assert u.abs().max() <= 8.0 + 1e-6, f"v_max did not hold: {u.abs().max().item()}"
+
+
+def test_scheduled_sampling_is_off_by_default_and_train_only():
+    """p=0 must reproduce the tracked protocol bitwise; p=1 must change it;
+    and neither must have any effect in eval mode."""
+    torch.manual_seed(3)
+    x = torch.rand(2, 5, 1, H, W)
+    tgt = torch.rand(2, 3, 1, H, W)
+
+    def run(p, training):
+        torch.manual_seed(4)
+        m = Seq2SeqMEConvLSTM(input_channels=1, hidden_channels=8, n_slots=2,
+                              decoder_layers=1, use_velocity_dynamics=True)
+        m.train(training)
+        torch.manual_seed(5)                        # fix the sampling coin too
+        with torch.no_grad():
+            return m(x, pred_len=3, target_seq=tgt, track_decoder_velocity=True,
+                     decoder_sampling_p=p)
+
+    assert torch.equal(run(0.0, True), run(0.0, True))
+    assert not torch.equal(run(0.0, True), run(1.0, True)), \
+        "p=1 must actually switch the decoder onto the head"
+    assert torch.equal(run(0.0, False), run(1.0, False)), \
+        "scheduled sampling must never fire outside training"

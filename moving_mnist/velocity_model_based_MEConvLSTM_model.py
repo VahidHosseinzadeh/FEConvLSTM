@@ -178,7 +178,9 @@ class Seq2SeqMEConvLSTM(nn.Module):
                  vel_dyn_gain='fixed',
                  vel_dyn_h_embed_dim=16,
                  vel_dyn_v_max=None,
-                 vel_dyn_openloop_k=0):
+                 vel_dyn_openloop_k=0,
+                 vel_dyn_arch='gru',
+                 vel_dyn_layers=1):
         super().__init__()
 
         self.batch_first     = batch_first
@@ -252,6 +254,8 @@ class Seq2SeqMEConvLSTM(nn.Module):
                 use_h=vel_dyn_use_h,
                 h_embed_dim=vel_dyn_h_embed_dim,
                 v_max=vel_dyn_v_max,
+                arch=vel_dyn_arch,
+                n_layers=vel_dyn_layers,
             )
             if vel_dyn_gain == 'learned':
                 # Kalman-ish gain from the correlation peak strength: a weak
@@ -349,6 +353,7 @@ class Seq2SeqMEConvLSTM(nn.Module):
                 target_seq=None,
                 track_decoder_velocity=True,
                 predict_decoder_velocity=False,
+                decoder_sampling_p=0.0,
                 return_velocity=False,
                 return_dyn_loss=False,
                 return_states=False):
@@ -364,6 +369,19 @@ class Seq2SeqMEConvLSTM(nn.Module):
             inference behavior — regardless of whether target_seq is given
             (so velocity metrics/losses can still be computed against a
             target without leaking its motion into the prediction).
+        decoder_sampling_p : scheduled sampling on the DECODER VELOCITY. With
+            this probability, a training step runs the decoder on the head's
+            own predicted velocity instead of the tracked measurement. It
+            exists because the model is otherwise optimised in a regime it is
+            never evaluated in: training always hands the decoder an oracle
+            velocity, so the ConvLSTM learns to depend on one and is never
+            given a gradient that would let it cope without. Measured on a
+            fixed held-out set while training, the two protocols pull apart --
+            oracle-velocity loss improved 6x while frozen-velocity loss on the
+            SAME data got 43% worse. The coin is flipped once per forward call
+            rather than per step, so each rollout is a coherent protocol rather
+            than a mixture. Only active in training mode, and only with the
+            dynamics head present. 0.0 = off, previous behaviour exactly.
         predict_decoder_velocity : the third decoder mode. Requires
             use_velocity_dynamics. The dynamics head rolls the velocity
             forward with no measurement at all (k = 0) — deployable like
@@ -498,13 +516,18 @@ class Seq2SeqMEConvLSTM(nn.Module):
                 u_ol  = u_ol_next
 
         # ---- Decoder ------------------------------------------------
+        # Scheduled sampling: decided once for the whole rollout (see the
+        # docstring) and only while training.
+        sample_predicted = (self.training and use_dyn and decoder_sampling_p > 0.0
+                            and random.random() < decoder_sampling_p)
+
         prev_frame = input_seq[:, -1]
         outputs    = []
 
         for t in range(pred_len):
             current_frame = prev_frame.detach()
 
-            if target_seq is not None and track_decoder_velocity:
+            if target_seq is not None and track_decoder_velocity and not sample_predicted:
                 v = self.track_velocities(h, target_seq[:, t])
                 if use_dyn:
                     # The oracle measurement still wins, but the head is run
@@ -520,7 +543,7 @@ class Seq2SeqMEConvLSTM(nn.Module):
                     n_meas += 1
                 estimated_velocities.append(v.clone().detach())
 
-            elif use_dyn and predict_decoder_velocity:
+            elif use_dyn and (predict_decoder_velocity or sample_predicted):
                 # No measurement exists here, so k = 0: the process model runs
                 # the velocity forward on its own. Gradients from the image
                 # loss do reach the head through the warp, which is intended —

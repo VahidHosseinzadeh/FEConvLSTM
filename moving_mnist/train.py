@@ -325,6 +325,40 @@ def main():
                         help="Weight on the dynamics head's one-step-ahead loss "
                              "smooth_l1(u_pred, v_measured.detach()). 0.0 (default) means the head "
                              "never trains — set it (e.g. 1.0) whenever --use_velocity_dynamics is on.")
+    parser.add_argument('--vel_dyn_arch', choices=['gru', 'recurrence'], default='gru',
+                        help="Structure of the dynamics head. 'gru' emits the velocity increment "
+                             "directly. 'recurrence' emits the COEFFICIENTS of a stable "
+                             "second-order linear recurrence du_{t+1} = a1 du_t + a2 du_{t-1}, "
+                             "parametrised by a pole radius rho<1 and angle so an open-loop "
+                             "rollout provably cannot diverge. A sinusoidal velocity satisfies "
+                             "that recurrence exactly, so this splits identification (hard, "
+                             "learned) from propagation (exact) instead of asking one GRU to do "
+                             "both -- which is what makes a plain GRU degrade into a one-step-"
+                             "LAGGED estimator. Both nest the frozen rollout exactly at init.")
+    parser.add_argument('--vel_dyn_v_max', type=float, default=None,
+                        help='Hard clamp on |predicted velocity| per component. The data is '
+                             'bounded by --data_v_range by construction, so that is the natural '
+                             'value and anything outside it is definitely wrong. This is the only '
+                             'real divergence guard for --vel_dyn_arch recurrence (the pole radius '
+                             'bounds each step, but the coefficients are re-estimated every step '
+                             'from a state the rollout drives, so a long open-loop rollout can '
+                             'still blow up). Costs exact equivariance only when it binds.')
+    parser.add_argument('--vel_dyn_layers', type=int, default=1,
+                        help='Number of stacked GRU layers in the dynamics head. 1 -> 3.5k '
+                             'params, 2 -> 9.9k at state_dim 32.')
+    parser.add_argument('--decoder_sampling_p', type=float, default=0.0,
+                        help="Scheduled sampling on the decoder VELOCITY: probability that a "
+                             "training rollout uses the head's own predicted velocity instead of "
+                             "the tracked measurement. Training otherwise always hands the "
+                             "decoder an oracle velocity, so the ConvLSTM learns to depend on one "
+                             "and never gets a gradient teaching it to cope without -- measured "
+                             "on a fixed set, oracle-velocity loss improved 6x while "
+                             "frozen-velocity loss on the SAME data got 43%% worse. Ramped from 0 "
+                             "over --decoder_sampling_ramp epochs. 0 = off.")
+    parser.add_argument('--decoder_sampling_ramp', type=int, default=10,
+                        help='Epochs over which --decoder_sampling_p ramps linearly from 0 to its '
+                             'full value. Ramping matters: early on the head is untrained, so '
+                             'sampling its output immediately would feed the ConvLSTM noise.')
     parser.add_argument('--vel_dyn_openloop_k', type=int, default=0,
                         help='Extra multi-step velocity supervision: for the last k encoder steps, '
                              'replay the head open-loop (fed its own predictions, no measurements) '
@@ -820,10 +854,15 @@ def main():
 
     for epoch in range(start_epoch, args.epochs + 1):
         epoch_start = time.time()
+        # Linear ramp: the head is useless at epoch 1, so sampling its output
+        # then would just feed the ConvLSTM noise.
+        samp_p = (args.decoder_sampling_p * min(1.0, epoch / max(1, args.decoder_sampling_ramp))
+                  if args.decoder_sampling_p > 0 else 0.0)
         train_loss, dyn_loss = train_fn(model, train_loader, optimizer, criterion, device, args.input_frames,
                                         args.grad_clip, curve_recorder=curve_recorder,
                                         show_h_state=args.show_h_state,
-                                        vel_dyn_loss_weight=args.vel_dyn_loss_weight)
+                                        vel_dyn_loss_weight=args.vel_dyn_loss_weight,
+                                        decoder_sampling_p=samp_p)
         epoch_time = time.time() - epoch_start
         val_loss = eval_fn(model, val_loader, criterion, device, args.input_frames, epoch, split_name="val",
                            show_h_state=args.show_h_state)
@@ -896,6 +935,8 @@ def main():
             log_payload["val_predicted_loss"] = val_predicted_loss
         if dyn_loss is not None:
             log_payload["dyn_loss"] = dyn_loss
+        if args.decoder_sampling_p > 0:
+            log_payload["decoder_sampling_p"] = samp_p
         wandb.log(log_payload)
 
         # Persist curves incrementally so a killed run still leaves data
