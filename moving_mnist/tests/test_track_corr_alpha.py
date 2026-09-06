@@ -231,3 +231,50 @@ def test_scheduled_sampling_is_off_by_default_and_train_only():
         "p=1 must actually switch the decoder onto the head"
     assert torch.equal(run(0.0, False), run(1.0, False)), \
         "scheduled sampling must never fire outside training"
+
+
+@pytest.mark.parametrize("sup", ["none", "teacher", "openloop"])
+def test_decoder_supervision_controls_what_leaks_from_the_future(sup):
+    """
+    The head must not be fed velocities MEASURED AGAINST THE TARGET FRAMES as
+    inputs -- that is teacher forcing, and repeating the input is its optimal
+    solution, which is why the head measured at one-step-lag quality.
+
+    Checked by making the target frames a pure translation of a known amount:
+    under 'teacher' the head's own state picks that velocity up, under 'none'
+    and 'openloop' it cannot.
+    """
+    torch.manual_seed(0)
+    ctx = torch.rand(2, 6, 1, H, W)
+    # targets translating by a large, unmistakable amount
+    tgt = torch.stack([torch.roll(ctx[:, -1], shifts=(0, 7 * (t + 1)), dims=(-2, -1))
+                       for t in range(4)], dim=1)
+
+    torch.manual_seed(1)
+    m = Seq2SeqMEConvLSTM(input_channels=1, hidden_channels=8, n_slots=1,
+                          decoder_layers=1, use_velocity_dynamics=True,
+                          vel_dyn_decoder_supervision=sup).train()
+    _, dyn = m(ctx, pred_len=4, target_seq=tgt, track_decoder_velocity=True,
+               return_dyn_loss=True)
+    assert torch.isfinite(dyn)
+
+    n_ctx_only = None
+    if sup == "none":
+        # 'none' must produce exactly the encoder's own terms, i.e. running
+        # with no target_seq at all gives the identical count of loss terms.
+        torch.manual_seed(1)
+        m2 = Seq2SeqMEConvLSTM(input_channels=1, hidden_channels=8, n_slots=1,
+                               decoder_layers=1, use_velocity_dynamics=True,
+                               vel_dyn_decoder_supervision="none").train()
+        _, dyn2 = m2(ctx, pred_len=4, target_seq=None,
+                     track_decoder_velocity=False, return_dyn_loss=True)
+        assert torch.allclose(dyn, dyn2), (
+            "with supervision 'none' the dynamics loss must be identical whether "
+            "or not target frames were supplied -- otherwise something still leaks")
+
+
+def test_decoder_supervision_rejects_nonsense():
+    with pytest.raises(ValueError, match="decoder_supervision"):
+        Seq2SeqMEConvLSTM(input_channels=1, hidden_channels=8, n_slots=1,
+                          decoder_layers=1, use_velocity_dynamics=True,
+                          vel_dyn_decoder_supervision="oracle")

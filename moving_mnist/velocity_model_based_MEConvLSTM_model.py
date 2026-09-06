@@ -180,7 +180,8 @@ class Seq2SeqMEConvLSTM(nn.Module):
                  vel_dyn_v_max=None,
                  vel_dyn_openloop_k=0,
                  vel_dyn_arch='gru',
-                 vel_dyn_layers=1):
+                 vel_dyn_layers=1,
+                 vel_dyn_decoder_supervision='none'):
         super().__init__()
 
         self.batch_first     = batch_first
@@ -241,6 +242,10 @@ class Seq2SeqMEConvLSTM(nn.Module):
         if vel_dyn_gain not in ('fixed', 'learned'):
             raise ValueError(f"vel_dyn_gain must be 'fixed' or 'learned', got {vel_dyn_gain!r}")
 
+        if vel_dyn_decoder_supervision not in ('none', 'teacher', 'openloop'):
+            raise ValueError("vel_dyn_decoder_supervision must be one of "
+                             f"'none'/'teacher'/'openloop', got {vel_dyn_decoder_supervision!r}")
+        self.vel_dyn_decoder_supervision = vel_dyn_decoder_supervision
         self.use_velocity_dynamics = use_velocity_dynamics
         self.vel_dyn_gain          = vel_dyn_gain
         self.vel_dyn_openloop_k    = vel_dyn_openloop_k
@@ -529,17 +534,36 @@ class Seq2SeqMEConvLSTM(nn.Module):
 
             if target_seq is not None and track_decoder_velocity and not sample_predicted:
                 v = self.track_velocities(h, target_seq[:, t])
-                if use_dyn:
-                    # The oracle measurement still wins, but the head is run
-                    # and supervised anyway: these steps are precisely the
-                    # regime it exists for, so they are the most informative
-                    # supervision available and it would be wasteful to skip
-                    # them just because the rollout does not need the output.
+
+                # What, if anything, the velocity head is allowed to take from
+                # the FUTURE frames. v here is measured against target_seq, so
+                # every use of it past this point is information the head will
+                # not have at inference.
+                #
+                #   'none'     the head is not run at all here. Its only
+                #              supervision comes from the context, which is the
+                #              only thing it will ever see. Default.
+                #   'teacher'  run it, feed it the ORACLE previous velocity,
+                #              and score its one-step-ahead output. This was
+                #              the original behaviour and it is why the head
+                #              learned to LAG: "given the true u_t, predict
+                #              u_{t+1}" is a teacher-forced task whose optimal
+                #              solution, when the signal is hard, is to repeat
+                #              the input. Measured at one-step-lag quality
+                #              (0.1179 against a 0.1149 lag ceiling).
+                #   'openloop' run it on its OWN previous output and score that
+                #              against the measurement. The future frames are
+                #              then used only as TARGETS, never as inputs, so
+                #              the head is trained to extrapolate rather than
+                #              to track. Uses target frames; 'none' does not.
+                sup = self.vel_dyn_decoder_supervision
+                if use_dyn and sup != 'none':
                     u_pred, dyn_state = self.vel_dyn(u_prev, du_prev, h, dyn_state)
                     if n_meas >= 1:
                         dyn_terms.append(F.smooth_l1_loss(u_pred, v.detach()))
-                    du_prev = (v - u_prev) if n_meas >= 1 else torch.zeros_like(v)
-                    u_prev  = v
+                    nxt = v if sup == 'teacher' else u_pred
+                    du_prev = (nxt - u_prev) if n_meas >= 1 else torch.zeros_like(nxt)
+                    u_prev  = nxt
                     n_meas += 1
                 estimated_velocities.append(v.clone().detach())
 

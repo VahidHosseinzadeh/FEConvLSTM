@@ -333,6 +333,30 @@ VEL_DYN_ARCH=gru        # gru        : emit the velocity increment directly.
                         # against a ONE-STEP-LAGGED ceiling of 0.1149 -- i.e.
                         # it had learned to lag rather than to extrapolate.
 VEL_DYN_LAYERS=1        # stacked GRU layers in the head
+VEL_DYN_DEC_SUP=none    # What the head may take from the FUTURE frames while
+                        # training (frames INPUT_FRAMES..SEQ_LEN-1, i.e. the
+                        # rollout targets).
+                        #   none     : nothing. The head is supervised only by
+                        #              velocities measured inside the context,
+                        #              which is all it ever has at inference.
+                        #   teacher  : the ORIGINAL behaviour -- at each decoder
+                        #              step the head is handed the ORACLE
+                        #              previous velocity (measured against the
+                        #              target frame) and scored one step ahead.
+                        #              This is why it learned to LAG: repeating
+                        #              a teacher-forced input is the optimal
+                        #              answer to that task when the signal is
+                        #              hard, and the head duly measured at
+                        #              0.1179 against a 0.1149 one-step-lag
+                        #              ceiling.
+                        #   openloop : run the head on its OWN previous output
+                        #              and score that against the measurement.
+                        #              Future frames are then TARGETS but never
+                        #              INPUTS, so it is trained to extrapolate.
+                        #
+                        # Note the head still gets multi-step supervision with
+                        # 'none', from VEL_DYN_OPENLOOP_K -- that replay lives
+                        # entirely inside the context.
                         #
                         # ARCH/LAYERS/STATE_DIM and DECODER_SAMPLING_P below are
                         # all back at the configuration that produced
@@ -529,12 +553,16 @@ case $MODEL in
               --vel_dyn_loss_weight "$VEL_DYN_LOSS_W"
               --vel_dyn_openloop_k "$VEL_DYN_OPENLOOP_K"
               --vel_dyn_arch "$VEL_DYN_ARCH"
+              --vel_dyn_decoder_supervision "$VEL_DYN_DEC_SUP"
               --vel_dyn_layers "$VEL_DYN_LAYERS"
               --vel_dyn_v_max "$VEL_DYN_V_MAX"
               --decoder_sampling_p "$DECODER_SAMPLING_P"
               --decoder_sampling_ramp "$DECODER_SAMPLING_RAMP")
       ME_TAG="_vd${VEL_DYN_STATE_DIM}x${VEL_DYN_LAYERS}${VEL_DYN_ARCH:0:1}${VEL_DYN_GAIN:0:1}"
-      if [ "$DECODER_SAMPLING_P" != 0 ]; then ME_TAG="${ME_TAG}_ss${DECODER_SAMPLING_P}"; fi
+      if [ "$VEL_DYN_DEC_SUP" != none ]; then ME_TAG="${ME_TAG}_${VEL_DYN_DEC_SUP}"; fi
+      if [ "$DECODER_SAMPLING_P" != 0 ] && [ "$DECODER_SAMPLING_P" != 0.0 ]; then
+        ME_TAG="${ME_TAG}_ss${DECODER_SAMPLING_P}"
+      fi
       if [ "$VEL_DYN_USE_H" = 1 ]; then
         EXTRA+=(--vel_dyn_use_h)
         ME_TAG="${ME_TAG}h"

@@ -342,6 +342,18 @@ def main():
                              "learned) from propagation (exact) instead of asking one GRU to do "
                              "both -- which is what makes a plain GRU degrade into a one-step-"
                              "LAGGED estimator. Both nest the frozen rollout exactly at init.")
+    parser.add_argument('--vel_dyn_decoder_supervision',
+                        choices=['none', 'teacher', 'openloop'], default='none',
+                        help="What the velocity head may take from the FUTURE frames during "
+                             "training. 'none' (default): nothing -- it is supervised only by "
+                             "velocities measured inside the context, which is all it will ever "
+                             "have at inference. 'teacher': the original behaviour -- the head is "
+                             "handed the ORACLE previous velocity at each decoder step and scored "
+                             "one step ahead; this is why it learned to LAG, since repeating a "
+                             "teacher-forced input is the optimal answer when the signal is hard "
+                             "(measured at 0.1179 against a 0.1149 one-step-lag ceiling). "
+                             "'openloop': run it on its OWN output and score against the "
+                             "measurement, so future frames are targets but never inputs.")
     parser.add_argument('--vel_dyn_v_max', type=float, default=None,
                         help='Hard clamp on |predicted velocity| per component. The data is '
                              'bounded by --data_v_range by construction, so that is the natural '

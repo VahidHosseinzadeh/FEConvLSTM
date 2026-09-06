@@ -55,6 +55,7 @@ def build_model(cfg):
             vel_dyn_openloop_k=get("vel_dyn_openloop_k", 0),
             vel_dyn_arch=get("vel_dyn_arch", "gru"),
             vel_dyn_layers=get("vel_dyn_layers", 1),
+            vel_dyn_decoder_supervision=get("vel_dyn_decoder_supervision", "none"),
             vel_dyn_v_max=get("vel_dyn_v_max", None),
             track_corr_alpha=get("track_corr_alpha", None))
 
