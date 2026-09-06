@@ -99,6 +99,30 @@ EARLY_STOP_PATIENCE=0   # ~2-3 LR reductions' worth of chances before giving up
 SEED=42
 SAVE_DIR=./experiments
 
+# ---- reconstruction loss: shape / location split -------------------------
+# Applies to ALL THREE models, so it stays a shared setting.
+#
+# Plain MSE on sparse bright-on-black frames has a degenerate minimum at
+# "predict nothing": with a 28 px digit, a correctly drawn but misplaced digit
+# costs the same as a blank frame at ~10 px of displacement and more beyond it.
+#
+#     displaced  2 px : 0.047      displaced 20 px : 0.469
+#     displaced  5 px : 0.117      predict nothing : 0.234
+#     displaced 10 px : 0.234  <-- identical to predicting nothing
+#
+# The first two harmonic runs both sat BEHIND that baseline for their whole
+# length (best val 0.130 and 0.092, against 0.090 for all-zeros).
+#
+# FOURIER_LOSS=1 splits the squared-error half into a translation-invariant
+# "shape" term and a "location" term (exact identity; they sum to the MSE).
+# Raising SHAPE_WEIGHT prices blankness directly -- a blank prediction has zero
+# Fourier magnitude everywhere, so it cannot hide behind roughly-right
+# placement. At weights 1/1 this is EXACTLY the old MSE+L1, so the split is
+# safe to leave on; only the weights change what is optimised.
+FOURIER_LOSS=1
+SHAPE_WEIGHT=3.0        # >1 punishes blur and blankness harder
+LOCATION_WEIGHT=1.0     # where a pure translation puts ALL of its error
+
 # ---- motion settings: ALSO must be identical across the three runs --------
 # These define the data, so a comparison is only meaningful if all three
 # models saw the same motion. Only the parameters that apply to the chosen
@@ -363,8 +387,15 @@ FE_V_RANGE=$DATA_V_RANGE
 # happened: "run_comparison.sh: line 41: 15: command not found"). Array
 # elements need no line-continuation character at all, so this class of
 # corruption can't happen here.
+RECON=()
+if [ "$FOURIER_LOSS" = 1 ]; then
+  RECON=(--fourier_loss --shape_weight "$SHAPE_WEIGHT"
+         --location_weight "$LOCATION_WEIGHT")
+fi
+
 COMMON=(
   "${MOTION[@]}"
+  "${RECON[@]}"
   --hidden_size "$HIDDEN"
   --decoder_hidden_size "$DEC_HIDDEN"
   --decoder_conv_layers "$DEC_LAYERS"
@@ -395,6 +426,11 @@ COMMON=(
 
 RUN_TAG="h${HIDDEN}_${MOTION_TAG}_s${SEED}"   # motion is in the name so a sweep
                                            # gives distinguishable wandb runs
+# the objective is part of the run's identity too -- two runs with different
+# loss weights are not comparable and should not look alike in wandb
+if [ "$FOURIER_LOSS" = 1 ] && [ "$SHAPE_WEIGHT" != 1.0 ]; then
+  RUN_TAG="${RUN_TAG}_sh${SHAPE_WEIGHT}"
+fi
 case $MODEL in
   lstm)
     EXTRA=(--model lstm --v_range 0 --wandb_name "lstm_${RUN_TAG}") ;;
