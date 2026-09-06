@@ -348,6 +348,7 @@ def eval_epoch(model, dataloader, criterion, device, input_frames, epoch, split_
     track = decoder_velocity_mode == "tracked"
     predict = decoder_velocity_mode == "predicted"
     running_loss = 0.0
+    running_trivial = 0.0
     velocity_metrics = VelocityMetrics()
     has_velocity_data = False
 
@@ -370,6 +371,14 @@ def eval_epoch(model, dataloader, criterion, device, input_frames, epoch, split_
             loss = criterion(output_seq, target_seq)
             batch_loss = loss.item()
             running_loss += batch_loss * seq.size(0)
+            # The all-zeros predictor, scored by the SAME criterion. On sparse
+            # bright-on-black frames this is a surprisingly strong baseline --
+            # a digit displaced by half its own width already costs as much as
+            # a blank frame -- so a model can sit ABOVE it for an entire run
+            # without that being visible in the loss curve alone. Logging it
+            # makes "are we beating nothing at all?" impossible to miss.
+            running_trivial += criterion(torch.zeros_like(target_seq),
+                                         target_seq).item() * seq.size(0)
             pbar.set_postfix({"loss": f"{batch_loss:.4f}"})
 
             if want_velocity:
@@ -393,7 +402,16 @@ def eval_epoch(model, dataloader, criterion, device, input_frames, epoch, split_
         log_velocity_report(velocity_metrics.summary(), split_name=split_name, epoch=epoch,
                             input_frames=input_frames)
 
-    return running_loss / len(dataloader.dataset)
+    n = len(dataloader.dataset)
+    trivial = running_trivial / n
+    loss = running_loss / n
+    wandb.log({f"{split_name}_trivial_baseline": trivial,
+               f"{split_name}_vs_trivial": trivial - loss})
+    if loss > trivial:
+        print(f"  WARNING: {split_name} loss {loss:.4f} is WORSE than predicting all zeros "
+              f"({trivial:.4f}). The model is being penalised for drawing anything at all -- "
+              f"see fourier_loss.py.")
+    return loss
 
 
 def eval_len_generalization(model, dataloader, device, input_frames, subsample_t=1,

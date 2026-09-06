@@ -121,7 +121,7 @@ TRANSITION_MODE=smooth  # what a change jumps TO. uniform = anywhere on the grid
                         # smooth = a neighbouring velocity (each component moves by
                         # at most 1) with probability SMOOTH_PROB. Applies to
                         # piecewise/stochastic only; accelerate defines its own step.
-DATA_V_RANGE=8          # velocity grid is [-N..N]^2 minus (0,0), in pixels/frame.
+DATA_V_RANGE=4          # velocity grid is [-N..N]^2 minus (0,0), in pixels/frame.
                         # In harmonic mode this ALSO sets the oscillation scale
                         # (amplitude = HARMONIC_AMP_* x this), and the orbit radius
                         # is roughly amplitude x period / 2pi -- so this is the main
@@ -135,9 +135,20 @@ DATA_V_RANGE=8          # velocity grid is [-N..N]^2 minus (0,0), in pixels/fram
                         # the melstm-vs-lstm comparison this is free. Drop it back
                         # to 2-4 before running felstm.
                         #
-                        # Measured at IMAGE=64, context 15 / rollout 10: path radius
-                        # 43 px (vs a 28 px digit), frozen-decoder end-of-rollout
-                        # error 72 px against a 11 px one-step-lag bound.
+                        # WHY 4 AND NOT 8. Reconstruction loss has a break-even
+                        # displacement: past about half a digit width (~14 px
+                        # here) a correctly drawn but misplaced digit costs MORE
+                        # than a blank frame, so the model is rewarded for going
+                        # silent. At v_range=8 the frozen decoder ends the
+                        # rollout 70 px out and even a one-step-lagged oracle is
+                        # at 11 px -- the whole comparison sits on the wrong side
+                        # of that cliff, and the first run duly plateaued WORSE
+                        # than the all-zeros predictor (0.130 vs 0.090). At
+                        # v_range=4 frozen is ~24 px (clearly bad) while a good
+                        # velocity model lands under 14 px (clearly good), which
+                        # is the contrast the experiment is trying to measure.
+                        # This is NOT about measurement accuracy: the bootstrap
+                        # correlator is 100% at v_range 2, 4 and 8 alike.
 MIN_SEGMENT=3           # piecewise/accelerate: frames held before a velocity change.
 MAX_SEGMENT=6           # For accelerate, this is the ramp interval: smaller = faster
                         # acceleration. Ignored by constant/stochastic.
@@ -300,7 +311,7 @@ VEL_DYN_OPENLOOP_K=10   # extra multi-step supervision: for the last K encoder
                         # 5.8 -> 1.9. Internally the fork cannot start before the
                         # second measurement, so K is effectively capped at
                         # INPUT_FRAMES-2.
-TRACK_CORR_ALPHA=0.0    # Whitening of the TRACKING correlator, track(h, X_t).
+TRACK_CORR_ALPHA=1.0    # Whitening of the TRACKING correlator, track(h, X_t).
                         # The bootstrap correlator is untouched and stays at 1.0.
                         #   1.0 = classic phase correlation -- what every run
                         #         before this one used.
@@ -317,10 +328,15 @@ TRACK_CORR_ALPHA=0.0    # Whitening of the TRACKING correlator, track(h, X_t).
                         #   3x3 blur                0%       92%
                         #   5x5 blur + tanh         0%       65%
                         #
-                        # The first MELSTM run plateaued at 60% velocity
-                        # accuracy from epoch ~9 onward and never moved, which
-                        # is what this is meant to break. Set back to 1.0 to
-                        # reproduce that run.
+                        # MEASURED, and the reason the default is back at 1.0:
+                        # alpha=0 is bimodal on a real hidden state -- exactly
+                        # right more often, but with a heavy tail of wildly
+                        # wrong estimates (median error 0 px, MEAN 5.3 px,
+                        # versus alpha=1's median 2.8 / mean 3.2). For a warp,
+                        # a consistently small error is far better than an
+                        # occasionally huge one: a 3 px mistake blurs h, a
+                        # 20 px mistake scrambles it. The alpha=0 run collapsed
+                        # to predicting nothing by epoch 14. Leave this at 1.0.
                         #
                         # NOTE this cannot affect motion equivariance: |R| is
                         # invariant to a shift of either input, so alpha changes

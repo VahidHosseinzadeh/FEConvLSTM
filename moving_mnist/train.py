@@ -18,6 +18,7 @@ import time
 import os
 from train_eval_utils import (train_epoch, eval_epoch, eval_len_generalization,
                              eval_velocity_generalization, ValCurveRecorder, build_model)
+from fourier_loss import FourierShapePhaseLoss
 from velocity_metrics import VelocityMetrics
 
 class MSEPlusL1Loss(nn.Module):
@@ -30,6 +31,29 @@ class MSEPlusL1Loss(nn.Module):
 
     def forward(self, input_seq, target_seq):
         return self.mse_weight * self.mse(input_seq, target_seq) + self.l1_weight * self.l1(input_seq, target_seq)
+
+
+class FourierPlusL1Loss(nn.Module):
+    """
+    MSEPlusL1 with the squared-error half split into its translation-invariant
+    ("shape") and remaining ("location") parts, so the two can be weighted
+    separately. See fourier_loss.py for the identity and its caveats.
+
+    At shape_weight == location_weight == 1.0 this is EXACTLY MSEPlusL1, so
+    switching it on changes nothing until a weight is moved off 1.
+    """
+
+    def __init__(self, shape_weight=1.0, location_weight=1.0, l1_weight=1.0):
+        super().__init__()
+        self.fourier = FourierShapePhaseLoss(shape_weight, location_weight)
+        self.l1 = nn.L1Loss()
+        self.l1_weight = l1_weight
+        self.last_parts = {}
+
+    def forward(self, input_seq, target_seq):
+        f, parts = self.fourier(input_seq, target_seq)
+        self.last_parts = parts
+        return f + self.l1_weight * self.l1(input_seq, target_seq)
 
 
 def log_length_generalization_curve(gen_mean, gen_std, gen_pred_frames, args):
@@ -235,6 +259,23 @@ def main():
     parser.add_argument('--gen_vel_step', type=int, default= 1, help='Step size (integer) for the velocity grid')
     parser.add_argument('--gen_vel_n_seq', type=int, default=128, help='How many sequences to sample **per (vx,vy)** for velocitygeneralisation test')
     parser.add_argument('--run_velocity_generalization', action='store_true', help='Run velocity generalization test (default: False)')
+    # ---- reconstruction loss shape/location split (see fourier_loss.py) ----
+    parser.add_argument('--fourier_loss', action='store_true',
+                        help="Split the squared-error half of the reconstruction loss into a "
+                             "translation-invariant 'shape' term and a 'location' term, weighted "
+                             "separately. Motivation: plain MSE on sparse frames has a degenerate "
+                             "minimum at 'predict nothing' -- a digit displaced by about half its "
+                             "own width already costs exactly as much as a blank frame, and more "
+                             "beyond that, so a rollout with imperfect velocity is rewarded for "
+                             "going silent. The shape term prices blankness directly (a blank "
+                             "prediction has zero magnitude at every frequency). At weights "
+                             "(1, 1) this is EXACTLY the current MSE+L1, so it is safe to leave on.")
+    parser.add_argument('--shape_weight', type=float, default=1.0,
+                        help='--fourier_loss only: weight on the translation-invariant term. '
+                             'Raise above 1 to punish blur and blankness harder.')
+    parser.add_argument('--location_weight', type=float, default=1.0,
+                        help='--fourier_loss only: weight on the location term, which is where a '
+                             'pure translation puts ALL of its error.')
     parser.add_argument('--grad_clip', type=float, default=1.0, help='Gradient clipping value (default: 1.0, None for no clipping)')
     parser.add_argument('--wandb_entity', type=str, default=None, help='Wandb entity')
     parser.add_argument('--wandb_project', type=str, default="FERNN", help='Wandb project')
@@ -633,7 +674,8 @@ def main():
     # If evaluate_only is True, skip training and only run evaluation
     if args.evaluate_only:
         print("Running evaluation only...")
-        criterion = MSEPlusL1Loss()
+        criterion = (FourierPlusL1Loss(args.shape_weight, args.location_weight)
+                     if args.fourier_loss else MSEPlusL1Loss())
         test_dataset.reset_rng()       # identical benchmark set every evaluation
         test_loss = eval_fn(model, test_loader, criterion, device, args.input_frames, 0, split_name="test",
                             show_h_state=args.show_h_state)
@@ -694,7 +736,12 @@ def main():
 
     # Optimizers & loss
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
-    criterion = MSEPlusL1Loss()
+    criterion = (FourierPlusL1Loss(args.shape_weight, args.location_weight)
+                 if args.fourier_loss else MSEPlusL1Loss())
+    if args.fourier_loss:
+        print(f"Reconstruction loss: fourier split, shape x{args.shape_weight} "
+              f"location x{args.location_weight} (+ L1). "
+              f"{'== plain MSE+L1' if args.shape_weight == args.location_weight == 1.0 else ''}")
 
     scheduler = None
     if args.use_lr_scheduler:
