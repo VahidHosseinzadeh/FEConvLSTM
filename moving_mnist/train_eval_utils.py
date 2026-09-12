@@ -305,6 +305,12 @@ def train_epoch(model, dataloader, optimizer, criterion, device, input_frames, g
     """
     model.train()
     running_loss = 0.0
+    # Per decoder-velocity protocol. Scheduled sampling flips a coin INSIDE the
+    # model, so a single blended train_loss mixes an oracle-tracked rollout with
+    # a deployable one -- and those differ by orders of magnitude. Reporting them
+    # apart is what stops a falling train_loss next to a flat val_loss from
+    # looking like overfitting when it is really a change of protocol.
+    running_by_proto = {}
     running_dyn_loss = 0.0
     running_shape = 0.0
     running_location = 0.0
@@ -388,6 +394,10 @@ def train_epoch(model, dataloader, optimizer, criterion, device, input_frames, g
 
         batch_loss = loss.item()
         running_loss += batch_loss * seq.size(0)
+        proto = getattr(model, "last_decoder_protocol", None)
+        if proto is not None:
+            cnt, tot = running_by_proto.get(proto, (0, 0.0))
+            running_by_proto[proto] = (cnt + seq.size(0), tot + batch_loss * seq.size(0))
         pbar.set_postfix({"loss": f"{batch_loss:.4f}"})
 
         if curve_recorder is not None:
@@ -414,8 +424,16 @@ def train_epoch(model, dataloader, optimizer, criterion, device, input_frames, g
     # Shape/location are logged unweighted and in pixel-MSE units, whatever the
     # criterion is, so they sum to the plain MSE and stay comparable across
     # runs with different --shape_weight (or with --fourier_loss off entirely).
-    wandb.log({"train_shape_loss": running_shape / n,
-               "train_location_loss": running_location / n})
+    log_payload = {"train_shape_loss": running_shape / n,
+                   "train_location_loss": running_location / n}
+    # train_loss_tracked is the ORACLE regime (the decoder is re-measured against
+    # the true next frame every step) and is not comparable with val_loss, which
+    # is frozen. train_loss_predicted IS comparable with val_predicted_loss --
+    # that is the pair to read.
+    for proto, (cnt, tot) in running_by_proto.items():
+        log_payload[f"train_loss_{proto}"] = tot / max(1, cnt)
+        log_payload[f"train_frac_{proto}"] = cnt / max(1, n)
+    wandb.log(log_payload)
     # (pixel loss, dynamics loss). The second is None when the head is absent
     # or unweighted, so the caller can tell "not measured" from "measured 0".
     return running_loss / n, (running_dyn_loss / n if want_dyn_loss else None)

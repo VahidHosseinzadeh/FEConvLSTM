@@ -490,7 +490,7 @@ TRACK_CORR_ALPHA=1.0    # Whitening of the TRACKING correlator, track(h, X_t).
                         # NOTE this cannot affect motion equivariance: |R| is
                         # invariant to a shift of either input, so alpha changes
                         # how reliably the peak is found, never where it is.
-DECODER_SAMPLING_P=0.0  # Scheduled sampling on the decoder velocity: fraction of
+DECODER_SAMPLING_P=0.5  # Scheduled sampling on the decoder velocity: fraction of
 DECODER_SAMPLING_RAMP=10 # training rollouts that use the head's own predicted
                         # velocity instead of the tracked measurement, ramped in
                         # over this many epochs.

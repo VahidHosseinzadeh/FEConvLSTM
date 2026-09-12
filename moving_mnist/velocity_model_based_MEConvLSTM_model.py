@@ -584,6 +584,19 @@ class Seq2SeqMEConvLSTM(nn.Module):
         sample_predicted = (self.training and use_dyn and decoder_sampling_p > 0.0
                             and random.random() < decoder_sampling_p)
 
+        # Which velocity the ROLLOUT actually ran on, recorded for the caller to
+        # log. The coin above is flipped internally and per batch, and the three
+        # protocols are not the same measurement -- an oracle-tracked rollout
+        # scores far better than a deployable one. Without this the training
+        # curve silently blends protocols, which is exactly what makes a falling
+        # train_loss sit next to a flat val_loss and look like overfitting.
+        if target_seq is not None and track_decoder_velocity and not sample_predicted:
+            self.last_decoder_protocol = 'tracked'
+        elif use_dyn and (predict_decoder_velocity or sample_predicted):
+            self.last_decoder_protocol = 'predicted'
+        else:
+            self.last_decoder_protocol = 'frozen'
+
         prev_frame = input_seq[:, -1]
         outputs    = []
 

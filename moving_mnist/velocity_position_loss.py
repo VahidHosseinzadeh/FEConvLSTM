@@ -25,20 +25,33 @@ shape of the curve.
 
 What this module computes instead
 ---------------------------------
-The motion here is a pure translation on the torus, and the dataset renders it
-with an integer `torch.roll`, so "where the digit is" is EXACTLY the cumulative
-velocity -- verified: roll(X_t, motions[t]) == X_{t+1} to 0.0. Therefore the
-displacement between the predicted digit and the target digit at rollout step t
-is the cumulative velocity error
+Read it outermost-first, as a composition:
 
-    e_t = sum_{s<=t} (v_pred_s - v_target_s)                        [2-vector, px]
+    L = (1/H) sum_t w_t * rho_delta( d(e_t) ),   e_t = sum_{s<=t} (v_pred_s - v*_s)
 
-and the loss is a genuine distance on that:
-
-    L = (1/H) sum_t w_t * rho_delta( ||e_t||_torus )
+    d_T2(e) = || e - S * round(e / S) ||_2       toroidal distance  (reporting)
+    d(e)    = || e ||_2                          plain distance     (training)
 
     rho_delta(r) = 0.5 r^2 / delta        r <= delta      (smooth at 0)
                  = r - 0.5 delta          r >  delta      (linear, never saturates)
+
+In words, and this is the whole statement:
+
+    at every rollout step, work out where the predicted digit is relative to
+    where the target digit should be, measure that positional distance, and
+    penalise that distance.
+
+Integrating the velocity error is merely HOW the positional discrepancy is
+obtained when the model predicts velocities rather than positions. It is not
+what the loss is about, and reading it as "a velocity loss with a cumsum in it"
+gets the emphasis backwards.
+
+The identity that licenses the reading: the motion here is a pure translation and
+the dataset renders it with an integer `torch.roll`, so position IS the
+cumulative velocity -- exactly, verified as roll(X_t, motions[t]) == X_{t+1} to
+0.0. That is a PRECONDITION, not a general construction: it stops holding the
+moment the content deforms, and with several digits there is no single "the
+position" to speak of (which is what the K velocity slots are for).
 
 Properties, which are the ones asked for:
 
@@ -48,16 +61,22 @@ Properties, which are the ones asked for:
     from every step t >= s -- an early error is charged for the whole horizon,
     which is the actual physics of a rollout.
 
-Toroidal distance
------------------
-Positions wrap. Two digits whose displacement differs by exactly the frame size
-are the SAME picture, so the distance that matters is the toroidal one and e_t
-is wrapped into [-S/2, S/2) per axis. Beyond S/2 the wrapped distance decreases
-again -- that is a true property of the torus, not an artifact, but it does mean
-the loss is only a useful gradient signal while the digit is within half a frame
-of its target. Pass image_size=None to disable wrapping (plain Euclidean), which
-is the right choice if you would rather the loss keep growing monotonically and
-you know the drift can exceed S/2.
+Which distance, and when -- d or d_T2
+--------------------------------------
+Positions wrap: two digits whose displacement differs by exactly the frame size
+are the SAME picture. So d_T2 is the honest PIXEL distance, and it is what should
+be REPORTED.
+
+It is the wrong thing to TRAIN on, for two reasons that both bite at these
+settings. It is capped at S/sqrt(2), so over a long horizon every method piles up
+against the ~18 px "two random positions" ceiling and the metric stops
+discriminating between them. Worse, beyond S/2 it is NON-MONOTONE: the gradient
+points the wrong way, pushing the prediction to wrap further rather than come
+back. With max_speed 4 over 10 steps the cumulative error can reach ~80 px on a
+48 px frame, so that regime is reachable early in training, not hypothetical.
+
+Hence image_size=None (plain d, the default) is the training form, and
+image_size=S (d_T2) the reporting form. Both are exercised in the tests.
 
 Targets without labels
 ----------------------

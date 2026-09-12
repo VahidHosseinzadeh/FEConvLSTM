@@ -507,6 +507,17 @@ def main():
         print("WARNING: --use_velocity_dynamics is on but --vel_dyn_loss_weight is 0, so the "
               "dynamics head never trains and predicts exactly the frozen velocity forever. "
               "Set --vel_dyn_loss_weight (e.g. 1.0).")
+    if (args.model == 'melstm' and args.use_velocity_dynamics
+            and args.decoder_sampling_p == 0.0):
+        print("WARNING: --decoder_sampling_p is 0, so the velocity head NEVER DRIVES THE "
+              "ROLLOUT during training: every decoder step is handed v = track(h, "
+              "target_frame), an oracle measured against the true future. The head is then "
+              "trained only by --vel_dyn_loss_weight inside the context, and the ConvLSTM "
+              "never gets a gradient teaching it to cope with a predicted velocity. This is "
+              "also why train_loss (tracked protocol) can fall steeply while val_loss "
+              "(frozen protocol) does not move -- they are different measurements, not "
+              "overfitting. Raise --decoder_sampling_p (e.g. 0.5) to train in the regime "
+              "the model is evaluated in.")
     if args.eval_velocity_mode in ('predicted', 'all') and not args.use_velocity_dynamics:
         print(f"WARNING: --eval_velocity_mode {args.eval_velocity_mode} needs "
               f"--use_velocity_dynamics; without it the 'predicted' evaluation degrades to "
