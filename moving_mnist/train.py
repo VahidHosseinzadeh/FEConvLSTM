@@ -391,6 +391,34 @@ def main():
                              "(measured at 0.1179 against a 0.1149 one-step-lag ceiling). "
                              "'openloop': run it on its OWN output and score against the "
                              "measurement, so future frames are targets but never inputs.")
+    parser.add_argument('--vel_dyn_loss', choices=['velocity', 'position', 'both'],
+                        default='velocity',
+                        help="What the velocity head is scored on. 'velocity' (default) "
+                             "= smooth_l1(u_pred, v_measured) per step, the original and "
+                             "bit-for-bit unchanged. 'position' = a Huber on the "
+                             "||cumulative velocity error||, i.e. how many PIXELS the "
+                             "digit would be from where it belongs -- zero exactly when "
+                             "they coincide, and unlike a pixel loss it never saturates "
+                             "(pixel MSE is already worse than a blank frame at 3 px and "
+                             "is identical at 20 and 30 px). In the open-loop replay the "
+                             "error accumulates across replayed steps, so a systematic "
+                             "bias is charged once per remaining step. 'both' = "
+                             "smooth_l1 + --vel_dyn_pos_weight * the position term. "
+                             "MEASURED standalone on clean velocity streams: 'velocity' "
+                             "extrapolated better (13.9 px vs 22.0 at a 30-step rollout), "
+                             "'both' at 0.2 in between (16.1) -- but that was with exact "
+                             "targets and no warp in the loop, so the coupled case is "
+                             "open. See velocity_position_loss.py.")
+    parser.add_argument('--vel_dyn_pos_delta', type=float, default=2.0,
+                        help='--vel_dyn_loss position/both: Huber knee in PIXELS. Below '
+                             'it the term is quadratic (fine-grained once nearly right), '
+                             'above it linear (robust, and still informative at 30 px). '
+                             '2 px is about a tenth of a digit.')
+    parser.add_argument('--vel_dyn_pos_weight', type=float, default=0.2,
+                        help="--vel_dyn_loss both: weight on the position term next to "
+                             "smooth_l1. 0.2 is the ratio that measured best standalone; "
+                             "the two terms are in different units (px vs px/frame), so "
+                             "this is not a dimensionless mixing constant.")
     parser.add_argument('--vel_dyn_v_max', type=float, default=None,
                         help='Hard clamp on |predicted velocity| per component. The data is '
                              'bounded by --data_v_range by construction, so that is the natural '

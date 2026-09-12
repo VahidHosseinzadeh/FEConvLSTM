@@ -5,6 +5,7 @@ import torch.nn.functional as F
 
 from velocity_predictor_model import PhaseCorrelation
 from velocity_dynamics_model import VelocityDynamicsHead
+from velocity_position_loss import huber_on_norm
 
 
 class MEConvLSTMCell(nn.Module):
@@ -181,7 +182,10 @@ class Seq2SeqMEConvLSTM(nn.Module):
                  vel_dyn_openloop_k=0,
                  vel_dyn_arch='gru',
                  vel_dyn_layers=1,
-                 vel_dyn_decoder_supervision='none'):
+                 vel_dyn_decoder_supervision='none',
+                 vel_dyn_loss='velocity',
+                 vel_dyn_pos_delta=2.0,
+                 vel_dyn_pos_weight=0.2):
         super().__init__()
 
         self.batch_first     = batch_first
@@ -245,6 +249,30 @@ class Seq2SeqMEConvLSTM(nn.Module):
         if vel_dyn_decoder_supervision not in ('none', 'teacher', 'openloop'):
             raise ValueError("vel_dyn_decoder_supervision must be one of "
                              f"'none'/'teacher'/'openloop', got {vel_dyn_decoder_supervision!r}")
+        if vel_dyn_loss not in ('velocity', 'position', 'both'):
+            raise ValueError("vel_dyn_loss must be one of 'velocity'/'position'/'both', "
+                             f"got {vel_dyn_loss!r}")
+        # What the head is scored on (see velocity_position_loss.py):
+        #
+        #   'velocity'  smooth_l1(u_pred, v_measured) per step -- the original,
+        #               and bit-for-bit unchanged when this is left at default.
+        #   'position'  how far the DIGIT would be from where it belongs, in px:
+        #               a Huber on ||cumulative velocity error||. In the open-loop
+        #               replay the error accumulates across the replayed steps, so
+        #               a systematic bias is charged once per remaining step rather
+        #               than once in total -- which is the failure mode the frozen
+        #               and predicted rollouts actually exhibit.
+        #   'both'      smooth_l1 + vel_dyn_pos_weight * the position term.
+        #
+        # MEASURED, standalone on clean velocity streams (velocity_forecaster.py):
+        # 'velocity' extrapolated BETTER than 'position' there (13.9 vs 22.0 px
+        # final error at a 30-step rollout), with 'both' at 0.2 in between (16.1).
+        # That was on exact targets and without the warp in the loop, so it does
+        # not settle the coupled case -- but it is the reason this is a switch
+        # with 'velocity' as the default rather than a replacement.
+        self.vel_dyn_loss       = vel_dyn_loss
+        self.vel_dyn_pos_delta  = vel_dyn_pos_delta
+        self.vel_dyn_pos_weight = vel_dyn_pos_weight
         self.vel_dyn_decoder_supervision = vel_dyn_decoder_supervision
         self.use_velocity_dynamics = use_velocity_dynamics
         self.vel_dyn_gain          = vel_dyn_gain
@@ -347,6 +375,30 @@ class Seq2SeqMEConvLSTM(nn.Module):
             return None
         k = torch.sigmoid(self.vel_dyn_gain_mlp(score.unsqueeze(-1)))  # (B,K,1)
         return k
+
+    def _dyn_term(self, u_pred, v_target, cum_err=None):
+        """One scalar term of the velocity head's objective, per --vel_dyn_loss.
+
+        cum_err threads the running sum of (prediction - target) through an
+        OPEN-LOOP replay, and is None for a one-step-ahead term -- where the
+        cumulative error is just that one step, so the position form degrades to
+        a Huber on ||u_pred - v||, still in pixels.
+
+        Returns (term, new_cum_err). The target is expected to be detached
+        already; nothing here re-detaches it, so a caller that wants gradient to
+        flow into the target would get it, and none currently does.
+        """
+        err = u_pred - v_target
+        cum = err if cum_err is None else cum_err + err
+        if self.vel_dyn_loss == 'velocity':
+            return F.smooth_l1_loss(u_pred, v_target), cum
+        # ||.|| over the (vx, vy) axis, then Huber on that distance -- the same
+        # function the standalone study used, imported rather than re-derived so
+        # the two cannot drift apart.
+        pos = huber_on_norm(cum.norm(dim=-1), self.vel_dyn_pos_delta).mean()
+        if self.vel_dyn_loss == 'position':
+            return pos, cum
+        return F.smooth_l1_loss(u_pred, v_target) + self.vel_dyn_pos_weight * pos, cum
 
     # ------------------------------------------------------------------
     # Forward
@@ -474,7 +526,7 @@ class Seq2SeqMEConvLSTM(nn.Module):
                 # No term at the first measurement: there is nothing to have
                 # predicted it from.
                 if n_meas >= 1:
-                    dyn_terms.append(F.smooth_l1_loss(u_pred, v.detach()))
+                    dyn_terms.append(self._dyn_term(u_pred, v.detach())[0])
 
                 # Blend only once the process model has seen something. At the
                 # very first measurement u_pred is just the zero-initialized
@@ -512,11 +564,17 @@ class Seq2SeqMEConvLSTM(nn.Module):
         # above is untouched — the fork is a side branch.
         if use_dyn and self.vel_dyn_openloop_k > 0 and ol_fork is not None:
             u_ol, du_ol, st_ol = ol_fork
+            cum_err = None
             for t_rec, h_rec, v_rec in dyn_records:
                 if t_rec < t_fork:
                     continue
                 u_ol_next, st_ol = self.vel_dyn(u_ol, du_ol, h_rec, st_ol)
-                dyn_terms.append(F.smooth_l1_loss(u_ol_next, v_rec))
+                # The error ACCUMULATES along the replay. This is the only place
+                # the head is scored in the regime it is deployed in, so a bias
+                # that would walk the digit away step by step has to be charged
+                # that way -- once per remaining step, not once in total.
+                term, cum_err = self._dyn_term(u_ol_next, v_rec, cum_err)
+                dyn_terms.append(term)
                 du_ol = u_ol_next - u_ol
                 u_ol  = u_ol_next
 
@@ -560,7 +618,7 @@ class Seq2SeqMEConvLSTM(nn.Module):
                 if use_dyn and sup != 'none':
                     u_pred, dyn_state = self.vel_dyn(u_prev, du_prev, h, dyn_state)
                     if n_meas >= 1:
-                        dyn_terms.append(F.smooth_l1_loss(u_pred, v.detach()))
+                        dyn_terms.append(self._dyn_term(u_pred, v.detach())[0])
                     nxt = v if sup == 'teacher' else u_pred
                     du_prev = (nxt - u_prev) if n_meas >= 1 else torch.zeros_like(nxt)
                     u_prev  = nxt

@@ -388,6 +388,38 @@ VEL_DYN_DEC_SUP=none    # What the head may take from the FUTURE frames while
                         # follow-up run changed all four AT ONCE plus the eval
                         # protocol, so nothing in it could be attributed. Change
                         # ONE of them per run from here.
+VEL_DYN_LOSS=position   # What the velocity head is scored on.
+                        #   velocity : smooth_l1(u_pred, v_measured) per step --
+                        #              the original objective, unchanged.
+                        #   position : a Huber on ||cumulative velocity error||,
+                        #              i.e. HOW MANY PIXELS the digit would be
+                        #              from where it belongs. Zero exactly when
+                        #              they coincide, strictly increasing with
+                        #              separation, and it never saturates -- pixel
+                        #              MSE is already worse than a blank frame at
+                        #              3 px and is IDENTICAL at 20 and 30 px, so
+                        #              it cannot say how far off a rollout is.
+                        #              In the open-loop replay (VEL_DYN_OPENLOOP_K)
+                        #              the error accumulates across steps, so a
+                        #              systematic bias is charged once per
+                        #              remaining step -- which is the failure mode
+                        #              the frozen/predicted rollouts actually show.
+                        #   both     : smooth_l1 + VEL_DYN_POS_WEIGHT * position.
+                        #
+                        # MEASURED standalone, on clean velocity streams with a
+                        # separate forecaster (moving_mnist/velocity_forecaster.py),
+                        # final digit error at a 30-step rollout after training at 10:
+                        #
+                        #     velocity  13.9 px      position  22.0 px
+                        #     both@0.2  16.1 px      frozen    88.5 px
+                        #
+                        # i.e. 'velocity' won THERE. That test had exact targets and
+                        # no warp in the loop, so it does not settle the coupled
+                        # case -- run 'position' against 'velocity' on the same data
+                        # before concluding. Everything else held fixed, this is a
+                        # one-variable change.
+VEL_DYN_POS_DELTA=2.0   # Huber knee, in pixels (~a tenth of a digit).
+VEL_DYN_POS_WEIGHT=0.2  # VEL_DYN_LOSS=both only.
 VEL_DYN_V_MAX=$DATA_V_RANGE
                         # Hard clamp on the predicted speed. The data is bounded
                         # by |v| <= DATA_V_RANGE by construction, so anything
@@ -579,10 +611,19 @@ case $MODEL in
               --vel_dyn_arch "$VEL_DYN_ARCH"
               --vel_dyn_decoder_supervision "$VEL_DYN_DEC_SUP"
               --vel_dyn_layers "$VEL_DYN_LAYERS"
+              --vel_dyn_loss "$VEL_DYN_LOSS"
+              --vel_dyn_pos_delta "$VEL_DYN_POS_DELTA"
+              --vel_dyn_pos_weight "$VEL_DYN_POS_WEIGHT"
               --vel_dyn_v_max "$VEL_DYN_V_MAX"
               --decoder_sampling_p "$DECODER_SAMPLING_P"
               --decoder_sampling_ramp "$DECODER_SAMPLING_RAMP")
       ME_TAG="_vd${VEL_DYN_STATE_DIM}x${VEL_DYN_LAYERS}${VEL_DYN_ARCH:0:1}${VEL_DYN_GAIN:0:1}"
+      # The head's objective is part of the run's identity: a position-loss run
+      # and a velocity-loss run are not comparable and must not look alike in
+      # wandb (their dyn_loss is not even in the same units -- px vs px/frame).
+      if [ "$VEL_DYN_LOSS" != velocity ]; then
+        ME_TAG="${ME_TAG}_L${VEL_DYN_LOSS:0:3}"
+      fi
       if [ "$VEL_DYN_DEC_SUP" != none ]; then ME_TAG="${ME_TAG}_${VEL_DYN_DEC_SUP}"; fi
       if [ "$DECODER_SAMPLING_P" != 0 ] && [ "$DECODER_SAMPLING_P" != 0.0 ]; then
         ME_TAG="${ME_TAG}_ss${DECODER_SAMPLING_P}"

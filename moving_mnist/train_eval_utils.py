@@ -89,6 +89,9 @@ def build_model(cfg):
             vel_dyn_layers=get("vel_dyn_layers", 1),
             vel_dyn_decoder_supervision=get("vel_dyn_decoder_supervision", "none"),
             vel_dyn_v_max=get("vel_dyn_v_max", None),
+            vel_dyn_loss=get("vel_dyn_loss", "velocity"),
+            vel_dyn_pos_delta=get("vel_dyn_pos_delta", 2.0),
+            vel_dyn_pos_weight=get("vel_dyn_pos_weight", 0.2),
             track_corr_alpha=get("track_corr_alpha", None))
 
     raise ValueError(f"unknown model {name!r}")
