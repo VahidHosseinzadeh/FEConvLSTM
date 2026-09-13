@@ -60,6 +60,7 @@ invisible under a constant velocity and shifts every supervision target by one
 frame the moment the velocity varies.
 """
 import warnings
+from contextlib import contextmanager
 
 import numpy as np
 import torch
@@ -330,6 +331,17 @@ class CommonFateMovingMNISTDataset(TDMovingMNISTDataset):
     min_dv        : required max-norm gap between every figure and the
                     background, at EVERY step. Below 1 a figure can travel with
                     the background and vanish. 0 disables the check.
+    bg_speed_range : (lo, hi) -- give the BACKGROUND its own velocity grid,
+                    every integer (vx, vy) with lo <= max(|vx|,|vy|) <= hi.
+                    Requires lo > max_speed, which makes the grid disjoint from
+                    the figures': the background then can NEVER coincide with a
+                    figure, by construction rather than by rejection. When
+                    lo - max_speed >= min_dv the separation constraint is a
+                    theorem and the rejection loop skips it. The background
+                    keeps the same motion_mode and transition statistics as the
+                    figures -- only its alphabet of velocities differs.
+                    None (default) draws the background from the figure grid and
+                    enforces separation by rejection instead.
     separate_figures : also require that gap pairwise BETWEEN figures. Off by
                     default: two figures sharing a velocity are one motion group
                     but still two shapes, which is fine for classification and
@@ -369,6 +381,7 @@ class CommonFateMovingMNISTDataset(TDMovingMNISTDataset):
         mask_threshold=0.3,
         min_dv=2,
         separate_figures=False,
+        bg_speed_range=None,
         max_velocity_tries=200,
         normalize="affine",
         clip=3.0,
@@ -408,10 +421,21 @@ class CommonFateMovingMNISTDataset(TDMovingMNISTDataset):
                 f"normalize must be 'affine', 'minmax' or 'none', got {normalize!r}")
         if num_figures < 1:
             raise ValueError(f"num_figures must be >= 1, got {num_figures}")
-        if min_dv > 2 * max_speed:
+        if min_dv > 2 * max_speed and bg_speed_range is None:
             raise ValueError(
                 f"min_dv={min_dv} is unsatisfiable with max_speed={max_speed} "
                 f"(the largest possible separation is {2 * max_speed}).")
+
+        if bg_speed_range is not None:
+            lo, hi = bg_speed_range
+            if lo > hi:
+                raise ValueError(f"bg_speed_range={bg_speed_range} is empty (lo > hi).")
+            if lo <= max_speed:
+                raise ValueError(
+                    f"bg_speed_range={bg_speed_range} overlaps the figure grid "
+                    f"(max_speed={max_speed}); the whole point of this argument is "
+                    f"that the background can NEVER coincide with a figure, so its "
+                    f"minimum speed must exceed max_speed.")
 
         # 'constant' unless the caller says otherwise -- but when
         # motion_difficulty is in play, hand the parent its own default so its
@@ -459,6 +483,28 @@ class CommonFateMovingMNISTDataset(TDMovingMNISTDataset):
         self.mask_threshold = mask_threshold
         self.min_dv = min_dv
         self.separate_figures = separate_figures
+        self.bg_speed_range = bg_speed_range
+
+        # Background velocities live on their own grid: every integer (vx, vy)
+        # whose max-norm falls in [lo, hi]. Because lo > max_speed, this set is
+        # DISJOINT from the figure grid, so the background can never coincide
+        # with a figure -- no rejection sampling, no residual chance of a
+        # figureless sequence.
+        self.bg_velocity_grid = None
+        self.bg_separation_is_structural = False
+        if bg_speed_range is not None:
+            lo, hi = bg_speed_range
+            self.bg_velocity_grid = [
+                (vx, vy)
+                for vx in range(-hi, hi + 1)
+                for vy in range(-hi, hi + 1)
+                if lo <= max(abs(vx), abs(vy)) <= hi
+            ]
+            # A figure has max-norm <= max_speed and the background >= lo, so
+            # their max-norm gap is at least lo - max_speed. When that already
+            # covers min_dv the constraint is a theorem, not a sample-time
+            # check, and the rejection loop can skip it entirely.
+            self.bg_separation_is_structural = (lo - max_speed) >= min_dv
         self.max_velocity_tries = max_velocity_tries
         self.normalize = normalize
         self.clip = float(clip)
@@ -567,8 +613,11 @@ class CommonFateMovingMNISTDataset(TDMovingMNISTDataset):
             return True
         N = self.num_figures
         fig, bg = motions[:, :N], motions[:, N:]
-        if int((fig - bg).abs().amax(dim=2).min()) < self.min_dv:
-            return False
+        # With a disjoint background grid whose gap already covers min_dv, this
+        # check can only ever pass -- skip it rather than pay for it per draw.
+        if not self.bg_separation_is_structural:
+            if int((fig - bg).abs().amax(dim=2).min()) < self.min_dv:
+                return False
         if self.separate_figures and N > 1:
             for i in range(N):
                 for j in range(i + 1, N):
@@ -576,6 +625,38 @@ class CommonFateMovingMNISTDataset(TDMovingMNISTDataset):
                     if int(gap) < self.min_dv:
                         return False
         return True
+
+    @contextmanager
+    def _velocity_grid(self, grid, n_slots):
+        """
+        Run the parent's trajectory machinery on a different grid and slot count.
+
+        The parent draws every slot from self.velocity_grid, which is exactly
+        what must NOT happen when the background has its own disjoint grid.
+        Swapping the three attributes it reads -- rather than reimplementing the
+        motion modes -- is what keeps the background's motion statistically
+        identical to the figures': same motion_mode, same transition_mode, same
+        segment lengths, different alphabet.
+        """
+        saved = (self.velocity_grid, self._velocity_set, self.num_digits)
+        self.velocity_grid, self._velocity_set, self.num_digits = (
+            grid, set(grid), n_slots)
+        try:
+            yield
+        finally:
+            self.velocity_grid, self._velocity_set, self.num_digits = saved
+
+    def _generate_split_grid_motion(self):
+        """
+        Figures on the figure grid, background on its own -- concatenated into
+        the usual (T, N+1, 2) layout with the background last.
+        """
+        N = self.num_figures
+        with self._velocity_grid(self.velocity_grid, N):
+            fig = self._generate_motion_trajectory()          # (T, N, 2)
+        with self._velocity_grid(self.bg_velocity_grid, 1):
+            bg = self._generate_motion_trajectory()           # (T, 1, 2)
+        return torch.cat([fig, bg], dim=1)                    # (T, N+1, 2)
 
     def _sample_separated_motion(self):
         """
@@ -586,9 +667,11 @@ class CommonFateMovingMNISTDataset(TDMovingMNISTDataset):
         change the velocity statistics this class inherits -- which is the one
         thing a subclass of TDMovingMNISTDataset must not do.
         """
+        draw = (self._generate_split_grid_motion if self.bg_velocity_grid is not None
+                else self._generate_motion_trajectory)
         motions = None
         for _ in range(self.max_velocity_tries):
-            motions = self._generate_motion_trajectory()   # (T, N+1, 2)
+            motions = draw()                              # (T, N+1, 2)
             if self._velocities_separated(motions):
                 return motions, True
         return motions, False

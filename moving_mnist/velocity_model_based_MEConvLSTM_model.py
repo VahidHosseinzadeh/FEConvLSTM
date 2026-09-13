@@ -229,6 +229,57 @@ class Seq2SeqMEConvLSTM(nn.Module):
             return h.max(dim=1).values
 
     # ------------------------------------------------------------------
+    # Encoder
+    # ------------------------------------------------------------------
+
+    def encode(self, input_seq, return_states=False):
+        """
+        Run the encoder only and hand back the recurrent state it ends on.
+
+        Returns (h, c, v_last, estimated_velocities, h_states), where h and c are
+        (B, K, Ch, H, W) -- the FULL per-slot state, not the channel-averaged
+        summary `return_states` produces. A downstream head that wants to read a
+        motion-defined figure out of the slots needs those feature channels;
+        averaging them away is exactly what destroys the signal.
+
+        forward() calls this, so the encoder exists in one place and a head that
+        trains on `encode` sees precisely the state prediction trains on.
+        """
+        B, T_in, C, H, W = input_seq.shape
+        K = self.n_slots
+
+        h, c = self.cell.init_hidden(B, K, H, W, input_seq.device, input_seq.dtype)
+
+        estimated_velocities = []
+        h_states = [] if return_states else None
+        v = torch.zeros(B, K, 2, device=input_seq.device, dtype=input_seq.dtype)
+
+        for t in range(T_in):
+
+            if t == 0:
+                # h=0, warp(0,v)=0 for any v. h_1 = s(U*X_0).
+                v = torch.zeros(B, K, 2, device=input_seq.device,
+                                         dtype=input_seq.dtype)
+
+            elif t == 1:
+                # First non-zero h. Bootstrap from (X_0, X_1).
+                v = self.bootstrap_velocities(input_seq[:, 0], input_seq[:, 1])
+
+            else:
+                # Slot self-tracking. X_t consumed exactly once.
+                v = self.track_velocities(h, input_seq[:, t])
+
+            h, c = self.cell(input_seq[:, t], h, c, v)
+
+            if t > 0:
+                estimated_velocities.append(v.detach())
+
+            if return_states:
+                h_states.append(h.mean(dim=2).detach())
+
+        return h, c, v, estimated_velocities, h_states
+
+    # ------------------------------------------------------------------
     # Forward
     # ------------------------------------------------------------------
 
@@ -258,35 +309,9 @@ class Seq2SeqMEConvLSTM(nn.Module):
         B, T_in, C, H, W = input_seq.shape
         K = self.n_slots
 
-        h, c = self.cell.init_hidden(B, K, H, W, input_seq.device, input_seq.dtype)
-
         # ---- Encoder ------------------------------------------------
-        # v_last = torch.zeros(B, K, 2, device=input_seq.device, dtype=input_seq.dtype)
-        estimated_velocities = []
-        h_states = [] if return_states else None
-
-        for t in range(T_in):
-
-            if t == 0:
-                # h=0, warp(0,v)=0 for any v. h_1 = σ(U★X_0).
-                v = torch.zeros(B, K, 2, device=input_seq.device,
-                                         dtype=input_seq.dtype)
-
-            elif t == 1:
-                # First non-zero h. Bootstrap from (X_0, X_1).
-                v = self.bootstrap_velocities(input_seq[:, 0], input_seq[:, 1])
-
-            else:
-                # Slot self-tracking. X_t consumed exactly once.
-                v = self.track_velocities(h, input_seq[:, t])
-
-            h, c   = self.cell(input_seq[:, t], h, c, v)
-
-            if t > 0:
-                estimated_velocities.append(v.detach())
-
-            if return_states:
-                h_states.append(h.mean(dim=2).detach())
+        h, c, v, estimated_velocities, h_states = self.encode(
+            input_seq, return_states=return_states)
 
         # ---- Decoder ------------------------------------------------
         prev_frame = input_seq[:, -1]

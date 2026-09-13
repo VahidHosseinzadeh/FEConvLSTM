@@ -264,34 +264,39 @@ class Seq2SeqFEConvLSTM(nn.Module):
         else:
             return h.max(dim=1)[0]
 
+    def encode(self, input_seq, return_states=False):
+        """
+        Run the encoder only and hand back the recurrent state it ends on.
+
+        Returns (h, c, h_states) with h and c of shape (B, num_v, Ch, H, W) --
+        the FULL per-velocity-channel state, not the channel-averaged summary
+        `return_states` produces. A head reading a motion-defined figure out of
+        the velocity channels needs those feature channels intact.
+
+        forward() calls this, so the encoder lives in one place and a head that
+        trains on `encode` sees precisely the state prediction trains on.
+        """
+        B, T_in, C, H, W = input_seq.shape
+
+        h, c = self.cell.init_hidden(B, H, W, input_seq.device)
+
+        h_states = [] if return_states else None
+
+        for t in range(T_in):
+
+            h, c = self.cell(input_seq[:, t], (h, c))
+
+            if return_states:
+                h_states.append(h.mean(dim=2).detach())
+
+        return h, c, h_states
+
     def forward(self,
                 input_seq,
                 pred_len,
                 return_states=False):
 
-        B, T_in, C, H, W = input_seq.shape
-
-        device = input_seq.device
-
-        h, c = self.cell.init_hidden(
-            B,
-            H,
-            W,
-            device
-        )
-
-        h_states = [] if return_states else None
-
-        # Encoder
-        for t in range(T_in):
-
-            h, c = self.cell(
-                input_seq[:, t],
-                (h, c)
-            )
-
-            if return_states:
-                h_states.append(h.mean(dim=2).detach())
+        h, c, h_states = self.encode(input_seq, return_states=return_states)
 
         prev = input_seq[:, -1]
 
