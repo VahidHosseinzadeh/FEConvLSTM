@@ -196,8 +196,17 @@ class CommonFateMovingMNISTDataset(Dataset):
     corr_len      : correlation length of both textures, in pixels. 0 gives
                     white noise, whose phase-correlation peak is sharp but
                     whose aperture problem is trivial; ~1 gives a texture with
-                    real spatial structure. Both layers share it, so texture
-                    statistics cannot leak the figure.
+                    real spatial structure.
+
+                    Both layers share it, so no INTENSITY statistic can leak the
+                    figure -- but the SEAM between two independently drawn smooth
+                    fields still can. Measured on frame 0 alone, a local gradient
+                    magnitude finds the mask boundary with AUC 0.49 at corr_len
+                    <= 0.5, 0.53 at 1.0, and 0.62 at 3.0. Above ~1.0 the
+                    correlation length exceeds the stroke width, the outline
+                    becomes visible in a single frame, and the task stops being
+                    purely motion-defined. Keep corr_len <= 1.0 for the
+                    "no single frame contains the figure" claim.
     digit_scale   : integer upscaling of the 28x28 glyph via pixel replication.
     mask_threshold: glyph intensity above which a pixel belongs to the figure.
     time_varying  : piecewise-constant velocities instead of constant ones.
