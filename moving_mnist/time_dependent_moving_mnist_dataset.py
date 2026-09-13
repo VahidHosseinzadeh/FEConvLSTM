@@ -383,9 +383,14 @@ class TDMovingMNISTDataset(Dataset):
                 return False
         return True
 
-    def _sample_initial_positions(self):
+    def _sample_initial_positions(self, n=None):
         """
         Sample (cx, cy) centre positions for each digit.
+
+        `n` overrides how many to place, for subclasses whose motion slots and
+        placed objects differ in number (CommonFateMovingMNISTDataset carries a
+        background layer that has a velocity but no position). Defaults to
+        self.num_digits, so existing callers are unaffected.
 
         Strategy
         --------
@@ -403,7 +408,7 @@ class TDMovingMNISTDataset(Dataset):
         small to fit N digits.
         """
         S = self.image_size
-        N = self.num_digits
+        N = self.num_digits if n is None else n
         positions = []
 
         for i in range(N):

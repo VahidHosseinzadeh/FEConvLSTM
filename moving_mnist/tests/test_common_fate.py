@@ -38,7 +38,8 @@ if str(_PKG) not in sys.path:
     sys.path.insert(0, str(_PKG))
 
 from common_fate_moving_mnist_dataset import (  # noqa: E402
-    CommonFateMovingMNISTDataset, make_sequence, _yx_to_xy,
+    CommonFateMovingMNISTDataset, make_sequence, cumulative_displacement,
+    _xy_to_yx, _yx_to_xy,
 )
 from common_fate_diagnostics import (  # noqa: E402
     leaky_accumulate, local_var, pc_peaks, residual_bootstrap,
@@ -189,18 +190,10 @@ def test_dataset_contract():
     assert seq.shape == (SEQ_LEN, 1, IMAGE_SIZE, IMAGE_SIZE) and seq.dtype == torch.float32
     assert 0.0 <= float(seq.min()) and float(seq.max()) <= 1.0, "affine normalize must land in [0,1]"
     assert isinstance(label, int) and 0 <= label <= 9
+    # N figures + 1 background layer, background last
     assert motion.shape == (SEQ_LEN, 2, 2) and motion.dtype == torch.int64
-    assert mask.shape == (SEQ_LEN, IMAGE_SIZE, IMAGE_SIZE)
+    assert mask.shape == (SEQ_LEN, 1, IMAGE_SIZE, IMAGE_SIZE)
     assert set(np.unique(mask.numpy())) <= {0.0, 1.0}
-
-    # motion[t, 0] = (vx, vy) of the figure. In moving_mask the mask travels
-    # with it, so the frame-to-frame mask shift must equal (vy, vx) in (row,
-    # col). This is the one place the numpy (dy, dx) world meets the repo's
-    # (vx, vy) world, and a transpose here would be invisible everywhere else.
-    vx, vy = int(motion[0, 0, 0]), int(motion[0, 0, 1])
-    rolled = np.roll(mask[0].numpy(), (vy, vx), axis=(0, 1))
-    assert np.array_equal(rolled, mask[1].numpy()), \
-        "motion is not (vx, vy), or the mask track does not follow the figure"
 
     assert (motion[:, 0] != motion[:, 1]).any(), "figure and background share a velocity"
 
@@ -213,10 +206,127 @@ def test_dataset_contract():
     assert torch.equal(first, ds[0][0]), "reset_rng did not restore the sequence"
 
 
+def test_motion_indexing_matches_the_rendered_displacement():
+    """
+    motion[t] must be the step taking frame t to frame t+1 -- TDMovingMNISTDataset's
+    convention, and what every velocity head in this repo is trained against.
+
+    The naive cumsum puts frame 0 at v[0] instead, which makes motion[t] the step
+    from t-1 to t. A CONSTANT velocity hides that completely, so this test runs a
+    time-varying mode on purpose: it is the only setting where the off-by-one is
+    observable at all.
+    """
+    for mode in ("piecewise", "stochastic"):
+        ds = CommonFateMovingMNISTDataset(
+            root=DATA_ROOT, train=False, seq_len=SEQ_LEN, image_size=IMAGE_SIZE,
+            max_speed=MAX_SPEED, motion_mode=mode, variant="moving_mask",
+            return_motion=True, return_mask=True, random=False, seed=SEED,
+            download=True)
+        ds.reset_rng()
+        changed = 0
+        for i in range(4):
+            _, _, motion, mask = ds[i]
+            for t in range(SEQ_LEN - 1):
+                vx, vy = int(motion[t, 0, 0]), int(motion[t, 0, 1])
+                rolled = np.roll(mask[t, 0].numpy(), (vy, vx), axis=(0, 1))
+                assert np.array_equal(rolled, mask[t + 1, 0].numpy()), (
+                    f"{mode}: motion[{t}] is not the step from frame {t} to {t+1} "
+                    f"(or motion is not (vx, vy))")
+                changed += int(t > 0 and not torch.equal(motion[t, 0], motion[t - 1, 0]))
+        assert changed > 0, f"{mode} produced no velocity change; the test proves nothing"
+
+
+def test_cumulative_displacement_convention():
+    """displacement[0] = 0 and displacement[t] = sum(v[0..t-1])."""
+    v = np.array([[1, 2], [3, 4], [5, 6]])
+    d = cumulative_displacement(v)
+    assert np.array_equal(d, [[0, 0], [1, 2], [4, 6]])
+    assert np.array_equal(np.diff(d, axis=0), v[:-1]), \
+        "consecutive displacements must differ by the velocity of the EARLIER frame"
+
+
+def test_inherits_the_parent_motion_vocabulary():
+    """The point of subclassing: every TDMovingMNISTDataset motion mode works."""
+    for mode in ("constant", "piecewise", "stochastic", "accelerate"):
+        ds = CommonFateMovingMNISTDataset(
+            root=DATA_ROOT, train=False, seq_len=SEQ_LEN, image_size=IMAGE_SIZE,
+            max_speed=MAX_SPEED, motion_mode=mode, return_motion=True,
+            random=False, seed=SEED, download=True)
+        _, _, motion = ds[0]
+        assert motion.shape == (SEQ_LEN, 2, 2)
+        n_distinct = len({tuple(v) for v in motion[:, 0].tolist()})
+        if mode == "constant":
+            assert n_distinct == 1, "constant mode changed the figure velocity"
+        assert (motion[:, 0] != motion[:, 1]).any()
+
+    # motion_difficulty must not trip the parent's "family overridden" warning
+    # just because this class defaults motion_mode to 'constant'.
+    import warnings as _w
+    with _w.catch_warnings():
+        _w.simplefilter("error")
+        CommonFateMovingMNISTDataset(
+            root=DATA_ROOT, train=False, seq_len=SEQ_LEN, image_size=IMAGE_SIZE,
+            max_speed=MAX_SPEED, motion_difficulty=0.5, download=True)
+
+    # freeze_after: the velocity is constant from freeze_after-1 onward
+    ds = CommonFateMovingMNISTDataset(
+        root=DATA_ROOT, train=False, seq_len=SEQ_LEN, image_size=IMAGE_SIZE,
+        max_speed=MAX_SPEED, motion_mode="stochastic", freeze_after=8,
+        return_motion=True, random=False, seed=SEED, download=True)
+    _, _, motion = ds[0]
+    assert (motion[7:] == motion[7]).all(), "freeze_after did not freeze the velocity"
+
+
+def test_multiple_figures():
+    """N figures + 1 background, with labels aligned to the figure motion slots."""
+    N = 2
+    ds = CommonFateMovingMNISTDataset(
+        root=DATA_ROOT, train=False, seq_len=SEQ_LEN, image_size=IMAGE_SIZE,
+        num_figures=N, max_speed=MAX_SPEED, motion_mode="piecewise",
+        variant="moving_mask", return_motion=True, return_positions=True,
+        return_mask=True, random=False, seed=SEED, download=True)
+
+    seq, labels, motion, positions, mask = ds[0]
+    assert seq.shape == (SEQ_LEN, 1, IMAGE_SIZE, IMAGE_SIZE)
+    assert labels.shape == (N,) and len(set(labels.tolist())) == N, \
+        "require_distinct_digits should give a well-posed set-prediction target"
+    assert motion.shape == (SEQ_LEN, N + 1, 2)
+    assert positions.shape == (SEQ_LEN, N, 2)
+    assert mask.shape == (SEQ_LEN, N, IMAGE_SIZE, IMAGE_SIZE)
+
+    # Each figure's own mask track must follow its own motion slot -- this is
+    # what makes labels[i], motion[:, i] and mask[:, i] refer to one object.
+    for i in range(N):
+        vx, vy = int(motion[0, i, 0]), int(motion[0, i, 1])
+        rolled = np.roll(mask[0, i].numpy(), (vy, vx), axis=(0, 1))
+        assert np.array_equal(rolled, mask[1, i].numpy()), \
+            f"figure {i}'s mask does not follow motion slot {i}"
+
+    # Every figure separated from the background at every step
+    gap = (motion[:, :N] - motion[:, N:]).abs().amax(dim=2)
+    assert int(gap.min()) >= 2, "a figure travelled with the background"
+
+
+def test_still_no_single_frame_cue_with_two_figures():
+    """Adding figures must not add a per-frame intensity cue."""
+    ds = CommonFateMovingMNISTDataset(
+        root=DATA_ROOT, train=False, seq_len=SEQ_LEN, image_size=IMAGE_SIZE,
+        num_figures=2, max_speed=MAX_SPEED, normalize="none",
+        return_mask=True, random=False, seed=SEED, download=True)
+    ds.reset_rng()
+    aucs = []
+    for i in range(8):
+        seq, _, _, mask = ds[i]
+        any_fig = mask[0].amax(dim=0).numpy()
+        aucs.append(intensity_auc(seq[0, 0].numpy(), any_fig))
+    assert 0.45 <= np.mean(aucs) <= 0.55, \
+        f"two-figure frames leak the figures through intensity, AUC={np.mean(aucs):.3f}"
+
+
 def test_guards():
     """Configurations that would silently produce a figureless set are refused."""
     for kw, msg in [
-        (dict(num_digits=2), "num_digits"),
+        (dict(num_figures=0), "num_figures"),
         (dict(min_dv=7), "min_dv"),
         (dict(variant="nope"), "variant"),
         (dict(normalize="nope"), "normalize"),
@@ -227,6 +337,45 @@ def test_guards():
         except ValueError:
             continue
         raise AssertionError(f"expected ValueError for {msg}={kw}")
+
+
+def test_transport_selects_the_right_figure_with_two():
+    """
+    With two figures moving differently, transporting at figure j's velocity must
+    recover figure j and not the other one.
+
+    This is the property that makes the multi-figure setting worth having: the
+    co-moving frame does not merely reveal "some shape", it SELECTS the object
+    whose velocity you transported at. Without it, two figures would just be one
+    noisier segmentation problem.
+    """
+    for variant, lo, hi in (("moving_mask", 0.30, None), ("static_mask", None, 0.12)):
+        ds = CommonFateMovingMNISTDataset(
+            root=DATA_ROOT, train=False, seq_len=SEQ_LEN, image_size=IMAGE_SIZE,
+            num_figures=2, max_speed=MAX_SPEED, variant=variant, corr_len=1.0,
+            min_dv=2, separate_figures=True, normalize="none",
+            return_motion=True, return_mask=True, random=False, seed=99, download=True)
+        ds.reset_rng()
+
+        own, other = [], []
+        for i in range(6):
+            seq, _, motion, mask = ds[i]
+            frames = seq[:, 0].numpy()
+            disp = _xy_to_yx(cumulative_displacement(motion.numpy()))
+            for j in range(2):
+                score = local_var(leaky_accumulate(frames, disp[:, j], lam=0.9), 3)
+                own.append(area_matched_iou(score, mask[0, j].numpy()))
+                other.append(area_matched_iou(score, mask[0, 1 - j].numpy()))
+
+        if lo is not None:
+            assert np.mean(own) >= lo, \
+                f"{variant}: transport did not recover the transported figure, IoU={np.mean(own):.3f}"
+            assert np.mean(own) > 3 * np.mean(other), (
+                f"{variant}: transport at figure j's velocity is not SELECTIVE -- "
+                f"own={np.mean(own):.3f} vs other={np.mean(other):.3f}")
+        if hi is not None:
+            assert np.mean(own) <= hi, \
+                f"{variant}: transport should recover nothing, IoU={np.mean(own):.3f}"
 
 
 # ------------------------------------------------------------------------- report
