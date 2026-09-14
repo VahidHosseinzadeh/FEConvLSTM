@@ -53,6 +53,7 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader, Subset, random_split
 
 _HERE = Path(__file__).resolve().parent
@@ -193,7 +194,13 @@ def get_args(argv=None):
                         'the picture the experiment rests on: the frame row is noise, and '
                         'the question is whether the copy transported at the figure '
                         'velocity grows the digit while the others do not.')
-    p.add_argument('--log_states_samples', type=int, default=2)
+    p.add_argument('--log_states_samples', type=int, default=2,
+                   help='How many sequences to DRAW. Kept small: the state tensor is '
+                        '(B, T, V, H, W) and felstm has 25 copies.')
+    p.add_argument('--state_metric_samples', type=int, default=32,
+                   help='How many sequences the val_state_shape_iou scalar averages over. '
+                        'Larger than --log_states_samples because two would be far too '
+                        'noisy for a curve you want to read across epochs.')
     p.add_argument('--wandb_project', type=str, default='FERNN-common-fate')
     p.add_argument('--wandb_entity', type=str, default=None)
     p.add_argument('--wandb_dir', type=str, default='./tmp/')
@@ -295,7 +302,91 @@ def velocity_diagnostics(aux, motion, n_figures):
     w = aux.get("pool_weights")
     if w is not None and w.shape[1] == v_last.shape[1]:
         out["attn_on_fig"] = (w * hit_fig.float()).sum(-1).mean().item()
+        out["attn_on_bg"] = (w * hit_bg.float()).sum(-1).mean().item()
+        # Entropy in nats: 0 = the head committed to one velocity copy,
+        # log(K) = it is hedging uniformly and the pool is doing nothing.
+        # Watch this FALL as attn_on_fig rises; flat at log(K) means the head
+        # never learned to select, whatever the accuracy says.
+        out["attn_entropy"] = (-(w.clamp_min(1e-9).log() * w).sum(-1)).mean().item()
+        out["attn_entropy_max"] = float(np.log(w.shape[1]))
     return out
+
+
+def _local_var(x, k=3):
+    """Local variance in a kxk window, circular (the canvas is a torus). x: (B,H,W)."""
+    x = x.unsqueeze(1)
+    pad = k // 2
+    mu = F.avg_pool2d(F.pad(x, (pad,) * 4, mode="circular"), k, stride=1)
+    mu2 = F.avg_pool2d(F.pad(x * x, (pad,) * 4, mode="circular"), k, stride=1)
+    return (mu2 - mu * mu).clamp(min=0).squeeze(1)
+
+
+def _area_matched_iou(score, mask):
+    """
+    IoU after thresholding `score` at whatever level selects exactly as many
+    pixels as the mask contains. Area-matching removes the threshold as a free
+    parameter, so this measures the RANKING the score induces and nothing else.
+    """
+    B = score.shape[0]
+    s = score.reshape(B, -1)
+    t = mask.reshape(B, -1) > 0.5
+    k = t.sum(1).clamp(min=1)
+    thr = s.sort(dim=1, descending=True).values.gather(1, (k - 1).unsqueeze(1))
+    p = s >= thr
+    return ((p & t).sum(1).float() / (p | t).sum(1).clamp(min=1).float())
+
+
+def state_shape_iou(model, states, velocities, motion, mask):
+    """
+    Does the hidden state actually CONTAIN the digit's shape?
+
+    This is the mechanism the whole experiment rests on, and accuracy does not
+    measure it: a model can be right for the wrong reason (it was, when the
+    texture seam leaked the outline per frame). This asks the question directly
+    -- take the velocity copy transported at the FIGURE's velocity, take the
+    local variance of its channel-mean, and score that against the true mask.
+
+    High only if the figure accumulated coherently in that copy. lstm has no
+    transport, so its single state smears the figure across its path and should
+    score near the mask's area fraction however good its accuracy looks. That
+    contrast is the point.
+
+    Returns a scalar, or None when nothing can be scored.
+    """
+    if mask is None or motion is None or states is None:
+        return None
+
+    h = states[:, -1]                                  # (B, V, H, W) channel-mean
+    B, V = h.shape[:2]
+    gt_fig = motion[:, -2, 0]                          # (B, 2) the last transported v
+    target = mask[:, -1].amax(dim=1)                   # (B, H, W) figure at frame T-1
+
+    # Pick, per sample, the copy transported at the figure's velocity.
+    idx = torch.zeros(B, dtype=torch.long, device=h.device)
+    valid = torch.ones(B, dtype=torch.bool, device=h.device)
+
+    if model.model in ("lstm", "felstm"):
+        grid = {tuple(v): k for k, v in enumerate(model.backbone.cell.v_list)}
+        for b in range(B):
+            key = tuple(int(x) for x in gt_fig[b])
+            if key in grid:
+                idx[b] = grid[key]
+            elif V == 1:
+                idx[b] = 0                              # lstm: the only state there is
+            else:
+                valid[b] = False
+    else:
+        if velocities is None:
+            return None
+        match = (velocities[:, -1].round().long() == gt_fig[:, None, :]).all(-1)  # (B, K)
+        idx = match.float().argmax(-1)
+        valid = match.any(-1)
+
+    if not bool(valid.any()):
+        return None
+    sel = h[torch.arange(B, device=h.device), idx]      # (B, H, W)
+    iou = _area_matched_iou(_local_var(sel), target)
+    return float(iou[valid].mean())
 
 
 def log_states(model, loader, fixed_ds, device, args, epoch):
@@ -314,7 +405,9 @@ def log_states(model, loader, fixed_ds, device, args, epoch):
 
     fixed_ds.reset_rng()
     batch = next(iter(loader))
-    n = min(args.log_states_samples, batch[0].shape[0])
+    # More samples than the pictures use: the images need two, the IoU scalar
+    # would be far too noisy on two.
+    n = min(args.state_metric_samples, batch[0].shape[0])
     seq = batch[0][:n].to(device)
     motion = batch[2][:n].to(device) if len(batch) > 2 else None
     mask = batch[3][:n].to(device) if len(batch) > 3 else None
@@ -322,24 +415,34 @@ def log_states(model, loader, fixed_ds, device, args, epoch):
     was_training = model.training
     model.eval()
     with torch.no_grad():
-        _, velocities, states = model.encode(seq, return_states=True)
+        h_last, velocities, states = model.encode(seq, return_states=True)
     model.train(was_training)
+
+    extra = {}
+    iou = state_shape_iou(model, states, velocities, motion, mask)
+    if iou is not None:
+        extra["val_state_shape_iou"] = iou
+        if mask is not None:
+            # Chance for an area-matched IoU is the mask's area fraction.
+            extra["val_state_shape_iou_chance"] = float(mask[:, -1].amax(1).mean())
 
     v_list = (model.backbone.cell.v_list
               if model.model in ("lstm", "felstm") else None)
     log_motion_classification_states(
         states, seq, mask_track=mask, velocities=velocities,
         v_list=v_list, gt_motion=motion, split_name="val", epoch=epoch,
-        step=epoch, num_samples=n)
+        step=epoch, num_samples=min(args.log_states_samples, seq.shape[0]))
+    return extra
 
 
 # -------------------------------------------------------------------- epochs
 def run_epoch(model, loader, device, n_figures, criterion, optimizer=None,
-              grad_clip=1.0, max_batches=None):
+              grad_clip=1.0, max_batches=None, collect_preds=False):
     train = optimizer is not None
     model.train(train)
     tot_loss = tot_correct = tot_n = 0
     diag_sum, diag_n = {}, 0
+    y_true, y_pred = [], []
 
     for b, batch in enumerate(loader):
         if max_batches and b >= max_batches:
@@ -361,9 +464,13 @@ def run_epoch(model, loader, device, n_figures, criterion, optimizer=None,
             optimizer.step()
 
         bs = label.size(0)
+        pred = logits.argmax(1)
         tot_loss += loss.item() * bs
-        tot_correct += (logits.argmax(1) == label).sum().item()
+        tot_correct += (pred == label).sum().item()
         tot_n += bs
+        if collect_preds:
+            y_true.extend(label.tolist())
+            y_pred.extend(pred.tolist())
 
         with torch.no_grad():
             d = velocity_diagnostics(aux, motion, n_figures)
@@ -375,6 +482,8 @@ def run_epoch(model, loader, device, n_figures, criterion, optimizer=None,
     stats = {"loss": tot_loss / max(tot_n, 1), "acc": tot_correct / max(tot_n, 1)}
     if diag_n:
         stats.update({k: v / diag_n for k, v in diag_sum.items()})
+    if collect_preds:
+        stats["_y_true"], stats["_y_pred"] = y_true, y_pred
     return stats
 
 
@@ -490,18 +599,23 @@ def main(argv=None):
                "lr": optimizer.param_groups[0]["lr"],
                **{f"train_{k}": v for k, v in tr.items()},
                **{f"val_{k}": v for k, v in va.items()}}
+
+        # Before the print and the log, so the shape IoU appears in both.
+        if wandb and args.log_states_every and epoch % args.log_states_every == 0:
+            row.update(log_states(model, state_loader, test_ds, device, args, epoch) or {})
         history["epochs"].append(row)
 
         extra = "".join(f"  {k}={va[k]:.3f}" for k in
                         ("slot_hit_fig", "slot_hit_bg", "attn_on_fig") if k in va)
+        if "val_state_shape_iou" in row:
+            extra += (f"  shape_iou={row['val_state_shape_iou']:.3f}"
+                      f"(chance {row['val_state_shape_iou_chance']:.3f})")
         print(f"epoch {epoch:3d} | train loss {tr['loss']:.4f} acc {tr['acc']:.3f} "
               f"| val loss {va['loss']:.4f} acc {va['acc']:.3f}{extra} "
               f"| {row['time']:.0f}s")
 
         if wandb:
             wandb.log(row, step=epoch)
-            if args.log_states_every and epoch % args.log_states_every == 0:
-                log_states(model, state_loader, test_ds, device, args, epoch)
 
         if va["acc"] > best_val:
             best_val, best_epoch, since_improved = va["acc"], epoch, 0
@@ -524,7 +638,9 @@ def main(argv=None):
     if ck.exists():
         model.load_state_dict(torch.load(ck, map_location=device)["model"])
     test_ds.reset_rng()
-    te = run_epoch(model, test_loader, device, args.num_figures, criterion)
+    te = run_epoch(model, test_loader, device, args.num_figures, criterion,
+                   collect_preds=bool(wandb))
+    y_true, y_pred = te.pop("_y_true", None), te.pop("_y_pred", None)
     history["test"] = te
     history["best_val_acc"] = best_val
     history["best_epoch"] = best_epoch
@@ -537,6 +653,21 @@ def main(argv=None):
     with open(results_dir / f"history_{run_name}.json", "w") as f:
         json.dump(history, f, indent=2)
     if wandb:
+        if y_true:
+            # Which digits get confused with which. On this task a model reading
+            # a per-frame cue tends to confuse by stroke thickness, while one
+            # reading motion confuses by shape -- the structure of the errors
+            # says more about the mechanism than the scalar does.
+            last_step = max(0, len(history["epochs"]) - 1)
+            wandb.log({"test_confusion": wandb.plot.confusion_matrix(
+                y_true=y_true, preds=y_pred,
+                class_names=[str(d) for d in range(10)])}, step=last_step)
+            per_class = {}
+            for t, pdt in zip(y_true, y_pred):
+                a, b = per_class.setdefault(t, [0, 0])
+                per_class[t] = [a + int(t == pdt), b + 1]
+            for d, (c, n) in sorted(per_class.items()):
+                wandb.summary[f"test_acc_digit{d}"] = c / max(n, 1)
         # Final numbers go in the summary, not the history: a step-less wandb.log
         # here would advance the counter past the last epoch for no benefit.
         wandb.summary["test_acc"] = te["acc"]

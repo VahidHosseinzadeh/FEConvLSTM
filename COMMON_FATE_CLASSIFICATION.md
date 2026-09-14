@@ -200,6 +200,28 @@ help — a defect of the peak selection, not evidence the scene has more motions
 
 **Chance is 10%.**
 
+### `val_state_shape_iou` — the one to watch
+
+**Does the hidden state actually contain the digit's shape?** Accuracy cannot
+answer this; a model can be right for the wrong reason, and once was. This asks
+directly: take the velocity copy transported at the figure's velocity, take the
+local variance of its channel-mean, and score that against the true mask
+(area-matched IoU, so the threshold is not a free parameter).
+
+`val_state_shape_iou_chance` is logged beside it — the mask's area fraction.
+
+Measured on **untrained** models, which is already diagnostic:
+
+| model | shape IoU (chance 0.062) | |
+|---|---|---|
+| `lstm` | **0.019** | below chance — no transport, so the figure smears along its path |
+| `felstm` | 0.119 | ~2x chance |
+| `melstm` | **0.328** | 5x chance — the figure slot holds the shape |
+
+This separates the three models by **mechanism** before any training, and it is
+the metric that would have caught the seam leak: a leaking `lstm` shows high
+accuracy and a flat, near-chance shape IoU.
+
 ### Velocity diagnostics — melstm only
 
 These matter *more than the loss curve*, because an accuracy number from slots
@@ -209,17 +231,22 @@ that never transported at the figure's velocity is measuring nothing.
 |---|---|---|
 | `val_slot_hit_fig` | fraction of samples where some slot ends the encoder holding the **ground-truth figure** velocity | ~0.95+ |
 | `val_slot_hit_bg` | same for the **background** velocity | ~1.0 |
-| `val_attn_on_fig` | share of the attention pool's mass sitting on a copy matching the figure | should **rise** during training |
+| `val_attn_on_fig` | share of the attention pool's mass on a copy matching the figure | should **rise** |
+| `val_attn_on_bg` | same for the background copy | should fall as the head commits |
+| `val_attn_entropy` | entropy of the attention distribution, in nats | should **fall** from `log(K)` |
+| `val_attn_entropy_max` | `log(K)`, the hedging ceiling, for reference | constant |
 
 If `slot_hit_fig` is near zero, the model never represented the figure — fix that
 before interpreting anything else. If it is high but `attn_on_fig` stays flat at
-`1/K`, the slots found the figure but the head never learned to attend to it.
+`1/K` and `attn_entropy` stays at `log(K)`, the slots found the figure but the
+head never learned to select it, and the pool is doing nothing.
 
 ### The state images
 
 `val_states_sample0`, `val_states_sample1` — logged every `--log_states_every`
 epochs (default 1) on a **fixed** set of sequences, so the wandb step slider
-shows the *same* sample developing as training proceeds.
+shows the *same* sample developing as training proceeds. **Every timestep
+`0 … T-1` is shown**, one per column.
 
 Each figure is, top to bottom:
 
@@ -228,13 +255,24 @@ Each figure is, top to bottom:
   selected (the one matching the figure, the one matching the background, plus
   controls) because its whole lattice is unreadable; for `melstm` all `K` slots;
   for `lstm` the single untransported state.
+- **`local var (figure copy)`** — the shape readout, computed from the row marked
+  `<- FIGURE`. This is the picture-form of `val_state_shape_iou`: structure
+  appearing here *is* the digit being recovered.
 - **`frame (input)`** — what the model saw. This is noise. The digit is genuinely
   not in it.
 - **`figure (GT mask)`** — the answer key: where the figure actually was.
 
 **What you are looking for:** the copy marked `<- FIGURE` should develop the
-digit's shape over time while the others stay textureless. That is the entire
-experiment in one picture.
+digit's shape over time while the others stay textureless, and the `local var`
+row should come to match the `GT mask` row. That is the entire experiment in one
+picture.
+
+### `test_confusion`
+
+A 10x10 confusion matrix on the test set, logged at the end, plus
+`test_acc_digit0 … digit9` in the summary. The *structure* of the errors says
+more about mechanism than the scalar does: a model reading a per-frame cue tends
+to confuse digits by stroke statistics, one reading motion by shape.
 
 If the title says *"not on this model's velocity lattice"*, that copy does not
 exist for this model — expected for `felstm` under `--bg_mode disjoint`, and the

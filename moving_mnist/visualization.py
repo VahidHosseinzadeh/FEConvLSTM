@@ -323,8 +323,9 @@ def log_motion_classification_states(
     epoch=None,
     step=None,
     num_samples=2,
-    subsample_t=2,
+    subsample_t=1,
     max_slots=6,
+    show_shape_readout=True,
 ):
     """
     Show what each velocity copy accumulated, for the motion-defined-digit task.
@@ -368,6 +369,23 @@ def log_motion_classification_states(
     steps = list(range(0, T, max(1, subsample_t)))
     if steps[-1] != T - 1:
         steps.append(T - 1)          # always show the final state the head reads
+
+    def local_var(x, k=3):
+        """
+        Local variance in a kxk window -- the 'is there structure here' readout.
+
+        This is what turns a coherently accumulated copy into a shape: inside the
+        figure the copy adds in register and keeps its variance, outside it
+        averages a drifting texture toward a smooth mean. Circular padding
+        because the canvas is a torus.
+        """
+        x = x[None, None]
+        pad = k // 2
+        mu = torch.nn.functional.avg_pool2d(
+            torch.nn.functional.pad(x, (pad,) * 4, mode="circular"), k, stride=1)
+        mu2 = torch.nn.functional.avg_pool2d(
+            torch.nn.functional.pad(x * x, (pad,) * 4, mode="circular"), k, stride=1)
+        return (mu2 - mu * mu).clamp(min=0)[0, 0]
 
     for i in range(n):
         h = h_states[i].detach().cpu()                       # (T, V, H, W)
@@ -414,32 +432,50 @@ def log_motion_classification_states(
         else:                                                 # lstm: nothing to pick
             chosen, labels = [0], ["h\n(no transport)"]
 
-        rows = len(chosen) + 1 + (mk is not None)
+        # The shape readout goes directly under the copy it is computed from, so
+        # "this copy accumulated the digit" can be read off without inferring it
+        # from a difference map.
+        # Whichever copy is the figure's, not necessarily the first one listed --
+        # melstm's slot order comes from the bootstrap, which puts the dominant
+        # background first.
+        fig_row = next((r for r, lab in enumerate(labels) if "FIGURE" in lab), None)
+        add_readout = show_shape_readout and fig_row is not None
+        rows = len(chosen) + int(add_readout) + 1 + (mk is not None)
+
         fig, axes = plt.subplots(
             rows, len(steps),
-            figsize=(max(6, len(steps) * 1.25), max(2, rows * 1.3) + 0.8),
-            gridspec_kw={"wspace": 0.05, "hspace": 0.30},
+            figsize=(max(6, len(steps) * 1.05), max(2, rows * 1.15) + 0.5),
+            gridspec_kw={"wspace": 0.04, "hspace": 0.28},
             squeeze=False,
         )
 
+        readout_row = len(chosen)
+        frame_row = readout_row + int(add_readout)
         for col, t in enumerate(steps):
             for r, k in enumerate(chosen):
                 m = h[t, k]
                 lim = m.abs().max().clamp(min=1e-8).item()
                 axes[r, col].imshow(m, cmap="coolwarm", vmin=-lim, vmax=lim)
-            axes[len(chosen), col].imshow(fr[t].mean(0), cmap="gray")
+            if add_readout:
+                lv = local_var(h[t, chosen[fig_row]])
+                axes[readout_row, col].imshow(lv, cmap="magma")
+            axes[frame_row, col].imshow(fr[t].mean(0), cmap="gray")
             if mk is not None:
                 axes[rows - 1, col].imshow(mk[t].amax(0), cmap="gray", vmin=0, vmax=1)
-            axes[0, col].set_title(f"t={t}", fontsize=8)
+            axes[0, col].set_title(f"t={t}", fontsize=7)
             for r in range(rows):
                 axes[r, col].axis("off")
 
         for r, lab in enumerate(labels):
             axes[r, 0].text(-0.45, 0.5, lab, rotation=90, va="center", ha="center",
                             fontsize=6.5, transform=axes[r, 0].transAxes)
-        axes[len(chosen), 0].text(-0.45, 0.5, "frame\n(input)", rotation=90,
-                                  va="center", ha="center", fontsize=6.5,
-                                  transform=axes[len(chosen), 0].transAxes)
+        if add_readout:
+            axes[readout_row, 0].text(-0.45, 0.5, "local var\n(figure copy)", rotation=90,
+                                      va="center", ha="center", fontsize=6.5,
+                                      transform=axes[readout_row, 0].transAxes)
+        axes[frame_row, 0].text(-0.45, 0.5, "frame\n(input)", rotation=90,
+                                va="center", ha="center", fontsize=6.5,
+                                transform=axes[frame_row, 0].transAxes)
         if mk is not None:
             axes[rows - 1, 0].text(-0.45, 0.5, "figure\n(GT mask)", rotation=90,
                                    va="center", ha="center", fontsize=6.5,
@@ -452,8 +488,9 @@ def log_motion_classification_states(
             title += f"   epoch {epoch}"
         if missing:
             title += f"\nnot on this model's velocity lattice: {', '.join(missing)}"
-        fig.suptitle(title, fontsize=9, y=0.99)
-        fig.subplots_adjust(top=0.90 if not missing else 0.87)
+        fig.suptitle(title, fontsize=9, y=0.995)
+        fig.subplots_adjust(top=0.88 if not missing else 0.85, bottom=0.02,
+                            left=0.045, right=0.995)
 
         # No "/" in the key. A slash makes wandb file the panel under a grouped
         # section, which an existing saved workspace layout often does not
