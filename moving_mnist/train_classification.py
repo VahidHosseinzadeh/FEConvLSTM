@@ -62,7 +62,7 @@ if str(_HERE) not in sys.path:
 
 from common_fate_moving_mnist_dataset import CommonFateMovingMNISTDataset
 from torchvision.datasets import MNIST
-from motion_classification_model import build_classifier
+from motion_classification_model import build_classifier, recompute_bn_stats
 from mps_integer_warp import enable_integer_shift_warp
 
 
@@ -115,15 +115,23 @@ def get_args(argv=None):
     p.add_argument('--head_blocks', type=int, default=3)
     p.add_argument('--head_mlp_hidden', type=int, default=128)
     p.add_argument('--head_dropout', type=float, default=0.0)
-    p.add_argument('--head_norm', choices=['group', 'batch', 'none'], default='group',
-                   help="Normalisation in the classifier head. 'batch' is BROKEN for this "
-                        "model: the head's input is an attention-weighted pool of a "
-                        "recurrent state whose distribution shifts as the cell and the "
-                        "attention train, so BatchNorm's running statistics never match and "
-                        "eval-mode accuracy oscillates between chance and the true value "
-                        "across epochs while training accuracy rises smoothly. 'group' "
-                        "(default) has no running statistics and behaves identically in "
-                        "train and eval.")
+    p.add_argument('--precise_bn_batches', type=int, default=50,
+                   help="Batches used to RE-ESTIMATE BatchNorm statistics before each "
+                        "evaluation (0 = off, use the running EMA). BatchNorm's EMA is "
+                        "collected while the weights are still moving, and for a head on a "
+                        "recurrent state it never catches up -- val accuracy then bounces "
+                        "between chance and its true value while training accuracy rises "
+                        "smoothly. Recomputing gives the exact statistics for the CURRENT "
+                        "weights. No effect when --head_norm is not 'batch'.")
+    p.add_argument('--head_norm', choices=['batch', 'group', 'none'], default='batch',
+                   help="Normalisation in the classifier head. 'batch' (default) is the "
+                        "only one that LEARNS on this task -- measured over 14 epochs, "
+                        "batch reaches 0.230 train accuracy while group (at 1e-3 and 3e-3) "
+                        "and none all stay flat at ~0.11. Batch statistics remove the "
+                        "component common to every sample, which here is the background "
+                        "noise that dominates the figure's contribution. Its running "
+                        "statistics do lag badly on this model, which is what "
+                        "--precise_bn_batches exists to fix.")
 
     # --- data
     p.add_argument('--root', type=str, default=str(_HERE.parent / 'data'))
@@ -717,6 +725,10 @@ def main(argv=None):
         tr = run_epoch(model, train_loader, device, args.num_figures, criterion,
                        optimizer, args.grad_clip, curve=curve, global_step=global_step,
                        curve_log_fn=curve_log_fn)
+        # BatchNorm's EMA lags the weights badly here, so re-estimate it from the
+        # TRAINING distribution before measuring. Without this the val number
+        # reflects statistics the model was never trained under.
+        recompute_bn_stats(model, train_loader, device, args.precise_bn_batches)
         val_ds.reset_rng()          # fixed benchmark: identical sequences every epoch
         va = run_epoch(model, val_loader, device, args.num_figures, criterion)
 
@@ -771,6 +783,9 @@ def main(argv=None):
     ck = models_dir / f"{run_name}_best.pth"
     if ck.exists():
         model.load_state_dict(torch.load(ck, map_location=device)["model"])
+    # The checkpoint stores the statistics that were current when it was saved,
+    # which is what we want; recompute anyway so test matches val's protocol.
+    recompute_bn_stats(model, train_loader, device, args.precise_bn_batches)
     test_ds.reset_rng()
     te = run_epoch(model, test_loader, device, args.num_figures, criterion,
                    collect_preds=bool(wandb))

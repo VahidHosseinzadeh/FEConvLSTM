@@ -559,50 +559,74 @@ def test_val_curve_survives_across_epochs_and_resume():
         "the recorder is not threaded through the training epoch"
 
 
-def test_head_behaves_identically_in_train_and_eval():
+def test_precise_bn_recomputes_statistics_for_the_current_weights():
     """
-    Regression: the head used BatchNorm, whose running statistics never matched
-    because its input is an attention-weighted pool of a RECURRENT state, and
-    that distribution shifts as both the cell and the attention weights train.
+    Regression for the val-accuracy oscillation.
 
-    Symptom: val accuracy oscillated between chance and 0.94 across epochs on a
-    2000-sequence set -- far outside sampling noise -- while training accuracy
-    rose smoothly. Evaluated with batch statistics the same model tracked
-    training accuracy (0.11 -> 0.22 over 14 epochs); in eval mode it sat at
-    chance and bounced (0.082 to 0.218).
+    BatchNorm's running statistics are an EMA collected while the weights were
+    still moving. For a head on a RECURRENT state the distribution keeps shifting
+    and the EMA never catches up, so eval used statistics the model was never
+    trained under: val accuracy bounced between chance and 0.94 across epochs
+    while training accuracy rose smoothly.
 
-    GroupNorm has no running statistics, so the two modes agree exactly. Any
-    normalisation added to this head must keep that property.
+    BatchNorm cannot simply be swapped out -- measured over 14 epochs it is the
+    only normalisation that learns here at all (0.230 train accuracy, against
+    ~0.11 flat for GroupNorm at two learning rates and for no normalisation). So
+    the fix is to recompute the statistics, and this pins that recompute actually
+    replaces them with the exact mean/var over the batches it sees.
     """
-    x = torch.randn(4, 6, 1, 32, 32)
-    for model, kw in (("lstm", {}), ("melstm", dict(n_slots=2))):
-        net = MotionDigitClassifier(model=model, hidden_channels=8, **kw)
-        net.eval()
-        with torch.no_grad():
-            a = net(x)
-        net.train()
-        with torch.no_grad():
-            b = net(x)
-        assert torch.allclose(a, b, atol=1e-5), (
-            f"{model}: train and eval forward passes differ, so val accuracy will not "
-            f"reflect what the model actually learned")
+    from motion_classification_model import recompute_bn_stats
+
+    net = MotionDigitClassifier(model="lstm", hidden_channels=8)
+    bns = [m for m in net.modules() if isinstance(m, torch.nn.BatchNorm2d)]
+    assert bns, "the head should contain BatchNorm by default"
+
+    data = [(torch.randn(4, 5, 1, 32, 32) * 3.0 + 1.0,) for _ in range(6)]
+
+    # Poison the running stats, as a lagging EMA effectively does
+    for bn in bns:
+        bn.running_mean.fill_(99.0)
+        bn.running_var.fill_(99.0)
+
+    seen = recompute_bn_stats(net, data, torch.device("cpu"), n_batches=4)
+    assert seen == 4
+    for bn in bns:
+        assert bn.running_mean.abs().max() < 50.0, "running_mean was not re-estimated"
+        assert abs(float(bn.running_var.mean()) - 99.0) > 1.0, "running_var was not re-estimated"
+        assert bn.momentum is not None, "momentum was not restored after the recompute"
+
+    # It must not train anything
+    before = [p.clone() for p in net.parameters()]
+    recompute_bn_stats(net, data, torch.device("cpu"), n_batches=2)
+    assert all(torch.equal(a, b) for a, b in zip(before, net.parameters())), \
+        "recompute_bn_stats changed model parameters; it must only collect statistics"
+
+    # and 0 disables it
+    for bn in bns:
+        bn.running_mean.fill_(7.0)
+    assert recompute_bn_stats(net, data, torch.device("cpu"), n_batches=0) == 0
+    assert all(float(bn.running_mean.abs().max()) == 7.0 for bn in bns)
 
 
-def test_batch_norm_head_is_still_reachable_but_not_default():
-    """'batch' stays available to reproduce the failure; it must not be the default."""
+def test_batch_is_the_default_head_norm_and_alternatives_exist():
+    """
+    'batch' is the measured choice, not a default left unexamined; 'group' and
+    'none' stay available and are normalisation-consistent between modes.
+    """
     import inspect
     from motion_classification_model import ConvClassifierHead
-    assert inspect.signature(ConvClassifierHead).parameters["norm"].default == "group"
+    assert inspect.signature(ConvClassifierHead).parameters["norm"].default == "batch"
+
     x = torch.randn(4, 6, 1, 32, 32)
-    net = MotionDigitClassifier(model="lstm", hidden_channels=8, head_norm="batch")
+    net = MotionDigitClassifier(model="lstm", hidden_channels=8, head_norm="group")
     net.eval()
     with torch.no_grad():
         a = net(x)
     net.train()
     with torch.no_grad():
         b = net(x)
-    assert not torch.allclose(a, b, atol=1e-5), \
-        "head_norm='batch' should still exhibit the train/eval gap it is kept to demonstrate"
+    assert torch.allclose(a, b, atol=1e-5), \
+        "GroupNorm should be identical in train and eval"
 
 
 def test_train_val_test_use_disjoint_mnist_glyphs():

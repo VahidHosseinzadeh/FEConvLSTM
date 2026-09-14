@@ -194,33 +194,52 @@ architecture : melstm  V=2 velocity slots  velocity_source=bootstrap
 The backbone's decoder is built (so the recurrent cell matches the prediction
 experiments exactly) but never run, and is excluded from the optimizer.
 
-### Normalisation — GroupNorm, not BatchNorm
+### Normalisation — BatchNorm, with its statistics recomputed
 
-`--head_norm group` (default). This is not a style choice, and getting it wrong
-produces a failure that looks like a data problem.
+`--head_norm batch` (default) and `--precise_bn_batches 50`. Both are measured
+choices; getting either wrong produces a failure that looks like a data problem.
 
-BatchNorm uses batch statistics while training and running statistics at eval.
-This head's input is an attention-weighted pool of a **recurrent** state, and
-that distribution shifts as both the cell and the attention weights train, so the
-running statistics chase a moving target and never match.
+**BatchNorm is load-bearing here, not a convenience.** Train accuracy over 14
+epochs — the one number every variant reports identically:
 
-Measured over 14 epochs with BatchNorm:
+| norm | lr | ep0 → ep13 |
+|---|---|---|
+| **batch** | 1e-3 | 0.109 → **0.230** |
+| group | 1e-3 | 0.104 → 0.109 (flat) |
+| group | 3e-3 | 0.103 → 0.096 (flat) |
+| none | 1e-3 | 0.110 → 0.106 (flat) |
 
-| | epoch 3 | 9 | 12 | 13 |
+Only BatchNorm learns at all. The likely reason is *what* it normalises over: per
+channel **across the batch**, which removes the component common to every sample
+— here the background noise field, which dominates the small, low-contrast
+structure the figure contributes. GroupNorm divides each sample by its own
+standard deviation, dominated by that same background, leaving the ratio
+untouched.
+
+**But its running statistics lag badly.** They are an EMA collected while the
+weights were still moving, and this head sits on a *recurrent* state whose
+distribution shifts as both the cell and the attention weights train, so the EMA
+never catches up. Left alone, val accuracy oscillates between chance and its true
+value **between epochs** while training accuracy rises smoothly — which is what
+it looked like in practice:
+
+| ep | train_acc | val (stale EMA) | val (**recomputed**) | val (batch stats) |
 |---|---|---|---|---|
-| train acc | 0.200 | 0.208 | 0.217 | 0.215 |
-| val, **batch** statistics | 0.223 | 0.229 | 0.221 | 0.221 |
-| val, **eval** (running) statistics | 0.122 | 0.127 | **0.082** | 0.123 |
+| 3 | 0.196 | 0.087 | **0.225** | 0.209 |
+| 5 | 0.203 | 0.103 | **0.235** | 0.240 |
+| 7 | 0.216 | 0.127 | **0.230** | 0.231 |
+| 9 | 0.211 | 0.122 | **0.246** | 0.229 |
 
-The model is learning normally — evaluating with batch statistics tracks training
-accuracy smoothly. Only the eval-mode forward pass is broken, and it lands at
-chance or below. On a full run this showed up as val accuracy oscillating between
-0.11 and 0.94 **between epochs** on a 2000-sequence set, which is far outside
-sampling noise (±0.007 at 0.9).
+`recompute_bn_stats` re-estimates every BatchNorm from the training distribution
+immediately before each evaluation, using `momentum=None` so PyTorch accumulates
+a cumulative average — the exact mean and variance for the *current* weights. It
+is gradient-free and changes no parameters. Cost is `--precise_bn_batches`
+forward passes per epoch (~20s for melstm at 50).
 
-GroupNorm normalises per sample over channel groups, keeps no running statistics,
-and so behaves identically in both modes. `--head_norm batch` is kept to
-reproduce the failure; `none` is also available.
+**If you see val bouncing between chance and a high value, check this first.** The
+diagnostic is to evaluate the same model twice, once with `model.eval()` and once
+with `model.train()` (batch statistics): if the batch-statistics number tracks
+training accuracy and the eval one does not, it is BatchNorm — not the data.
 
 ### Velocity pooling — why not `max`
 

@@ -125,22 +125,34 @@ class ConvClassifierHead(nn.Module):
     covering ~3% of the frame: a pure average would drown the figure in the
     background it shares its statistics with.
 
-    Normalisation is GroupNorm, not BatchNorm, and that is not a style choice.
-    BatchNorm keeps running statistics for eval and uses batch statistics while
-    training. This head's input is an attention-weighted pool of a RECURRENT
-    state, whose distribution moves as both the cell and the attention weights
-    train, so the running statistics chase a target that keeps shifting and never
-    match. Measured: with BatchNorm, val accuracy evaluated with batch statistics
-    tracked training accuracy smoothly (0.11 -> 0.22 over 14 epochs) while the
-    same model evaluated in eval mode sat at chance and bounced erratically
-    (0.082 to 0.218) -- the reported val accuracy oscillated between chance and
-    0.94 across epochs on a 2000-sequence set, which is far outside sampling
-    noise. GroupNorm normalises per sample over channel groups, has no running
-    statistics, and so behaves identically in both modes.
+    Normalisation is BatchNorm, and on this task it is load-bearing rather than a
+    convenience. Measured over 14 epochs on train accuracy, which is the one
+    number all variants report identically:
+
+        batch  lr 1e-3   0.109 -> 0.230
+        group  lr 1e-3   0.104 -> 0.109   (flat)
+        group  lr 3e-3   0.103 -> 0.096   (flat)
+        none   lr 1e-3   0.110 -> 0.106   (flat)
+
+    Only BatchNorm learns at all. The likely reason is what it normalises OVER:
+    per channel across the batch, which removes the component of the activation
+    that is common to every sample. Here that common component is the background
+    noise field, which dominates the small, low-contrast structure the figure
+    contributes -- so batch statistics act as a background subtraction, while
+    GroupNorm divides each sample by its own standard deviation (dominated by
+    that same background) and leaves the ratio untouched.
+
+    The catch is that BatchNorm's RUNNING statistics, used at eval, lag badly:
+    this head's input is an attention-weighted pool of a recurrent state, so the
+    distribution moves as both the cell and the attention weights train, and the
+    EMA never catches up. Left alone that made val accuracy oscillate between
+    chance and 0.94 across epochs while training accuracy rose smoothly. The fix
+    is not to abandon BatchNorm but to RECOMPUTE its statistics before each
+    evaluation -- see `recompute_bn_stats`.
     """
 
     def __init__(self, in_channels, n_classes=10, channels=64, n_blocks=3,
-                 mlp_hidden=128, dropout=0.0, norm="group", groups=8):
+                 mlp_hidden=128, dropout=0.0, norm="batch", groups=8):
         super().__init__()
         if norm not in ("group", "batch", "none"):
             raise ValueError(f"unknown head norm {norm!r}")
@@ -192,7 +204,7 @@ class MotionDigitClassifier(nn.Module):
                  velocity_pool="attention", pool_temperature=1.0,
                  velocity_source="bootstrap",
                  head_channels=64, head_blocks=3, head_mlp_hidden=128,
-                 head_dropout=0.0, head_norm="group", input_channels=1):
+                 head_dropout=0.0, head_norm="batch", input_channels=1):
         super().__init__()
         self.model = model
         self.hidden_channels = hidden_channels
@@ -463,6 +475,54 @@ class MotionDigitClassifier(nn.Module):
         return "\n".join(lines)
 
 
+@torch.no_grad()
+def recompute_bn_stats(model, loader, device, n_batches=50):
+    """
+    Re-estimate every BatchNorm's running statistics from scratch, on the current
+    weights, before evaluating. ("Precise BN", Wu & Johnson 2021.)
+
+    BatchNorm's running mean/var are an exponential moving average collected while
+    the weights were still changing. For a head sitting on a RECURRENT state --
+    whose activation distribution moves as both the cell and the attention weights
+    train -- that EMA never catches up, and eval-mode accuracy is measured with
+    statistics the model was never trained under. Symptom: val accuracy bouncing
+    between chance and its true value between epochs while training accuracy rises
+    smoothly.
+
+    Setting momentum=None makes PyTorch accumulate a CUMULATIVE average instead of
+    an EMA, so after n_batches forward passes the statistics are the exact mean and
+    variance over those batches, for these weights. Nothing is learned here: no
+    gradients, and the parameters are untouched.
+    """
+    bns = [m for m in model.modules() if isinstance(m, nn.modules.batchnorm._BatchNorm)]
+    if not bns or n_batches <= 0:
+        return 0
+
+    saved = [(bn.momentum, bn.training) for bn in bns]
+    for bn in bns:
+        bn.reset_running_stats()
+        bn.momentum = None            # cumulative average, not an EMA
+        bn.train()                    # so the forward pass updates the statistics
+
+    was_training = model.training
+    model.eval()                      # everything else stays in eval; only BN collects
+    for bn in bns:
+        bn.train()
+
+    seen = 0
+    for batch in loader:
+        if seen >= n_batches:
+            break
+        model(batch[0].to(device))
+        seen += 1
+
+    model.train(was_training)
+    for bn, (mom, mode) in zip(bns, saved):
+        bn.momentum = mom
+        bn.train(mode)
+    return seen
+
+
 def build_classifier(cfg):
     """
     Construct the classifier a run config describes.
@@ -486,5 +546,5 @@ def build_classifier(cfg):
         head_blocks=get("head_blocks", 3),
         head_mlp_hidden=get("head_mlp_hidden", 128),
         head_dropout=get("head_dropout", 0.0),
-        head_norm=get("head_norm", "group"),
+        head_norm=get("head_norm", "batch"),
     )
