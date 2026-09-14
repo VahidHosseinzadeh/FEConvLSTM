@@ -298,7 +298,7 @@ def log_states(model, loader, fixed_ds, device, args, epoch):
     log_motion_classification_states(
         states, seq, mask_track=mask, velocities=velocities,
         v_list=v_list, gt_motion=motion, split_name="val", epoch=epoch,
-        num_samples=n)
+        step=epoch, num_samples=n)
 
 
 # -------------------------------------------------------------------- epochs
@@ -496,7 +496,12 @@ def main(argv=None):
     with open(results_dir / f"history_{run_name}.json", "w") as f:
         json.dump(history, f, indent=2)
     if wandb:
-        wandb.log({"test_acc": te["acc"], "test_loss": te["loss"]})
+        # Final numbers go in the summary, not the history: a step-less wandb.log
+        # here would advance the counter past the last epoch for no benefit.
+        wandb.summary["test_acc"] = te["acc"]
+        wandb.summary["test_loss"] = te["loss"]
+        wandb.summary["best_val_acc"] = best_val
+        wandb.summary["best_epoch"] = best_epoch
         wandb.finish()
 
     # All --epochs completed (not just this Slurm submission's walltime slice):

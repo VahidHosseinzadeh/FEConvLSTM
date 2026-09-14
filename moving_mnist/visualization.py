@@ -321,6 +321,7 @@ def log_motion_classification_states(
     gt_motion=None,
     split_name="val",
     epoch=None,
+    step=None,
     num_samples=2,
     subsample_t=2,
     max_slots=6,
@@ -352,7 +353,16 @@ def log_motion_classification_states(
     gives one slider per sample showing the SAME sequence developing as training
     proceeds, which is the thing to watch. Random sample indices would scatter
     the keys and make that impossible.
+
+    `step` MUST be passed by any caller whose other wandb.log calls use an
+    explicit step. Every sample is logged in ONE call at that step: a wandb.log
+    without `step` commits and advances wandb's internal counter, so logging
+    per sample would push the counter past the epoch and the NEXT epoch's
+    metrics would be silently dropped with "Tried to log to step N that is less
+    than the current step". Images and scalars then also land on different x
+    axes, which is what makes the epoch slider useless.
     """
+    payload = {}
     B, T, V, H, W = h_states.shape
     n = min(num_samples, B)
     steps = list(range(0, T, max(1, subsample_t)))
@@ -445,5 +455,8 @@ def log_motion_classification_states(
         fig.suptitle(title, fontsize=9, y=0.99)
         fig.subplots_adjust(top=0.90 if not missing else 0.87)
 
-        wandb.log({f"{split_name}_velocity_states/sample{i}": wandb.Image(fig)})
+        payload[f"{split_name}_velocity_states/sample{i}"] = wandb.Image(fig)
         plt.close(fig)
+
+    if payload:
+        wandb.log(payload, step=step) if step is not None else wandb.log(payload)

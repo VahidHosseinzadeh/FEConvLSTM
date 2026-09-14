@@ -336,3 +336,59 @@ def test_state_visualisation_uses_identical_sequences_every_epoch():
     # the mask must be present, since it is the answer key beside the states
     assert len(next(iter(state_loader))) > 3, \
         "state batch carries no GT mask; return_mask should be on when logging states"
+
+
+def test_state_logging_does_not_advance_the_wandb_step(monkeypatch):
+    """
+    Regression: wandb.log() without `step` COMMITS and advances wandb's internal
+    counter. Logging one image per sample therefore pushed the counter past the
+    current epoch, and the next epoch's wandb.log(row, step=epoch) was rejected
+    outright -- "Tried to log to step N that is less than the current step" --
+    silently dropping that epoch's metrics as well as misplacing the images.
+
+    So: exactly ONE log call per invocation, carrying every sample, at an
+    explicit step.
+    """
+    import types
+    import matplotlib
+    matplotlib.use("Agg")
+
+    calls = []
+    fake = types.ModuleType("wandb")
+    fake.Image = lambda fig: fig
+    fake.log = lambda d, **kw: calls.append((set(d), kw.get("step", "MISSING")))
+    monkeypatch.setitem(sys.modules, "wandb", fake)
+
+    import importlib
+    import visualization
+    importlib.reload(visualization)
+
+    B, T, H, W = 3, 5, 32, 32
+    frames = torch.rand(B, T, 1, H, W)
+    net = MotionDigitClassifier(model="melstm", hidden_channels=4, n_slots=2).eval()
+    with torch.no_grad():
+        _, vel, states = net.encode(frames, return_states=True)
+
+    visualization.log_motion_classification_states(
+        states, frames, velocities=vel, split_name="val", epoch=7, step=7,
+        num_samples=3)
+
+    assert len(calls) == 1, (
+        f"{len(calls)} wandb.log calls for 3 samples; each step-less call advances "
+        f"the counter and drops the following epoch's metrics")
+    keys, step = calls[0]
+    assert step == 7, f"state images logged at step {step!r}, not the epoch"
+    assert keys == {f"val_velocity_states/sample{i}" for i in range(3)}
+
+
+def test_training_script_has_no_step_less_wandb_logs():
+    """
+    Every wandb.log in the training script must pass an explicit step, or it
+    desynchronises the x axis from the epoch and can drop later epochs. Final
+    numbers belong in wandb.summary, which does not touch the step counter.
+    """
+    import re
+    src = (_PKG / "train_classification.py").read_text()
+    for m in re.finditer(r"wandb\.log\((.*?)\)\n", src, re.S):
+        assert "step=" in m.group(1), \
+            f"wandb.log without an explicit step:\n    wandb.log({m.group(1).strip()})"
