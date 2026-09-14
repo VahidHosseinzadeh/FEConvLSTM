@@ -455,7 +455,12 @@ def log_motion_classification_states(
         fig.suptitle(title, fontsize=9, y=0.99)
         fig.subplots_adjust(top=0.90 if not missing else 0.87)
 
-        payload[f"{split_name}_velocity_states/sample{i}"] = wandb.Image(fig)
+        # No "/" in the key. A slash makes wandb file the panel under a grouped
+        # section, which an existing saved workspace layout often does not
+        # surface -- the images are logged but the user never finds them. This
+        # matches log_state_evolution's flat "{split}_states_sample{i}" naming,
+        # which is where these already appear for the prediction experiments.
+        payload[f"{split_name}_states_sample{i}"] = wandb.Image(fig)
         plt.close(fig)
 
     if payload:

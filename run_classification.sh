@@ -37,16 +37,25 @@ POOL=attention     # 'max' is the repo default elsewhere and is expected to fail
 # ---- data -----------------------------------------------------------------
 DATA_V=2           # figure max speed. felstm needs V_RANGE >= this, and its cost
                    # grows as (2R+1)^2, so raising it is expensive for felstm only.
-BG_MIN=4           # background speed band, DISJOINT from the figure grid
-BG_MAX=5           # (BG_MIN > DATA_V) => figure and background can never coincide
+BG_MODE=opposite   # background stays ON the shared velocity grid and is separated by
+                   # DIRECTION (opposing the digit at t=0) rather than by speed.
+                   # 'disjoint' would guarantee separation by making the background
+                   # faster than any figure -- but that puts it beyond every lattice
+                   # copy felstm has, so felstm could not represent the background at
+                   # all while melstm's tracked slots could: expressive power
+                   # confounded with the effect being measured.
 MOTION=piecewise   # figure velocity held 3-6 frames, then changes
 CORR_LEN=1.0       # keep <= 1.0: above that the texture seam makes the digit
                    # visible in a single frame and the task stops being motion-defined
 
 # ---- per-model ------------------------------------------------------------
-V_RANGE=2          # felstm: (2*2+1)^2 = 25 transported copies, covers |v| <= 2
-N_SLOTS=4          # melstm: slot_hit_fig 62%/78%/94% at K=2/4/6 on this data
-VEL_SRC=frame_pair # melstm: 'tracked' measurably fails here -- see --help
+V_RANGE=2          # felstm: (2*2+1)^2 = 25 transported copies, covers |v| <= 2,
+                   # which now also covers the background since it shares the grid
+N_SLOTS=2          # melstm: the scene has exactly two motions, digit and background.
+                   # Measured slot_hit_fig with VEL_SRC=bootstrap: 97.9% at K=2, and
+                   # identically 97.9% at K=3 and K=4 -- extra slots buy nothing.
+VEL_SRC=bootstrap  # melstm: slot_hit_fig at K=2 is 97.9% (bootstrap) vs 68.8%
+                   # (frame_pair) vs 0.0% (tracked, MEConvLSTM's own protocol)
 
 # Batch size is NOT shared, because memory is not. The recurrent state is carried
 # on every velocity copy at every timestep and kept for BPTT, so felstm's 25
@@ -77,7 +86,7 @@ python moving_mnist/train_classification.py \
   --velocity_pool $POOL --v_range $V_RANGE --num_vel_modes $N_SLOTS \
   --velocity_source $VEL_SRC \
   --seq_len $SEQ_LEN --image_size $IMAGE \
-  --data_v_range $DATA_V --bg_speed_min $BG_MIN --bg_speed_max $BG_MAX \
+  --data_v_range $DATA_V --bg_mode $BG_MODE \
   --motion_mode $MOTION --corr_len $CORR_LEN \
   --batch_size $BATCH --epochs $EPOCHS --lr $LR \
   --max_train_samples $TRAIN_SAMPLES --val_size $VAL_SAMPLES \

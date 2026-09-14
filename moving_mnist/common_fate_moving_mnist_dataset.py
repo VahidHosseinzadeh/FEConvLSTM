@@ -331,6 +331,19 @@ class CommonFateMovingMNISTDataset(TDMovingMNISTDataset):
     min_dv        : required max-norm gap between every figure and the
                     background, at EVERY step. Below 1 a figure can travel with
                     the background and vanish. 0 disables the check.
+    bg_opposite_at_start : require the background to travel in an OPPOSING
+                    direction to every figure at t=0 (strictly negative dot
+                    product), while staying on the SHARED velocity grid.
+
+                    Prefer this to bg_speed_range whenever felstm is in the
+                    comparison. bg_speed_range guarantees separation by putting
+                    the background outside the figure grid -- but felstm's
+                    copies sit at fixed lattice velocities bounded by v_range,
+                    so an off-grid background is a motion felstm structurally
+                    CANNOT represent while melstm's tracked slots can. That is a
+                    difference in expressive power confounded with the effect
+                    being measured. Separating by direction keeps both motions
+                    representable by both models.
     bg_speed_range : (lo, hi) -- give the BACKGROUND its own velocity grid,
                     every integer (vx, vy) with lo <= max(|vx|,|vy|) <= hi.
                     Requires lo > max_speed, which makes the grid disjoint from
@@ -381,6 +394,7 @@ class CommonFateMovingMNISTDataset(TDMovingMNISTDataset):
         mask_threshold=0.3,
         min_dv=2,
         separate_figures=False,
+        bg_opposite_at_start=False,
         bg_speed_range=None,
         max_velocity_tries=200,
         normalize="affine",
@@ -483,6 +497,7 @@ class CommonFateMovingMNISTDataset(TDMovingMNISTDataset):
         self.mask_threshold = mask_threshold
         self.min_dv = min_dv
         self.separate_figures = separate_figures
+        self.bg_opposite_at_start = bg_opposite_at_start
         self.bg_speed_range = bg_speed_range
 
         # Background velocities live on their own grid: every integer (vx, vy)
@@ -624,6 +639,25 @@ class CommonFateMovingMNISTDataset(TDMovingMNISTDataset):
                     gap = (fig[:, i] - fig[:, j]).abs().amax(dim=1).min()
                     if int(gap) < self.min_dv:
                         return False
+
+        if self.bg_opposite_at_start:
+            # At t=0 the background must travel in an OPPOSING direction to every
+            # figure: a strictly negative dot product, so the two are not merely
+            # different but visibly counter-moving from the first frame pair.
+            #
+            # This is the alternative to bg_speed_range for a fair felstm
+            # comparison. Putting the background outside the figure grid
+            # guarantees they never coincide, but it also puts the background
+            # beyond every lattice copy felstm has, so felstm cannot represent
+            # that motion at all while melstm's tracked slots can -- a difference
+            # in what the models can express, confounded with the thing being
+            # measured. Keeping the background ON the shared grid and separating
+            # it by DIRECTION instead keeps both models able to represent both
+            # motions.
+            f0, b0 = motions[0, :N].to(torch.long), motions[0, N].to(torch.long)
+            if bool(((f0 * b0.unsqueeze(0)).sum(dim=1) >= 0).any()):
+                return False
+
         return True
 
     @contextmanager

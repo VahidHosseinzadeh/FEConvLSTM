@@ -43,6 +43,7 @@ Usage
 """
 import argparse
 import json
+import warnings
 import os
 import random
 import sys
@@ -77,20 +78,30 @@ def get_args(argv=None):
     p.add_argument('--v_range', type=int, default=2,
                    help='felstm only: velocity lattice half-width, giving (2R+1)^2 copies. '
                         'Must be >= --data_v_range or no copy can represent the figure.')
-    p.add_argument('--num_vel_modes', type=int, default=4,
-                   help='melstm only: number of velocity slots. Measured slot_hit_fig on '
-                        'this data with --velocity_source frame_pair: 62%% at K=2, 78%% at '
-                        'K=4, 94%% at K=6. Cost is linear in K, so 4 is the default '
-                        'compromise and 6 is worth it if the figure slot is the bottleneck.')
-    p.add_argument('--velocity_source', choices=['frame_pair', 'tracked'], default='frame_pair',
-                   help="melstm only: where slot velocities come from. 'tracked' is "
-                        "MEConvLSTM's own protocol (correlate each slot's hidden state "
-                        "against the next frame) and MEASURABLY FAILS on this data -- after "
-                        "15 frames no slot held either the figure or the background "
-                        "velocity, and slots collapsed from 4 distinct velocities onto 2.0. "
-                        "'frame_pair' (default) reads the velocities off the raw frame pair "
-                        "instead, where phase correlation is reliable here, and keeps slot "
-                        "identity by matching to each slot's previous velocity.")
+    p.add_argument('--num_vel_modes', type=int, default=2,
+                   help='melstm only: number of velocity slots. The scene contains exactly '
+                        'TWO motions -- the digit and the background -- so 2 is the right '
+                        'number, and measured slot_hit_fig confirms it: with '
+                        '--velocity_source bootstrap it is 97.9%% at K=2 and identically '
+                        '97.9%% at K=3 and K=4, so extra slots buy nothing and cost compute '
+                        'linearly. (With the weaker frame_pair source, K=2 only reaches '
+                        '69%% and extra slots DO help -- which is a defect of the peak '
+                        'selection, not evidence that the scene has more motions.)')
+    p.add_argument('--velocity_source', choices=['bootstrap', 'frame_pair', 'tracked'],
+                   default='bootstrap',
+                   help="melstm only: where slot velocities come from. Measured "
+                        "slot_hit_fig at K=2 on this data: bootstrap 97.9%%, frame_pair "
+                        "68.8%%, tracked 0.0%%. "
+                        "'tracked' is MEConvLSTM's own protocol (correlate each slot's "
+                        "hidden state against the next frame); it needs a clean template "
+                        "and has none here, so no slot ends up on either motion and the "
+                        "slots collapse onto each other. "
+                        "'frame_pair' takes the top-K peaks of the raw frame pair, but the "
+                        "background dominates the correlation surface so the figure's peak "
+                        "often loses to the noise floor. "
+                        "'bootstrap' (default) explains the dominant motion away first and "
+                        "re-correlates the residual, which is what makes the MINORITY "
+                        "motion reliably findable -- and therefore what makes K=2 correct.")
     p.add_argument('--velocity_pool', choices=['attention', 'max', 'mean', 'concat'],
                    default='attention',
                    help="How the velocity axis is reduced before the head. 'max' is the "
@@ -114,11 +125,21 @@ def get_args(argv=None):
                         'between the two textures becomes visible in a single frame and '
                         'the task stops being purely motion-defined.')
     p.add_argument('--data_v_range', type=int, default=2, help="Figure max speed")
+    p.add_argument('--bg_mode', choices=['opposite', 'disjoint'], default='opposite',
+                   help="How the background is kept distinguishable from the figure. "
+                        "'opposite' (default) keeps it on the SHARED velocity grid and "
+                        "requires it to travel in an opposing direction at t=0. 'disjoint' "
+                        "gives it a faster grid of its own (--bg_speed_min/max), which "
+                        "guarantees they never coincide but puts the background BEYOND "
+                        "every lattice copy felstm has -- a motion felstm structurally "
+                        "cannot represent while melstm's tracked slots can, which confounds "
+                        "expressive power with the effect being measured. Use 'disjoint' "
+                        "only when felstm is not in the comparison.")
     p.add_argument('--bg_speed_min', type=int, default=4,
-                   help='Background min speed. Must exceed --data_v_range, which is what '
-                        'makes the background grid disjoint from the figure grid so the '
-                        'two can never coincide.')
-    p.add_argument('--bg_speed_max', type=int, default=5)
+                   help='--bg_mode disjoint only: background min speed, must exceed '
+                        '--data_v_range.')
+    p.add_argument('--bg_speed_max', type=int, default=5,
+                   help='--bg_mode disjoint only.')
     p.add_argument('--motion_mode', choices=['constant', 'piecewise', 'stochastic', 'accelerate'],
                    default='piecewise')
     p.add_argument('--transition_mode', choices=['uniform', 'smooth'], default='smooth')
@@ -156,9 +177,10 @@ def get_args(argv=None):
     p.add_argument('--save_dir', type=str, default='./experiments_classification/')
     p.add_argument('--resume', type=str, default=None)
     p.add_argument('--use_wandb', action='store_true')
-    p.add_argument('--log_states_every', type=int, default=5,
+    p.add_argument('--log_states_every', type=int, default=1,
                    help='Log the per-velocity-copy hidden state to wandb every N epochs '
-                        '(0 = off). Uses a FIXED set of sequences so the wandb slider '
+                        '(0 = off; 1 = every epoch, the default, since the whole point is '
+                        'watching it develop). Uses a FIXED set of sequences so the slider '
                         'shows the same sample developing as training proceeds. This is '
                         'the picture the experiment rests on: the frame row is noise, and '
                         'the question is whether the copy transported at the figure '
@@ -184,7 +206,9 @@ def build_datasets(args):
         num_figures=args.num_figures, variant=args.variant, corr_len=args.corr_len,
         digit_scale=args.digit_scale, normalize=args.normalize,
         max_speed=args.data_v_range,
-        bg_speed_range=(args.bg_speed_min, args.bg_speed_max),
+        bg_opposite_at_start=(args.bg_mode == "opposite"),
+        bg_speed_range=((args.bg_speed_min, args.bg_speed_max)
+                        if args.bg_mode == "disjoint" else None),
         motion_mode=args.motion_mode, transition_mode=args.transition_mode,
         min_segment=args.min_segment, max_segment=args.max_segment,
         return_motion=True, return_mask=want_mask, download=True,
@@ -354,11 +378,18 @@ def main(argv=None):
         args.epochs, args.num_workers, args.use_wandb = 2, 0, False
         args.max_train_samples = 2 * args.batch_size
 
-    if args.bg_speed_min <= args.data_v_range:
+    if args.bg_mode == "disjoint" and args.bg_speed_min <= args.data_v_range:
         raise SystemExit(
             f"--bg_speed_min ({args.bg_speed_min}) must exceed --data_v_range "
             f"({args.data_v_range}); that is what makes the background grid disjoint "
             f"from the figure grid so the two can never coincide.")
+    if args.bg_mode == "disjoint" and args.model == "felstm":
+        warnings.warn(
+            "--bg_mode disjoint puts the background outside felstm's velocity lattice, "
+            "so felstm cannot represent the background motion at all while melstm can. "
+            "That is a difference in expressive power confounded with the effect being "
+            "measured. Prefer --bg_mode opposite for a three-way comparison.",
+            UserWarning)
     if args.model == "felstm" and args.v_range < args.data_v_range:
         raise SystemExit(
             f"--v_range ({args.v_range}) < --data_v_range ({args.data_v_range}): "
@@ -404,9 +435,11 @@ def main(argv=None):
     print(f"pool         : {args.velocity_pool}")
     print(model.describe())
     print()
+    bg_desc = ("on the shared grid, opposing direction at t=0"
+               if args.bg_mode == "opposite"
+               else f"|v| in [{args.bg_speed_min}, {args.bg_speed_max}] (disjoint grid)")
     print(f"data         : figure |v|<={args.data_v_range} ({args.motion_mode}), "
-          f"background |v| in [{args.bg_speed_min}, {args.bg_speed_max}] (disjoint), "
-          f"corr_len={args.corr_len}, T={args.seq_len}")
+          f"background {bg_desc}, corr_len={args.corr_len}, T={args.seq_len}")
     print(f"batches      : train {len(train_loader)}, val {len(val_loader)}, "
           f"test {len(test_loader)}  (chance accuracy = 10%)")
 

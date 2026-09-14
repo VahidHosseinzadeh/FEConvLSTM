@@ -156,6 +156,62 @@ def test_fractional_velocities_still_use_grid_sample():
 
 
 # --------------------------------------------------------- the velocity source
+def test_background_opposes_the_figure_on_the_shared_grid():
+    """
+    The felstm-safe alternative to a disjoint grid: the background stays inside
+    the figures' velocity grid -- so every lattice copy that can represent a
+    figure can represent it too -- and is separated by DIRECTION instead.
+    """
+    ds = _ds(bg_speed_range=None, bg_opposite_at_start=True, min_dv=2)
+    ds.reset_rng()
+    fig_grid = set(ds.velocity_grid)
+    for i in range(12):
+        _, _, motion = ds[i]
+        v_fig0, v_bg0 = motion[0, 0], motion[0, 1]
+        assert int((v_fig0 * v_bg0).sum()) < 0, \
+            f"sample {i}: background does not oppose the figure at t=0"
+        # on the shared grid at every step, so felstm can represent both
+        for t in range(motion.shape[0]):
+            assert tuple(motion[t, 1].tolist()) in fig_grid, \
+                "background left the shared velocity grid"
+        gap = (motion[:, :1] - motion[:, 1:]).abs().amax(dim=2).min()
+        assert int(gap) >= 2, "figure and background came within min_dv"
+
+
+def test_bootstrap_makes_two_slots_enough():
+    """
+    The scene has exactly two motions, so two slots should suffice -- but only if
+    the velocity selection can actually FIND the minority one. The dominant
+    background owns the correlation surface, so plain top-2 peaks lose the figure
+    to the noise floor; the residual bootstrap explains the background away first.
+
+    This pins the claim the K=2 default rests on.
+    """
+    from torch.utils.data import DataLoader, Subset
+    ds = _ds(seq_len=12, image_size=64, bg_speed_range=None, bg_opposite_at_start=True)
+    ds.reset_rng()
+    seq, _, motion = next(iter(DataLoader(Subset(ds, list(range(16))), batch_size=16)))
+
+    def hit(source, K=2):
+        torch.manual_seed(0)
+        net = MotionDigitClassifier(model="melstm", hidden_channels=8, n_slots=K,
+                                    velocity_source=source).eval()
+        with torch.no_grad():
+            _, v = net.encode(seq)
+        vl = v[:, -1].round().long()
+        f = (vl == motion[:, -2, 0][:, None, :]).all(-1).any(-1).float().mean().item()
+        b = (vl == motion[:, -2, 1][:, None, :]).all(-1).any(-1).float().mean().item()
+        return f, b
+
+    f_boot, b_boot = hit("bootstrap")
+    f_plain, _ = hit("frame_pair")
+    assert b_boot >= 0.9, f"bootstrap lost the background velocity ({b_boot:.1%})"
+    assert f_boot >= 0.85, f"bootstrap held the figure only {f_boot:.1%} of the time at K=2"
+    assert f_boot > f_plain, (
+        f"bootstrap ({f_boot:.1%}) should beat plain top-2 peaks ({f_plain:.1%}); "
+        f"if not, K=2 is no longer justified as the default")
+
+
 def test_frame_pair_keeps_the_slots_distinct_and_finds_the_figure():
     """
     The experiment's precondition. If no slot transports at the figure's
@@ -212,10 +268,10 @@ def test_training_script_runs_end_to_end(tmp_path):
 
 def test_training_script_refuses_impossible_configurations():
     from train_classification import main
-    # background grid must be disjoint from the figure grid
+    # under --bg_mode disjoint the background grid really must be disjoint
     with pytest.raises(SystemExit, match="disjoint"):
-        main(["--model", "lstm", "--smoke_test", "--data_v_range", "4",
-              "--bg_speed_min", "3", "--root", DATA_ROOT])
+        main(["--model", "lstm", "--smoke_test", "--bg_mode", "disjoint",
+              "--data_v_range", "4", "--bg_speed_min", "3", "--root", DATA_ROOT])
     # felstm's lattice must be able to represent the figure at all
     with pytest.raises(SystemExit, match="no copy could"):
         main(["--model", "felstm", "--smoke_test", "--v_range", "1",
@@ -294,7 +350,7 @@ def test_state_visualisation_runs_for_every_model(monkeypatch):
             gt_motion=motion, split_name="val", epoch=1, num_samples=1)
         assert logged, f"{model}: nothing was logged"
         # positional key, so wandb shows one slider per sample across epochs
-        assert "val_velocity_states/sample0" in logged
+        assert "val_states_sample0" in logged
 
 
 def test_state_visualisation_uses_identical_sequences_every_epoch():
@@ -378,7 +434,10 @@ def test_state_logging_does_not_advance_the_wandb_step(monkeypatch):
         f"the counter and drops the following epoch's metrics")
     keys, step = calls[0]
     assert step == 7, f"state images logged at step {step!r}, not the epoch"
-    assert keys == {f"val_velocity_states/sample{i}" for i in range(3)}
+    assert keys == {f"val_states_sample{i}" for i in range(3)}
+    assert not any("/" in k for k in keys), (
+        "a \"/\" in the key files the panel under a grouped wandb section, "
+        "which a saved workspace layout often does not surface")
 
 
 def test_training_script_has_no_step_less_wandb_logs():
