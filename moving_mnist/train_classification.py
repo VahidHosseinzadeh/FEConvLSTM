@@ -117,13 +117,21 @@ def get_args(argv=None):
     # --- data
     p.add_argument('--root', type=str, default=str(_HERE.parent / 'data'))
     p.add_argument('--seq_len', type=int, default=15, help='Context frames T')
-    p.add_argument('--image_size', type=int, default=64)
+    p.add_argument('--image_size', type=int, default=36,
+                   help='Canvas size. 36 keeps a 28px digit on a torus with room to move '
+                        'while staying affordable for felstm, whose cost carries every one '
+                        'of its (2R+1)^2 copies at every timestep.')
     p.add_argument('--num_figures', type=int, default=1)
     p.add_argument('--variant', choices=['moving_mask', 'static_mask'], default='moving_mask')
-    p.add_argument('--corr_len', type=float, default=1.0,
-                   help='Texture correlation length. Keep <= 1.0: above that the seam '
-                        'between the two textures becomes visible in a single frame and '
-                        'the task stops being purely motion-defined.')
+    p.add_argument('--corr_len', type=float, default=0.0,
+                   help='Texture correlation length. LEAVE AT 0. Above 0, pixels within a '
+                        'region are correlated while pixels across the figure boundary are '
+                        'not, so the outline is a local-statistics discontinuity present in '
+                        'EVERY frame. A single-frame CNN with no temporal information at '
+                        'all scores 11%% / 13%% / 24%% / 36%% at corr_len 0 / 0.5 / 1 / 2 '
+                        '(chance 10%%) -- so at the old 1.0 default a per-frame model could '
+                        'already do most of the job, and lstm reaching high accuracy meant '
+                        'the dataset was leaking, not that it had learned motion.')
     p.add_argument('--data_v_range', type=int, default=2, help="Figure max speed")
     p.add_argument('--bg_mode', choices=['opposite', 'disjoint'], default='opposite',
                    help="How the background is kept distinguishable from the figure. "

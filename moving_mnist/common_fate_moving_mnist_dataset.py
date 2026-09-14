@@ -316,16 +316,32 @@ class CommonFateMovingMNISTDataset(TDMovingMNISTDataset):
     num_figures   : how many motion-defined digits. Each gets its own texture,
                     so they remain distinguishable only by motion and shape.
     variant       : 'moving_mask' | 'static_mask' -- the experimental variable.
-    corr_len      : correlation length of every texture, in pixels. All layers
-                    share it, so no INTENSITY statistic can leak a figure -- but
-                    the SEAM between two independently drawn smooth fields still
-                    can. Measured on frame 0 alone, a local gradient magnitude
-                    finds the mask boundary with AUC 0.49 at corr_len <= 0.5,
-                    0.53 at 1.0 and 0.62 at 3.0. Above ~1.0 the correlation
-                    length exceeds the stroke width, the outline becomes visible
-                    in a single frame, and the task stops being purely
-                    motion-defined. Keep corr_len <= 1.0 for the "no single frame
-                    contains the figure" claim.
+    corr_len      : correlation length of every texture, in pixels. DEFAULT 0
+                    (white noise), and anything above ~0.5 breaks the premise of
+                    the dataset.
+
+                    All layers share the statistic, so no INTENSITY cue can leak
+                    a figure -- but the SEAM can. With corr_len > 0 pixels WITHIN
+                    a region are correlated while pixels ACROSS the boundary are
+                    independent, so the figure's outline is marked by a local
+                    statistics discontinuity in EVERY frame. A single-frame CNN,
+                    given no temporal information whatsoever, reaches:
+
+                        corr_len  0.0   0.5   1.0   2.0
+                        accuracy  11%   13%   24%   36%      (chance 10%)
+
+                    At corr_len 0 the noise is independent everywhere including
+                    at the boundary, so there is no local statistic to find.
+
+                    An earlier version of this docstring said "keep corr_len <=
+                    1.0", inferred from a hand-crafted gradient detector that
+                    scored only AUC 0.53 there. That underestimated the leak
+                    badly: a trained CNN extracts far more from the same cue. The
+                    numbers above come from the CNN, which is the adversary that
+                    matters.
+
+                    corr_len 0 is also simply better for the experiment: measured
+                    transport IoU 0.661 vs 0.522, and slot_hit_fig 100% vs 96%.
     digit_scale   : integer upscaling of the 28x28 glyph by pixel replication.
     mask_threshold: glyph intensity above which a pixel belongs to the figure.
     min_dv        : required max-norm gap between every figure and the
@@ -389,7 +405,7 @@ class CommonFateMovingMNISTDataset(TDMovingMNISTDataset):
         # --- common-fate specific ---
         num_figures=1,
         variant="moving_mask",
-        corr_len=1.0,
+        corr_len=0.0,
         digit_scale=1,
         mask_threshold=0.3,
         min_dv=2,

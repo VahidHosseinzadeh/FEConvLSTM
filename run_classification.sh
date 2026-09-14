@@ -25,7 +25,9 @@ HEAD_BLOCKS=3
 EPOCHS=40
 LR=1e-3
 SEQ_LEN=15         # context T
-IMAGE=64
+IMAGE=36           # a 28px digit still has room to travel on the torus, and felstm
+                   # carries every one of its 25 copies at every timestep, so this is
+                   # where its cost is actually decided
 TRAIN_SAMPLES=20000
 VAL_SAMPLES=2000   # --val_fraction of MNIST is 6000, paid every epoch; 2000 is
                    # plenty for a val estimate and meaningfully cheaper for felstm
@@ -45,8 +47,11 @@ BG_MODE=opposite   # background stays ON the shared velocity grid and is separat
                    # all while melstm's tracked slots could: expressive power
                    # confounded with the effect being measured.
 MOTION=piecewise   # figure velocity held 3-6 frames, then changes
-CORR_LEN=1.0       # keep <= 1.0: above that the texture seam makes the digit
-                   # visible in a single frame and the task stops being motion-defined
+CORR_LEN=0.0       # LEAVE AT 0. Above 0 the texture seam marks the digit's outline in
+                   # every single frame: a single-frame CNN with no temporal information
+                   # scores 11%/13%/24%/36% at corr_len 0/0.5/1/2 against 10% chance.
+                   # This is what let lstm -- the no-transport control -- reach high
+                   # accuracy: it was reading the seam, not the motion.
 
 # ---- per-model ------------------------------------------------------------
 V_RANGE=2          # felstm: (2*2+1)^2 = 25 transported copies, covers |v| <= 2,

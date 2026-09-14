@@ -451,3 +451,52 @@ def test_training_script_has_no_step_less_wandb_logs():
     for m in re.finditer(r"wandb\.log\((.*?)\)\n", src, re.S):
         assert "step=" in m.group(1), \
             f"wandb.log without an explicit step:\n    wandb.log({m.group(1).strip()})"
+
+
+def test_default_corr_len_leaves_no_per_frame_boundary_cue():
+    """
+    The control test for the whole experiment.
+
+    With corr_len > 0, pixels WITHIN a region are correlated while pixels ACROSS
+    the figure boundary are independent, so the outline is a local-statistics
+    discontinuity visible in every single frame. A single-frame CNN scores 24% at
+    corr_len=1.0 and 36% at 2.0 against 10% chance -- enough that lstm, which has
+    no transport at all, can reach high accuracy by reading the seam instead of
+    the motion, which is exactly what happened.
+
+    A trained CNN cannot run in a unit test, so this uses the local-variance
+    contrast at the boundary as a proxy: at corr_len=0 the noise is independent
+    everywhere, so a boundary window is statistically identical to an interior
+    one. The intensity-AUC test elsewhere in this suite does NOT catch this --
+    it passes at every corr_len, because intensity genuinely is protected.
+    """
+    from common_fate_diagnostics import local_var
+
+    def boundary_contrast(corr_len):
+        ds = _ds(seq_len=2, image_size=48, corr_len=corr_len, bg_speed_range=None,
+                 bg_opposite_at_start=True, normalize="none", return_mask=True)
+        ds.reset_rng()
+        ratios = []
+        for i in range(6):
+            seq, _, _, mask = ds[i]
+            frame = seq[0, 0].numpy()
+            m = mask[0, 0].numpy()
+            inner = m.copy()
+            for ax, sh in ((0, 1), (0, -1), (1, 1), (1, -1)):
+                inner = inner * np.roll(m, sh, axis=ax)
+            edge = (m - inner) > 0.5
+            if edge.sum() < 10:
+                continue
+            lv = local_var(frame, 3)
+            ratios.append(float(lv[edge].mean() / (lv[~edge].mean() + 1e-8)))
+        return float(np.mean(ratios))
+
+    clean = boundary_contrast(0.0)
+    leaky = boundary_contrast(1.5)
+    assert clean < 1.15, (
+        f"at the default corr_len=0 the boundary still stands out in local variance "
+        f"({clean:.2f}x the interior); the digit is visible per frame and lstm can "
+        f"solve the task without any transport")
+    assert leaky > clean, (
+        "correlated texture should make the seam MORE visible, not less -- if this "
+        "fails the proxy is measuring the wrong thing")
