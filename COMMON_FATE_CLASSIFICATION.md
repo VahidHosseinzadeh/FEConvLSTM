@@ -36,14 +36,42 @@ sbatch --job-name=cf_k6 submit_classification.sbatch melstm --num_vel_modes 6
 
 ---
 
-## Read `lstm` first
+## What the controls actually mean
 
-`lstm` has no transport structure. **It should sit at chance (10%).** If it
-climbs meaningfully above chance, the dataset is leaking a per-frame cue and
-neither of the other two numbers means anything.
+**`lstm` above chance is expected, and is not by itself evidence of a leak.**
+An earlier version of this document said it "should sit at chance"; that was
+wrong, and believing it will send you hunting for bugs that are not there.
 
-This is not hypothetical — it already happened once, and the cause is worth
-knowing (see [The seam leak](#the-seam-leak-why-corr_len-must-be-0)).
+A plain ConvLSTM is not motion-blind. Its cell convolves the input together with
+the previous hidden state, which is enough to build local spatiotemporal
+correlations — Reichardt-style motion detectors. It can notice that a region
+moves differently from its surroundings, segment it roughly, and classify the
+shape. What it **cannot** do is transport its hidden state, so it cannot
+accumulate the figure coherently in a co-moving frame over many steps.
+
+So the claim under test is **melstm and felstm beat lstm**, not that lstm fails.
+
+### The real leak test
+
+A model with no access to motion at all: one frame, no recurrence.
+
+```bash
+python moving_mnist/leak_probe.py                      # current defaults
+python moving_mnist/leak_probe.py --corr_len 0 0.5 1 2
+```
+
+If that beats chance, a per-frame cue exists and every recurrent number is
+contaminated. This is what caught the texture-seam leak (see
+[The seam leak](#the-seam-leak-why-corr_len-must-be-0)); at the current
+`corr_len=0` default it reports 11% against 10% chance.
+
+### And `val_state_shape_iou`
+
+The second control, and the one that separates "learned the motion" from "found
+a shortcut": a model solving the task the intended way has the digit's shape in
+the transported copy of its hidden state. `lstm` scores **below** chance there
+(0.019 vs 0.062) because it has no transport. High accuracy together with a flat,
+near-chance shape IoU is the signature of a shortcut.
 
 ---
 
@@ -338,6 +366,7 @@ reason `opposite` is the default.
 | `moving_mnist/motion_classification_model.py` | classifier: pool + head + velocity sources |
 | `moving_mnist/train_classification.py` | training loop, diagnostics, checkpointing |
 | `moving_mnist/mps_integer_warp.py` | makes melstm trainable on Apple GPU |
+| `moving_mnist/leak_probe.py` | single-frame CNN — the dataset's leak test |
 | `moving_mnist/visualization.py` | `log_motion_classification_states` |
 | `run_classification.sh` | hyperparameters, shared by local and cluster |
 | `submit_classification.sbatch` | Slurm wrapper with auto-resume and self-chaining |

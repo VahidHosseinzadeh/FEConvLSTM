@@ -400,7 +400,7 @@ def state_shape_iou(model, states, velocities, motion, mask):
     return float(iou[valid].mean())
 
 
-def log_states(model, loader, fixed_ds, device, args, epoch):
+def log_states(model, loader, fixed_ds, device, args, epoch, step):
     """
     One small forward with return_states=True, on a FIXED set of sequences.
 
@@ -442,7 +442,7 @@ def log_states(model, loader, fixed_ds, device, args, epoch):
     log_motion_classification_states(
         states, seq, mask_track=mask, velocities=velocities,
         v_list=v_list, gt_motion=motion, split_name="val", epoch=epoch,
-        step=epoch, num_samples=min(args.log_states_samples, seq.shape[0]))
+        step=step, num_samples=min(args.log_states_samples, seq.shape[0]))
     return extra
 
 
@@ -459,10 +459,13 @@ class ValCurveRecorder:
     mostly resampling noise. (Same reason the state images use the fixed
     benchmark split.)
 
-    Points are accumulated and logged to wandb once, at the end, as a single
-    line chart. Logging them live is not possible here without corrupting the
-    step axis: this script logs epoch metrics at step=epoch, and a per-batch
-    series would have to share that counter.
+    Points are logged LIVE, through `log_fn`, so the curve is watchable while a
+    50-epoch run is still going rather than appearing only at the end. That is
+    possible because this script's wandb step axis is the OPTIMIZER STEP, not the
+    epoch -- epoch metrics are logged at whatever step the epoch ended on, so
+    both series share one monotonically increasing counter and neither is
+    rejected. (Mixing an epoch step axis with a per-batch one silently drops
+    whichever is behind.)
     """
 
     def __init__(self, dataset, n_sequences, interval, device, batch_size=64):
@@ -481,7 +484,7 @@ class ValCurveRecorder:
         self.batch_size = batch_size
         self.steps, self.val_loss, self.val_acc, self.train_loss = [], [], [], []
 
-    def maybe_record(self, model, step, train_loss, criterion):
+    def maybe_record(self, model, step, train_loss, criterion, log_fn=None):
         if self.interval <= 0 or step % self.interval:
             return
         was_training = model.training
@@ -496,10 +499,14 @@ class ValCurveRecorder:
                 correct += (logits.argmax(1) == y).sum().item()
                 n += y.numel()
         model.train(was_training)
+        vl, vacc = tot_loss / max(n, 1), correct / max(n, 1)
         self.steps.append(step)
-        self.val_loss.append(tot_loss / max(n, 1))
-        self.val_acc.append(correct / max(n, 1))
+        self.val_loss.append(vl)
+        self.val_acc.append(vacc)
         self.train_loss.append(train_loss)
+        if log_fn is not None:
+            log_fn(step, {"curve/val_loss": vl, "curve/val_acc": vacc,
+                          "curve/train_loss": train_loss})
 
     def as_dict(self):
         return {"step": self.steps, "val_loss": self.val_loss,
@@ -509,7 +516,7 @@ class ValCurveRecorder:
 # -------------------------------------------------------------------- epochs
 def run_epoch(model, loader, device, n_figures, criterion, optimizer=None,
               grad_clip=1.0, max_batches=None, collect_preds=False,
-              curve=None, global_step=0):
+              curve=None, global_step=0, curve_log_fn=None):
     train = optimizer is not None
     model.train(train)
     tot_loss = tot_correct = tot_n = 0
@@ -536,7 +543,8 @@ def run_epoch(model, loader, device, n_figures, criterion, optimizer=None,
             optimizer.step()
             global_step += 1
             if curve is not None:
-                curve.maybe_record(model, global_step, loss.item(), criterion)
+                curve.maybe_record(model, global_step, loss.item(), criterion,
+                                   log_fn=curve_log_fn)
 
         bs = label.size(0)
         pred = logits.argmax(1)
@@ -654,6 +662,13 @@ def main(argv=None):
     best_val, best_epoch, since_improved = -1.0, -1, 0
     start_epoch, global_step = 0, 0
 
+    curve_log_fn = None
+    if wandb:
+        # `epoch` as a selectable x axis in the UI; the logged step stays the
+        # optimizer step so the per-batch curve and the per-epoch metrics agree.
+        wandb.define_metric("epoch")
+        curve_log_fn = lambda step, payload: wandb.log(payload, step=step)
+
     curve = None
     if args.val_curve_interval > 0:
         print(f"materialising {args.val_curve_size} fixed val sequences for the loss curve...")
@@ -672,7 +687,8 @@ def main(argv=None):
     for epoch in range(start_epoch, args.epochs):
         t0 = time.time()
         tr = run_epoch(model, train_loader, device, args.num_figures, criterion,
-                       optimizer, args.grad_clip, curve=curve, global_step=global_step)
+                       optimizer, args.grad_clip, curve=curve, global_step=global_step,
+                       curve_log_fn=curve_log_fn)
         va = run_epoch(model, val_loader, device, args.num_figures, criterion)
 
         if scheduler:
@@ -687,7 +703,8 @@ def main(argv=None):
 
         # Before the print and the log, so the shape IoU appears in both.
         if wandb and args.log_states_every and epoch % args.log_states_every == 0:
-            row.update(log_states(model, state_loader, test_ds, device, args, epoch) or {})
+            row.update(log_states(model, state_loader, test_ds, device, args, epoch,
+                                  global_step) or {})
         history["epochs"].append(row)
 
         extra = "".join(f"  {k}={va[k]:.3f}" for k in
@@ -700,7 +717,9 @@ def main(argv=None):
               f"| {row['time']:.0f}s")
 
         if wandb:
-            wandb.log(row, step=epoch)
+            # step = optimizer step, shared with the fine-grained curve above.
+            # `epoch` is in the payload, so the wandb UI can use it as the x axis.
+            wandb.log(row, step=global_step)
 
         if va["acc"] > best_val:
             best_val, best_epoch, since_improved = va["acc"], epoch, 0
@@ -743,27 +762,12 @@ def main(argv=None):
         json.dump(history, f, indent=2)
 
     if wandb:
-        if curve is not None and curve.steps:
-            # One chart, logged once at the end. The x axis is optimizer steps,
-            # which is not this run's wandb step axis (that is the epoch), so it
-            # has to be a plot object rather than a logged series.
-            wandb.log({"val_curve": wandb.plot.line_series(
-                xs=curve.steps,
-                ys=[curve.val_loss, curve.train_loss],
-                keys=["val_loss (fixed set)", "train_loss (batch)"],
-                title=f"loss vs optimizer steps ({args.val_curve_size} fixed val seqs)",
-                xname="optimizer step")},
-                step=max(0, len(history["epochs"]) - 1))
-            wandb.log({"val_curve_acc": wandb.plot.line_series(
-                xs=curve.steps, ys=[curve.val_acc], keys=["val_acc (fixed set)"],
-                title="val accuracy vs optimizer steps", xname="optimizer step")},
-                step=max(0, len(history["epochs"]) - 1))
         if y_true:
             # Which digits get confused with which. On this task a model reading
             # a per-frame cue tends to confuse by stroke thickness, while one
             # reading motion confuses by shape -- the structure of the errors
             # says more about the mechanism than the scalar does.
-            last_step = max(0, len(history["epochs"]) - 1)
+            last_step = global_step
             wandb.log({"test_confusion": wandb.plot.confusion_matrix(
                 y_true=y_true, preds=y_pred,
                 class_names=[str(d) for d in range(10)])}, step=last_step)

@@ -8,9 +8,12 @@
 # The task: T context frames of a digit defined ONLY by moving differently from
 # its background, then name the digit. No single frame contains it.
 #
-# READ lstm FIRST. It has no transport structure and should sit at chance (10%).
-# If it climbs meaningfully above chance the dataset is leaking a per-frame cue
-# and neither of the other two numbers means anything.
+# NOTE on lstm: above chance is EXPECTED and is not by itself a leak. A plain
+# ConvLSTM convolves the input with its previous hidden state, which is enough to
+# build local motion detectors; it just cannot TRANSPORT its state to accumulate
+# the figure coherently. The claim under test is melstm/felstm > lstm.
+# The real leak test is a model with no motion access at all:
+#   python moving_mnist/leak_probe.py
 #
 # Settings below are shared and MUST stay identical across the three runs --
 # hidden size and head are matched, so the models differ only in how they
