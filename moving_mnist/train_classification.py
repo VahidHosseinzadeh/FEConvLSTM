@@ -138,6 +138,11 @@ def get_args(argv=None):
                    help='MNIST has 60k, but each sample is a freshly rendered sequence; '
                         'cap it so an epoch is a sane unit of time.')
     p.add_argument('--val_fraction', type=float, default=0.1)
+    p.add_argument('--val_size', type=int, default=2000,
+                   help='Cap on validation sequences per epoch. --val_fraction of MNIST '
+                        'is 6000, which is far more than a val estimate needs and is paid '
+                        'EVERY epoch -- at felstm cost that roughly doubles epoch time for '
+                        'no statistical benefit. 0 = no cap.')
     p.add_argument('--test_size', type=int, default=2000)
     p.add_argument('--early_stop_patience', type=int, default=0)
     p.add_argument('--use_lr_scheduler', action='store_true')
@@ -151,6 +156,14 @@ def get_args(argv=None):
     p.add_argument('--save_dir', type=str, default='./experiments_classification/')
     p.add_argument('--resume', type=str, default=None)
     p.add_argument('--use_wandb', action='store_true')
+    p.add_argument('--log_states_every', type=int, default=5,
+                   help='Log the per-velocity-copy hidden state to wandb every N epochs '
+                        '(0 = off). Uses a FIXED set of sequences so the wandb slider '
+                        'shows the same sample developing as training proceeds. This is '
+                        'the picture the experiment rests on: the frame row is noise, and '
+                        'the question is whether the copy transported at the figure '
+                        'velocity grows the digit while the others do not.')
+    p.add_argument('--log_states_samples', type=int, default=2)
     p.add_argument('--wandb_project', type=str, default='FERNN-common-fate')
     p.add_argument('--wandb_entity', type=str, default=None)
     p.add_argument('--wandb_dir', type=str, default='./tmp/')
@@ -163,6 +176,9 @@ def get_args(argv=None):
 
 # ----------------------------------------------------------------------- data
 def build_datasets(args):
+    # The mask is only needed by the state visualisation (as the answer key
+    # beside the hidden states); rendering it per sample otherwise is waste.
+    want_mask = bool(args.use_wandb and args.log_states_every)
     common = dict(
         root=args.root, image_size=args.image_size, seq_len=args.seq_len,
         num_figures=args.num_figures, variant=args.variant, corr_len=args.corr_len,
@@ -171,7 +187,7 @@ def build_datasets(args):
         bg_speed_range=(args.bg_speed_min, args.bg_speed_max),
         motion_mode=args.motion_mode, transition_mode=args.transition_mode,
         min_segment=args.min_segment, max_segment=args.max_segment,
-        return_motion=True, return_mask=False, download=True,
+        return_motion=True, return_mask=want_mask, download=True,
     )
     train = CommonFateMovingMNISTDataset(train=True, random=True, seed=args.data_seed, **common)
     # Fixed benchmark: seeded and stateful, so reset_rng() before every pass and
@@ -188,6 +204,8 @@ def make_loaders(args, train_ds, test_ds):
     if args.max_train_samples and args.max_train_samples < len(tr):
         idx = torch.randperm(len(tr), generator=torch.Generator().manual_seed(args.data_seed))
         tr = Subset(tr, idx[:args.max_train_samples].tolist())
+    if args.val_size and args.val_size < len(va):
+        va = Subset(va, list(range(args.val_size)))
     if args.smoke_test:
         tr = Subset(tr, list(range(2 * args.batch_size)))
         va = Subset(va, list(range(args.batch_size)))
@@ -195,11 +213,21 @@ def make_loaders(args, train_ds, test_ds):
     n_test = min(args.test_size, len(test_ds))
     te = Subset(test_ds, list(range(args.batch_size if args.smoke_test else n_test)))
 
+    # Sequences for the state visualisation come from the FIXED benchmark set,
+    # not from val. val is split off a random=True dataset, so every access
+    # renders a fresh sequence -- fine for an unbiased val metric (and what
+    # train.py does), useless for watching one sample develop across epochs,
+    # which is the entire point of the picture. Paired with reset_rng() before
+    # each logging pass, this yields the identical sequences every time.
+    n_state = min(args.log_states_samples, len(test_ds))
+    st = Subset(test_ds, list(range(n_state)))
+
     kw = dict(num_workers=args.num_workers, pin_memory=torch.cuda.is_available())
     return (DataLoader(tr, batch_size=args.batch_size, shuffle=True,
                        persistent_workers=args.num_workers > 0, **kw),
             DataLoader(va, batch_size=args.batch_size, persistent_workers=False, **kw),
-            DataLoader(te, batch_size=args.batch_size, persistent_workers=False, **kw))
+            DataLoader(te, batch_size=args.batch_size, persistent_workers=False, **kw),
+            DataLoader(st, batch_size=n_state, shuffle=False, num_workers=0))
 
 
 # ---------------------------------------------------------------- diagnostics
@@ -238,6 +266,41 @@ def velocity_diagnostics(aux, motion, n_figures):
     return out
 
 
+def log_states(model, loader, fixed_ds, device, args, epoch):
+    """
+    One small forward with return_states=True, on a FIXED set of sequences.
+
+    `fixed_ds` is reset first so the sequences are byte-identical at every epoch
+    -- otherwise the picture shows a different sample each time and cannot show
+    anything developing.
+
+    Kept separate from the training loop and capped at a couple of samples
+    because the state tensor is (B, T, V, H, W) -- at felstm's 25 copies and
+    64px that is gigabytes for a full batch, for a picture of two.
+    """
+    from visualization import log_motion_classification_states
+
+    fixed_ds.reset_rng()
+    batch = next(iter(loader))
+    n = min(args.log_states_samples, batch[0].shape[0])
+    seq = batch[0][:n].to(device)
+    motion = batch[2][:n].to(device) if len(batch) > 2 else None
+    mask = batch[3][:n].to(device) if len(batch) > 3 else None
+
+    was_training = model.training
+    model.eval()
+    with torch.no_grad():
+        _, velocities, states = model.encode(seq, return_states=True)
+    model.train(was_training)
+
+    v_list = (model.backbone.cell.v_list
+              if model.model in ("lstm", "felstm") else None)
+    log_motion_classification_states(
+        states, seq, mask_track=mask, velocities=velocities,
+        v_list=v_list, gt_motion=motion, split_name="val", epoch=epoch,
+        num_samples=n)
+
+
 # -------------------------------------------------------------------- epochs
 def run_epoch(model, loader, device, n_figures, criterion, optimizer=None,
               grad_clip=1.0, max_batches=None):
@@ -251,6 +314,8 @@ def run_epoch(model, loader, device, n_figures, criterion, optimizer=None,
             break
         seq, label = batch[0].to(device), batch[1].to(device)
         motion = batch[2].to(device) if len(batch) > 2 else None
+        # batch may also carry the GT mask (index 3) for the state visualisation;
+        # the training step itself never looks at it.
 
         with torch.set_grad_enabled(train):
             logits, aux = model(seq, return_aux=True)
@@ -329,17 +394,16 @@ def main(argv=None):
         d.mkdir(parents=True, exist_ok=True)
 
     train_ds, test_ds = build_datasets(args)
-    train_loader, val_loader, test_loader = make_loaders(args, train_ds, test_ds)
+    train_loader, val_loader, test_loader, state_loader = make_loaders(
+        args, train_ds, test_ds)
 
     model = build_classifier(args).to(device)
     report = model.parameter_report()
     print(f"run          : {run_name}")
     print(f"device       : {device}")
-    src = f"  velocity_source={args.velocity_source}" if args.model == "melstm" else ""
-    print(f"model        : {args.model}  velocity copies V={report['n_velocities']}  "
-          f"pool={args.velocity_pool}{src}")
-    print(f"parameters   : encoder {report['encoder']:,} + head {report['head']:,} "
-          f"= {report['trained']:,} trained ({report['unused_decoder']:,} unused decoder)")
+    print(f"pool         : {args.velocity_pool}")
+    print(model.describe())
+    print()
     print(f"data         : figure |v|<={args.data_v_range} ({args.motion_mode}), "
           f"background |v| in [{args.bg_speed_min}, {args.bg_speed_max}] (disjoint), "
           f"corr_len={args.corr_len}, T={args.seq_len}")
@@ -376,7 +440,6 @@ def main(argv=None):
         t0 = time.time()
         tr = run_epoch(model, train_loader, device, args.num_figures, criterion,
                        optimizer, args.grad_clip)
-        test_ds.reset_rng()          # identical benchmark set every evaluation
         va = run_epoch(model, val_loader, device, args.num_figures, criterion)
 
         if scheduler:
@@ -396,6 +459,8 @@ def main(argv=None):
 
         if wandb:
             wandb.log(row, step=epoch)
+            if args.log_states_every and epoch % args.log_states_every == 0:
+                log_states(model, state_loader, test_ds, device, args, epoch)
 
         if va["acc"] > best_val:
             best_val, best_epoch, since_improved = va["acc"], epoch, 0

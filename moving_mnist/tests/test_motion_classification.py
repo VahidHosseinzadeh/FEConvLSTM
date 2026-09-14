@@ -220,3 +220,119 @@ def test_training_script_refuses_impossible_configurations():
     with pytest.raises(SystemExit, match="no copy could"):
         main(["--model", "felstm", "--smoke_test", "--v_range", "1",
               "--data_v_range", "2", "--root", DATA_ROOT])
+
+
+# ------------------------------------------------- states and the run header
+@pytest.mark.parametrize("model,kw", [("lstm", {}), ("felstm", dict(v_range=1)),
+                                      ("melstm", dict(n_slots=3))])
+def test_encode_returns_per_step_states(model, kw):
+    """(B, T, V, H, W): one channel-mean map per velocity copy per timestep."""
+    net = MotionDigitClassifier(model=model, hidden_channels=8, **kw)
+    seq = torch.randn(2, 7, 1, 32, 32)
+    h, vel, states = net.encode(seq, return_states=True)
+    assert states.shape == (2, 7, net.n_velocities, 32, 32)
+    assert h.shape == (2, net.n_velocities, 8, 32, 32)
+    # encode() without the flag must still return the 2-tuple forward() unpacks
+    assert len(net.encode(seq)) == 2
+
+
+def test_describe_reports_matching_trained_counts():
+    """
+    The run header is what catches an accidental capacity difference between the
+    three models, so the table it prints has to actually agree with the counts.
+    """
+    totals = set()
+    for model, kw in (("lstm", {}), ("felstm", dict(v_range=2)), ("melstm", dict(n_slots=4))):
+        net = MotionDigitClassifier(model=model, hidden_channels=16, **kw)
+        rows, trained = net.submodule_report()
+        text = net.describe()
+        assert "TRAINED" in text and "backbone.cell" in text
+        assert f"{trained:,}" in text
+        assert trained == net.parameter_report()["trained"]
+        # the unused decoder must not be counted as trained
+        assert dict((r[0], r[2]) for r in rows)["backbone.decoder"] == \
+            net.parameter_report()["unused_decoder"]
+        totals.add(trained)
+    assert len(totals) == 1, f"models differ in trained parameters: {totals}"
+
+
+def test_state_visualisation_runs_for_every_model(monkeypatch):
+    """
+    The figure is the experiment's main qualitative output, so a crash in it
+    must fail here rather than 20 epochs into a cluster run.
+    """
+    import types
+    import matplotlib
+    matplotlib.use("Agg")
+
+    logged = {}
+    fake = types.ModuleType("wandb")
+    fake.Image = lambda fig: fig
+    fake.log = lambda d, **kw: logged.update(d)
+    monkeypatch.setitem(sys.modules, "wandb", fake)
+
+    import importlib
+    import visualization
+    importlib.reload(visualization)
+
+    B, T, H, W = 2, 6, 32, 32
+    frames = torch.rand(B, T, 1, H, W)
+    mask = torch.zeros(B, T, 1, H, W)
+    mask[:, :, :, 8:20, 8:20] = 1.0
+    motion = torch.zeros(B, T, 2, 2, dtype=torch.long)
+    motion[:, :, 0] = torch.tensor([1, 2])     # figure, on the lattice
+    motion[:, :, 1] = torch.tensor([4, 5])     # background, deliberately off it
+
+    for model, kw in (("lstm", {}), ("felstm", dict(v_range=2)), ("melstm", dict(n_slots=3))):
+        net = MotionDigitClassifier(model=model, hidden_channels=4, **kw).eval()
+        with torch.no_grad():
+            _, vel, states = net.encode(frames, return_states=True)
+        logged.clear()
+        visualization.log_motion_classification_states(
+            states, frames, mask_track=mask, velocities=vel,
+            v_list=net.backbone.cell.v_list if model in ("lstm", "felstm") else None,
+            gt_motion=motion, split_name="val", epoch=1, num_samples=1)
+        assert logged, f"{model}: nothing was logged"
+        # positional key, so wandb shows one slider per sample across epochs
+        assert "val_velocity_states/sample0" in logged
+
+
+def test_state_visualisation_uses_identical_sequences_every_epoch():
+    """
+    The picture is meant to show ONE sample developing as training proceeds, so
+    the sequences it draws must be byte-identical at every epoch.
+
+    They cannot come from val: val is split off a random=True dataset, which
+    renders a fresh sequence on every access. That is correct for an unbiased
+    val metric and useless here -- each epoch would show a different sample and
+    nothing could be compared across them.
+    """
+    from train_classification import build_datasets, get_args, make_loaders
+
+    args = get_args([
+        "--root", DATA_ROOT, "--seq_len", "6", "--image_size", "32",
+        "--batch_size", "4", "--num_workers", "0", "--use_wandb",
+        "--log_states_every", "1", "--log_states_samples", "2",
+        "--max_train_samples", "16", "--val_size", "8", "--test_size", "8",
+    ])
+    train_ds, test_ds = build_datasets(args)
+    _, val_loader, _, state_loader = make_loaders(args, train_ds, test_ds)
+
+    test_ds.reset_rng()
+    first = next(iter(state_loader))[0].clone()
+    test_ds.reset_rng()
+    second = next(iter(state_loader))[0]
+    assert torch.equal(first, second), \
+        "state-visualisation sequences differ between passes; the picture cannot " \
+        "show one sample developing"
+
+    # and the contrast that motivates it: val really does resample
+    a = next(iter(val_loader))[0].clone()
+    b = next(iter(val_loader))[0]
+    assert not torch.equal(a, b), \
+        "val stopped resampling -- if this changed, re-check whether the separate " \
+        "fixed state loader is still needed"
+
+    # the mask must be present, since it is the answer key beside the states
+    assert len(next(iter(state_loader))) > 3, \
+        "state batch carries no GT mask; return_mask should be on when logging states"

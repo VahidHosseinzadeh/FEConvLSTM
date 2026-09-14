@@ -27,6 +27,8 @@ LR=1e-3
 SEQ_LEN=15         # context T
 IMAGE=64
 TRAIN_SAMPLES=20000
+VAL_SAMPLES=2000   # --val_fraction of MNIST is 6000, paid every epoch; 2000 is
+                   # plenty for a val estimate and meaningfully cheaper for felstm
 POOL=attention     # 'max' is the repo default elsewhere and is expected to fail
                    # here: every velocity copy carries equal-amplitude noise, so
                    # the informative one differs by spatial COHERENCE, not by
@@ -78,7 +80,7 @@ python moving_mnist/train_classification.py \
   --data_v_range $DATA_V --bg_speed_min $BG_MIN --bg_speed_max $BG_MAX \
   --motion_mode $MOTION --corr_len $CORR_LEN \
   --batch_size $BATCH --epochs $EPOCHS --lr $LR \
-  --max_train_samples $TRAIN_SAMPLES \
+  --max_train_samples $TRAIN_SAMPLES --val_size $VAL_SAMPLES \
   --use_lr_scheduler --early_stop_patience 10 \
   --save_dir $SAVE_DIR \
   --run_name "cf_cls_${MODEL}" \

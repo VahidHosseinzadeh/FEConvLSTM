@@ -228,7 +228,7 @@ class MotionDigitClassifier(nn.Module):
             taken[rows, j] = True
         return out
 
-    def _encode_melstm_frame_pair(self, seq):
+    def _encode_melstm_frame_pair(self, seq, return_states=False):
         """
         Encoder that reads slot velocities from RAW FRAME PAIRS instead of
         self-tracking each slot's hidden state.
@@ -259,6 +259,7 @@ class MotionDigitClassifier(nn.Module):
         h, c = cell.init_hidden(B, K, H, W, seq.device, seq.dtype)
         v = torch.zeros(B, K, 2, device=seq.device, dtype=seq.dtype)
         vels = []
+        states = [] if return_states else None
 
         for t in range(T):
             if t > 0:
@@ -269,23 +270,37 @@ class MotionDigitClassifier(nn.Module):
             h, c = cell(seq[:, t], h, c, v)
             if t > 0:
                 vels.append(v.detach())
+            if return_states:
+                states.append(h.mean(dim=2).detach())
 
-        return h, c, vels
+        return h, c, vels, states
 
-    def encode(self, seq):
-        """seq (B, T, C, H, W) -> h_T (B, V, Ch, H, W), velocities or None."""
+    def encode(self, seq, return_states=False):
+        """
+        seq (B, T, C, H, W) -> h_T (B, V, Ch, H, W), velocities, states.
+
+        `states` is (B, T, V, H, W): the per-timestep CHANNEL-MEAN of each
+        velocity copy -- the same h.mean(dim=2) reduction the rest of this repo
+        visualises, and what MEConvLSTM's own tracker correlates against. It is
+        a summary for looking at, not the tensor the head consumes; the head
+        gets the full feature channels.
+        """
         if self.model == "melstm":
             if self.velocity_source == "frame_pair":
-                h, _, vels = self._encode_melstm_frame_pair(seq)
+                h, _, vels, states = self._encode_melstm_frame_pair(
+                    seq, return_states=return_states)
             else:
-                h, _, _, vels, _ = self.backbone.encode(seq)
+                h, _, _, vels, states = self.backbone.encode(
+                    seq, return_states=return_states)
             v = torch.stack(vels, dim=1) if vels else None    # (B, T-1, K, 2)
-            return h, v
-        h, _, _ = self.backbone.encode(seq)
-        return h, None
+        else:
+            h, _, states = self.backbone.encode(seq, return_states=return_states)
+            v = None
+        st = torch.stack(states, dim=1) if states else None   # (B, T, V, H, W)
+        return (h, v, st) if return_states else (h, v)
 
     def forward(self, seq, return_aux=False):
-        h, velocities = self.encode(seq)
+        h, velocities = self.encode(seq)[:2]
         features, weights = self.pool(h)
         logits = self.head(features)
         if not return_aux:
@@ -306,6 +321,27 @@ class MotionDigitClassifier(nn.Module):
         """The parameters this task uses -- the unused decoder is excluded."""
         return self.backbone_encoder_parameters() + self.head_parameters()
 
+    def submodule_report(self):
+        """
+        Per-submodule parameter counts, in the order they run.
+
+        Worth printing at the top of every run: the three backbones are meant to
+        have IDENTICAL trained parameter counts and to differ only in how many
+        velocity copies they transport. If these tables ever stop matching, the
+        comparison has silently become one about capacity.
+        """
+        n = lambda m: sum(p.numel() for p in m.parameters())
+        dec = self.backbone.decoder if self.model == "melstm" else self.backbone.decoder_conv
+        rows = [
+            ("backbone.cell", "recurrent, run on every velocity copy", n(self.backbone.cell)),
+            ("pool", f"velocity reduce ({self.pool.mode})", n(self.pool)),
+            ("head.conv", f"{len(self.head.conv) // 3} blocks, circular, stride 2", n(self.head.conv)),
+            ("head.mlp", "avg+max pool -> logits", n(self.head.mlp)),
+        ]
+        trained = sum(r[2] for r in rows)
+        rows.append(("backbone.decoder", "UNUSED in this task, excluded from the optimizer", n(dec)))
+        return rows, trained
+
     def parameter_report(self):
         n = lambda ps: sum(p.numel() for p in ps)
         enc, hd = n(self.backbone_encoder_parameters()), n(self.head_parameters())
@@ -313,6 +349,27 @@ class MotionDigitClassifier(nn.Module):
         return {"encoder": enc, "head": hd, "trained": enc + hd,
                 "unused_decoder": total - enc - hd,
                 "n_velocities": self.n_velocities}
+
+    def describe(self):
+        """Human-readable architecture + parameter table for the run header."""
+        rows, trained = self.submodule_report()
+        w = max(len(r[0]) for r in rows)
+        lines = [f"architecture : {self.model}  "
+                 f"V={self.n_velocities} velocity "
+                 f"{'slots' if self.model == 'melstm' else 'copies'}"
+                 + (f"  velocity_source={self.velocity_source}"
+                    if self.model == "melstm" else "")]
+        if self.model == "felstm":
+            lines[0] += f"  (lattice v_range covers |v| <= {max(abs(v[0]) for v in self.backbone.cell.v_list)})"
+        lines.append("")
+        lines.append(f"  {'submodule':<{w}}  {'params':>9}   note")
+        lines.append(f"  {'-' * w}  {'-' * 9}   {'-' * 46}")
+        for name, note, cnt in rows:
+            tag = "" if name != "backbone.decoder" else ""
+            lines.append(f"  {name:<{w}}  {cnt:>9,}   {note}{tag}")
+        lines.append(f"  {'-' * w}  {'-' * 9}")
+        lines.append(f"  {'TRAINED':<{w}}  {trained:>9,}   what the optimizer updates")
+        return "\n".join(lines)
 
 
 def build_classifier(cfg):

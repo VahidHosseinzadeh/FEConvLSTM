@@ -311,3 +311,139 @@ def log_velocity_report(summary, split_name="train", epoch=None):
         log_dict["epoch"] = epoch
 
     wandb.log(log_dict)
+
+def log_motion_classification_states(
+    h_states,
+    frames,
+    mask_track=None,
+    velocities=None,
+    v_list=None,
+    gt_motion=None,
+    split_name="val",
+    epoch=None,
+    num_samples=2,
+    subsample_t=2,
+    max_slots=6,
+):
+    """
+    Show what each velocity copy accumulated, for the motion-defined-digit task.
+
+    This is the picture the whole experiment rests on. The frame row is noise --
+    the digit is genuinely not in it -- so the question is whether the copy
+    transported at the FIGURE's velocity develops the digit's shape while the
+    others average their drifting texture into mush. The mask row is the answer
+    key: it is where the figure actually was.
+
+    h_states   : (B, T, V, H, W) per-timestep CHANNEL-MEAN of each velocity copy.
+    frames     : (B, T, C, H, W) the input the model saw.
+    mask_track : (B, T, N, H, W) ground-truth figure aperture, or None.
+    velocities : (B, T-1, K, 2) tracked slot velocities (melstm), or None.
+    v_list     : the fixed lattice, model.cell.v_list (felstm), or None.
+    gt_motion  : (B, T, N+1, 2) true (vx, vy), figures then background last.
+
+    Slot selection. felstm's lattice can be dozens of copies, which is
+    unreadable, so the ones actually worth seeing are picked: the copy matching
+    the figure's velocity, the copy matching the background's, and a few others
+    as a control. Selection uses the velocity at the LAST encoder step -- the one
+    h_T was most recently transported at, and the same step the slot_hit_fig
+    scalar is computed on.
+
+    Sample keys are positional and stable across epochs on purpose: wandb then
+    gives one slider per sample showing the SAME sequence developing as training
+    proceeds, which is the thing to watch. Random sample indices would scatter
+    the keys and make that impossible.
+    """
+    B, T, V, H, W = h_states.shape
+    n = min(num_samples, B)
+    steps = list(range(0, T, max(1, subsample_t)))
+    if steps[-1] != T - 1:
+        steps.append(T - 1)          # always show the final state the head reads
+
+    for i in range(n):
+        h = h_states[i].detach().cpu()                       # (T, V, H, W)
+        fr = frames[i].detach().cpu()                        # (T, C, H, W)
+        mk = mask_track[i].detach().cpu() if mask_track is not None else None
+
+        v_fig = v_bg = None
+        if gt_motion is not None:
+            g = gt_motion[i].detach().cpu()
+            v_fig = tuple(int(x) for x in g[-2, 0])
+            v_bg = tuple(int(x) for x in g[-2, -1])
+
+        # ---- choose which copies to draw, and name them
+        missing = []
+        if v_list is not None:                                # felstm lattice
+            index = {tuple(v): k for k, v in enumerate(v_list)}
+            chosen, labels = [], []
+            for tag, vel in (("FIGURE", v_fig), ("bg", v_bg)):
+                if vel in index and index[vel] not in chosen:
+                    chosen.append(index[vel])
+                    labels.append(f"v={vel}\n<- {tag}")
+                elif vel is not None:
+                    # Say so rather than quietly dropping the row. felstm's
+                    # lattice is sized to cover the FIGURE; the background moves
+                    # faster than any copy on purpose, since covering it would
+                    # need (2*5+1)^2 = 121 copies. A reader who does not know
+                    # that would just see a missing row and assume a plotting bug.
+                    missing.append(f"{tag} v={vel}")
+            for k in range(len(v_list)):                      # controls
+                if len(chosen) >= max_slots:
+                    break
+                if k not in chosen:
+                    chosen.append(k)
+                    labels.append(f"v={tuple(v_list[k])}")
+        elif velocities is not None:                          # melstm slots
+            vl = velocities[i, -1].detach().cpu().round().long()
+            chosen, labels = [], []
+            for k in range(min(V, max_slots)):
+                vk = tuple(int(x) for x in vl[k])
+                tag = ("\n<- FIGURE" if vk == v_fig else
+                       ("\n<- bg" if vk == v_bg else ""))
+                chosen.append(k)
+                labels.append(f"slot{k} v={vk}{tag}")
+        else:                                                 # lstm: nothing to pick
+            chosen, labels = [0], ["h\n(no transport)"]
+
+        rows = len(chosen) + 1 + (mk is not None)
+        fig, axes = plt.subplots(
+            rows, len(steps),
+            figsize=(max(6, len(steps) * 1.25), max(2, rows * 1.3) + 0.8),
+            gridspec_kw={"wspace": 0.05, "hspace": 0.30},
+            squeeze=False,
+        )
+
+        for col, t in enumerate(steps):
+            for r, k in enumerate(chosen):
+                m = h[t, k]
+                lim = m.abs().max().clamp(min=1e-8).item()
+                axes[r, col].imshow(m, cmap="coolwarm", vmin=-lim, vmax=lim)
+            axes[len(chosen), col].imshow(fr[t].mean(0), cmap="gray")
+            if mk is not None:
+                axes[rows - 1, col].imshow(mk[t].amax(0), cmap="gray", vmin=0, vmax=1)
+            axes[0, col].set_title(f"t={t}", fontsize=8)
+            for r in range(rows):
+                axes[r, col].axis("off")
+
+        for r, lab in enumerate(labels):
+            axes[r, 0].text(-0.45, 0.5, lab, rotation=90, va="center", ha="center",
+                            fontsize=6.5, transform=axes[r, 0].transAxes)
+        axes[len(chosen), 0].text(-0.45, 0.5, "frame\n(input)", rotation=90,
+                                  va="center", ha="center", fontsize=6.5,
+                                  transform=axes[len(chosen), 0].transAxes)
+        if mk is not None:
+            axes[rows - 1, 0].text(-0.45, 0.5, "figure\n(GT mask)", rotation=90,
+                                   va="center", ha="center", fontsize=6.5,
+                                   transform=axes[rows - 1, 0].transAxes)
+
+        title = f"{split_name} — velocity copies, sample {i}"
+        if v_fig is not None:
+            title += f"   GT v_fig={v_fig}  v_bg={v_bg}"
+        if epoch is not None:
+            title += f"   epoch {epoch}"
+        if missing:
+            title += f"\nnot on this model's velocity lattice: {', '.join(missing)}"
+        fig.suptitle(title, fontsize=9, y=0.99)
+        fig.subplots_adjust(top=0.90 if not missing else 0.87)
+
+        wandb.log({f"{split_name}_velocity_states/sample{i}": wandb.Image(fig)})
+        plt.close(fig)
