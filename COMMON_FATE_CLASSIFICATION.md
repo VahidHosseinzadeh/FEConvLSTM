@@ -62,6 +62,27 @@ inherits its whole motion vocabulary (`constant` / `piecewise` / `stochastic` /
 | `--bg_mode` | `opposite` | background separation, see below |
 | `--motion_mode` | `piecewise` | figure velocity held 3–6 frames, then changes |
 | `--num_figures` | 1 | one digit and one background = two motions |
+| `--epochs` | 50 | early stopping is **off** (`--early_stop_patience 0`), so all three run the full 50 and the curves are comparable end to end |
+| `--max_train_samples` | 50000 | **not a dataset size** — see below |
+| `--val_curve_interval` | 25 | fixed-set val loss every N optimizer steps |
+| `--val_curve_size` | 256 | how many fixed sequences behind that curve |
+
+### `--max_train_samples` is epoch length, not dataset size
+
+The training split uses `random=True`, which renders a **fresh** sequence on every
+access — new digit, new textures, new velocities. So this flag does not limit data
+diversity and there is no small-dataset overfitting to worry about: at 50 epochs ×
+50k it is 2.5M distinct sequences, every one seen once. The only thing raising it
+buys is **gradient steps** (~39k at `BATCH=64`).
+
+Measured cost at 36px, batch 32, `T=15`, hidden 32 on an M-series GPU (the A100 is
+much faster; the ratios are what transfer):
+
+| model | V | s/batch | 50 epochs @ 20k | @ 50k |
+|---|---|---|---|---|
+| `lstm` | 1 | 0.19 | 1.7 h | 4.1 h |
+| `melstm` | 2 | 0.44 | 3.8 h | 9.5 h |
+| `felstm` | 25 | — | OOM at 20 GB (cluster-only) |
 
 Every layer is band-limited noise on a torus with integer velocities, so `roll()`
 is the exact group action and a warp-based model is exactly equivariant rather
@@ -266,6 +287,22 @@ Each figure is, top to bottom:
 digit's shape over time while the others stay textureless, and the `local var`
 row should come to match the `GT mask` row. That is the entire experiment in one
 picture.
+
+### `val_curve` and `val_curve_acc`
+
+Loss and accuracy against **optimizer steps** rather than epochs, sampled every
+`--val_curve_interval` steps on a fixed set of `--val_curve_size` sequences. One
+point per epoch is a coarse picture of a 50-epoch run; this is the fine one.
+
+The set is **materialised into a tensor** at construction, not held by index —
+this dataset resamples on every access, so an indexed set would measure something
+different each time and the curve would be mostly resampling noise.
+
+Both are logged once, at the end, as line charts, because their x axis is
+optimizer steps and this run's wandb step axis is the epoch. The raw points are
+also written to `history_<run>.json` under `val_curve`, so you can re-plot them
+without wandb. The step counter is checkpointed, so the curve continues across a
+resume rather than restarting at 0.
 
 ### `test_confusion`
 

@@ -15,6 +15,9 @@
 # Settings below are shared and MUST stay identical across the three runs --
 # hidden size and head are matched, so the models differ only in how they
 # transport the hidden state.
+#
+# Early stopping is OFF (--early_stop_patience 0): every model runs the full
+# EPOCHS so the three curves are directly comparable end to end.
 set -e
 MODEL=${1:?usage: bash run_classification.sh lstm|felstm|melstm}
 
@@ -22,15 +25,22 @@ MODEL=${1:?usage: bash run_classification.sh lstm|felstm|melstm}
 HIDDEN=32
 HEAD_CH=64
 HEAD_BLOCKS=3
-EPOCHS=40
+EPOCHS=50
 LR=1e-3
 SEQ_LEN=15         # context T
 IMAGE=36           # a 28px digit still has room to travel on the torus, and felstm
                    # carries every one of its 25 copies at every timestep, so this is
                    # where its cost is actually decided
-TRAIN_SAMPLES=20000
+TRAIN_SAMPLES=50000
+                   # NOT a dataset size. random=True renders a FRESH sequence on every
+                   # access -- new digit, new textures, new velocities -- so this only
+                   # sets how long an epoch is. Over 50 epochs that is 2.5M distinct
+                   # sequences and there is no small-dataset overfitting to worry about;
+                   # the only thing it buys is gradient steps (~39k at BATCH=64).
 VAL_SAMPLES=2000   # --val_fraction of MNIST is 6000, paid every epoch; 2000 is
                    # plenty for a val estimate and meaningfully cheaper for felstm
+CURVE_EVERY=25     # record the fixed-set val loss every N optimizer steps, for a
+CURVE_SIZE=256     # loss-vs-steps curve far finer than one point per epoch
 POOL=attention     # 'max' is the repo default elsewhere and is expected to fail
                    # here: every velocity copy carries equal-amplitude noise, so
                    # the informative one differs by spatial COHERENCE, not by
@@ -62,21 +72,20 @@ N_SLOTS=2          # melstm: the scene has exactly two motions, digit and backgr
 VEL_SRC=bootstrap  # melstm: slot_hit_fig at K=2 is 97.9% (bootstrap) vs 68.8%
                    # (frame_pair) vs 0.0% (tracked, MEConvLSTM's own protocol)
 
-# Batch size is NOT shared, because memory is not. The recurrent state is carried
-# on every velocity copy at every timestep and kept for BPTT, so felstm's 25
-# copies cost ~25x melstm's 4 at the same hidden size. Profiled per piece, the
-# cost is the cell's CONVOLUTION (164 ms/step at B=16,K=4,64px on an M-series
-# GPU) -- the warp is 5 ms and the phase correlation under 1 ms, so neither is
-# worth optimising.
+# Batch size is SHARED across the three on purpose: a different batch size means a
+# different effective learning rate and gradient noise, which is a confound in a
+# comparison whose whole point is the transport structure.
 #
-# Calibrated from run_comparison.sh, which measured ~62GB for felstm at
-# hidden=32 / batch=32 / seq_len=25 on the 80GB A100. This task runs seq_len=15,
-# so ~0.6x that: batch 32 lands near 37GB and fits, batch 64 would sit at the
-# ceiling. Lower the felstm arm of the case below first if a run OOMs.
-case "$MODEL" in
-  felstm) BATCH=32 ;;
-  *)      BATCH=64 ;;
-esac
+# It is affordable only because IMAGE=36 rather than 64. felstm carries all 25
+# velocity copies of the state at every timestep and keeps them for BPTT, so it is
+# the memory constraint; 36px is ~0.32x the pixels of 64px, which brought it back
+# inside a shared batch. If felstm still OOMs on your GPU, drop BATCH for ALL
+# THREE rather than for felstm alone, so the comparison stays matched.
+#
+# Profiled per piece: the cost is the recurrent cell's CONVOLUTION, not the warp
+# (5 ms) or the velocity estimation (<1 ms), so hidden size, V and batch are the
+# only levers.
+BATCH=64
 
 # Local runs: lstm is fine (~0.3 s/batch at B=16/64px on an M-series GPU),
 # melstm is slow but possible (~14 s/batch), and felstm OOMs outright at B=16
@@ -95,7 +104,8 @@ python moving_mnist/train_classification.py \
   --motion_mode $MOTION --corr_len $CORR_LEN \
   --batch_size $BATCH --epochs $EPOCHS --lr $LR \
   --max_train_samples $TRAIN_SAMPLES --val_size $VAL_SAMPLES \
-  --use_lr_scheduler --early_stop_patience 10 \
+  --use_lr_scheduler --early_stop_patience 0 \
+  --val_curve_interval $CURVE_EVERY --val_curve_size $CURVE_SIZE \
   --save_dir $SAVE_DIR \
   --run_name "cf_cls_${MODEL}" \
   "${@:2}"

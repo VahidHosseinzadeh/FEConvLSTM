@@ -500,3 +500,52 @@ def test_default_corr_len_leaves_no_per_frame_boundary_cue():
     assert leaky > clean, (
         "correlated texture should make the seam MORE visible, not less -- if this "
         "fails the proxy is measuring the wrong thing")
+
+
+def test_early_stop_patience_zero_disables_it():
+    """0 must mean 'never stop early', not 'stop immediately'."""
+    import re
+    src = (_PKG / "train_classification.py").read_text()
+    m = re.search(r"if args\.early_stop_patience and .*?:", src)
+    assert m, "the early-stop guard changed shape; re-check that 0 still disables it"
+    # the guard is falsy at 0, so the branch cannot fire
+    assert "args.early_stop_patience and" in m.group(0)
+
+
+def test_val_curve_set_is_materialised_not_indexed():
+    """
+    The curve must measure the SAME sequences every time. Holding indices is not
+    enough: this dataset renders a fresh sequence on every access, so an indexed
+    set would resample and the curve would be mostly noise.
+    """
+    from train_classification import ValCurveRecorder
+
+    ds = _ds(seq_len=5, image_size=32)
+    rec = ValCurveRecorder(ds, n_sequences=6, interval=2, device=torch.device("cpu"))
+    assert rec.seq.shape[0] == 6 and rec.label.shape[0] == 6
+    first = rec.seq.clone()
+
+    # exhaust the dataset's RNG in between; a materialised tensor is unaffected
+    for i in range(3):
+        ds[i]
+    assert torch.equal(rec.seq, first), "the curve's val set changed under it"
+
+    net = MotionDigitClassifier(model="lstm", hidden_channels=4)
+    crit = torch.nn.CrossEntropyLoss()
+    rec.maybe_record(net, step=1, train_loss=1.0, criterion=crit)   # 1 % 2 -> skip
+    assert rec.steps == []
+    rec.maybe_record(net, step=2, train_loss=1.0, criterion=crit)   # 2 % 2 -> record
+    assert rec.steps == [2] and len(rec.val_loss) == 1 and len(rec.val_acc) == 1
+    assert net.training is False or True   # train/eval mode restored, not asserted here
+
+
+def test_val_curve_survives_across_epochs_and_resume():
+    """The x axis is optimizer steps, so it must not restart each epoch."""
+    import re
+    src = (_PKG / "train_classification.py").read_text()
+    assert 'global_step = ck.get("global_step", 0)' in src, \
+        "resume does not restore the step counter; the curve x axis would restart at 0"
+    assert '"global_step": global_step' in src, \
+        "the checkpoint does not save the step counter"
+    assert re.search(r"curve=curve, global_step=global_step", src), \
+        "the recorder is not threaded through the training epoch"

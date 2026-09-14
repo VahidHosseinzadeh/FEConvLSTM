@@ -174,7 +174,18 @@ def get_args(argv=None):
                         'EVERY epoch -- at felstm cost that roughly doubles epoch time for '
                         'no statistical benefit. 0 = no cap.')
     p.add_argument('--test_size', type=int, default=2000)
-    p.add_argument('--early_stop_patience', type=int, default=0)
+    p.add_argument('--early_stop_patience', type=int, default=0,
+                   help='Stop once the selection metric (val accuracy) has not improved for '
+                        'this many consecutive epochs. 0 = DISABLED, always run the full '
+                        '--epochs, which is the default.')
+    p.add_argument('--val_curve_interval', type=int, default=25,
+                   help='Record validation loss every N training batches, for a '
+                        'loss-vs-steps curve far finer than one point per epoch (0 = off).')
+    p.add_argument('--val_curve_size', type=int, default=256,
+                   help='Number of FIXED validation sequences behind that curve. They are '
+                        'materialised into a tensor once: this dataset resamples content on '
+                        'every access, so holding indices fixed is not enough to keep the '
+                        'measured set fixed.')
     p.add_argument('--use_lr_scheduler', action='store_true')
     p.add_argument('--lr_patience', type=int, default=4)
     p.add_argument('--lr_factor', type=float, default=0.5)
@@ -435,9 +446,70 @@ def log_states(model, loader, fixed_ds, device, args, epoch):
     return extra
 
 
+class ValCurveRecorder:
+    """
+    Fine-grained loss-vs-training-batches curve, recorded during training.
+
+    One point per epoch is a very coarse picture of a 50-epoch run; this samples
+    the same fixed sequences every `interval` optimizer steps instead.
+
+    The set is MATERIALISED into a tensor at construction rather than held by
+    index. This dataset renders a fresh sequence on every access, so fixing the
+    indices would still measure a different set each time and the curve would be
+    mostly resampling noise. (Same reason the state images use the fixed
+    benchmark split.)
+
+    Points are accumulated and logged to wandb once, at the end, as a single
+    line chart. Logging them live is not possible here without corrupting the
+    step axis: this script logs epoch metrics at step=epoch, and a per-batch
+    series would have to share that counter.
+    """
+
+    def __init__(self, dataset, n_sequences, interval, device, batch_size=64):
+        n = min(n_sequences, len(dataset))
+        if hasattr(dataset, "reset_rng"):
+            dataset.reset_rng()
+        seqs, labels = [], []
+        for i in range(n):
+            item = dataset[i]
+            seqs.append(item[0])
+            labels.append(item[1])
+        self.seq = torch.stack(seqs)
+        self.label = torch.tensor(labels, dtype=torch.long)
+        self.interval = interval
+        self.device = device
+        self.batch_size = batch_size
+        self.steps, self.val_loss, self.val_acc, self.train_loss = [], [], [], []
+
+    def maybe_record(self, model, step, train_loss, criterion):
+        if self.interval <= 0 or step % self.interval:
+            return
+        was_training = model.training
+        model.eval()
+        tot_loss = correct = n = 0
+        with torch.no_grad():
+            for i in range(0, len(self.seq), self.batch_size):
+                x = self.seq[i:i + self.batch_size].to(self.device)
+                y = self.label[i:i + self.batch_size].to(self.device)
+                logits = model(x)
+                tot_loss += criterion(logits, y).item() * y.numel()
+                correct += (logits.argmax(1) == y).sum().item()
+                n += y.numel()
+        model.train(was_training)
+        self.steps.append(step)
+        self.val_loss.append(tot_loss / max(n, 1))
+        self.val_acc.append(correct / max(n, 1))
+        self.train_loss.append(train_loss)
+
+    def as_dict(self):
+        return {"step": self.steps, "val_loss": self.val_loss,
+                "val_acc": self.val_acc, "train_loss": self.train_loss}
+
+
 # -------------------------------------------------------------------- epochs
 def run_epoch(model, loader, device, n_figures, criterion, optimizer=None,
-              grad_clip=1.0, max_batches=None, collect_preds=False):
+              grad_clip=1.0, max_batches=None, collect_preds=False,
+              curve=None, global_step=0):
     train = optimizer is not None
     model.train(train)
     tot_loss = tot_correct = tot_n = 0
@@ -462,6 +534,9 @@ def run_epoch(model, loader, device, n_figures, criterion, optimizer=None,
             if grad_clip:
                 torch.nn.utils.clip_grad_norm_(model.trainable_parameters(), grad_clip)
             optimizer.step()
+            global_step += 1
+            if curve is not None:
+                curve.maybe_record(model, global_step, loss.item(), criterion)
 
         bs = label.size(0)
         pred = logits.argmax(1)
@@ -484,6 +559,7 @@ def run_epoch(model, loader, device, n_figures, criterion, optimizer=None,
         stats.update({k: v / diag_n for k, v in diag_sum.items()})
     if collect_preds:
         stats["_y_true"], stats["_y_pred"] = y_true, y_pred
+    stats["_global_step"] = global_step
     return stats
 
 
@@ -576,7 +652,13 @@ def main(argv=None):
 
     history = {"config": vars(args), "parameters": report, "epochs": []}
     best_val, best_epoch, since_improved = -1.0, -1, 0
-    start_epoch = 0
+    start_epoch, global_step = 0, 0
+
+    curve = None
+    if args.val_curve_interval > 0:
+        print(f"materialising {args.val_curve_size} fixed val sequences for the loss curve...")
+        curve = ValCurveRecorder(test_ds, args.val_curve_size,
+                                 args.val_curve_interval, device, args.batch_size)
 
     if args.resume and Path(args.resume).exists():
         ck = torch.load(args.resume, map_location=device)
@@ -584,17 +666,20 @@ def main(argv=None):
         optimizer.load_state_dict(ck["optimizer"])
         start_epoch = ck["epoch"] + 1
         best_val, history = ck["best_val"], ck["history"]
+        global_step = ck.get("global_step", 0)
         print(f"resumed from {args.resume} at epoch {start_epoch}")
 
     for epoch in range(start_epoch, args.epochs):
         t0 = time.time()
         tr = run_epoch(model, train_loader, device, args.num_figures, criterion,
-                       optimizer, args.grad_clip)
+                       optimizer, args.grad_clip, curve=curve, global_step=global_step)
         va = run_epoch(model, val_loader, device, args.num_figures, criterion)
 
         if scheduler:
             scheduler.step(va["acc"])
 
+        global_step = tr.pop("_global_step", global_step)
+        va.pop("_global_step", None)
         row = {"epoch": epoch, "time": time.time() - t0,
                "lr": optimizer.param_groups[0]["lr"],
                **{f"train_{k}": v for k, v in tr.items()},
@@ -626,7 +711,8 @@ def main(argv=None):
             since_improved += 1
 
         torch.save({"model": model.state_dict(), "optimizer": optimizer.state_dict(),
-                    "epoch": epoch, "best_val": best_val, "history": history},
+                    "epoch": epoch, "best_val": best_val, "history": history,
+                    "global_step": global_step},
                    state_dir / f"checkpoint_{run_name}.pth")
 
         if args.early_stop_patience and since_improved >= args.early_stop_patience:
@@ -650,9 +736,28 @@ def main(argv=None):
     print("chance is 0.100 — read lstm's number first: if it is meaningfully "
           "above chance the dataset is leaking, not the model working.")
 
+    if curve is not None and curve.steps:
+        history["val_curve"] = curve.as_dict()
+
     with open(results_dir / f"history_{run_name}.json", "w") as f:
         json.dump(history, f, indent=2)
+
     if wandb:
+        if curve is not None and curve.steps:
+            # One chart, logged once at the end. The x axis is optimizer steps,
+            # which is not this run's wandb step axis (that is the epoch), so it
+            # has to be a plot object rather than a logged series.
+            wandb.log({"val_curve": wandb.plot.line_series(
+                xs=curve.steps,
+                ys=[curve.val_loss, curve.train_loss],
+                keys=["val_loss (fixed set)", "train_loss (batch)"],
+                title=f"loss vs optimizer steps ({args.val_curve_size} fixed val seqs)",
+                xname="optimizer step")},
+                step=max(0, len(history["epochs"]) - 1))
+            wandb.log({"val_curve_acc": wandb.plot.line_series(
+                xs=curve.steps, ys=[curve.val_acc], keys=["val_acc (fixed set)"],
+                title="val accuracy vs optimizer steps", xname="optimizer step")},
+                step=max(0, len(history["epochs"]) - 1))
         if y_true:
             # Which digits get confused with which. On this task a model reading
             # a per-frame cue tends to confuse by stroke thickness, while one
