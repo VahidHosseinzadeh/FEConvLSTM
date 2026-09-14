@@ -34,14 +34,17 @@ SEQ_LEN=15         # context T
 IMAGE=36           # a 28px digit still has room to travel on the torus, and felstm
                    # carries every one of its 25 copies at every timestep, so this is
                    # where its cost is actually decided
-TRAIN_SAMPLES=50000
-                   # NOT a dataset size. random=True renders a FRESH sequence on every
-                   # access -- new digit, new textures, new velocities -- so this only
-                   # sets how long an epoch is. Over 50 epochs that is 2.5M distinct
-                   # sequences and there is no small-dataset overfitting to worry about;
-                   # the only thing it buys is gradient steps (~39k at BATCH=64).
-VAL_SAMPLES=2000   # --val_fraction of MNIST is 6000, paid every epoch; 2000 is
-                   # plenty for a val estimate and meaningfully cheaper for felstm
+# Glyph splits. MNIST's 60k train images are split 54000 / 6000 into DISJOINT
+# train and val pools, and test draws from MNIST's own 10k test split -- three
+# glyph sets with no overlap, which is what a classification val/test number
+# requires. Each glyph is re-rendered with fresh velocities and textures on every
+# access, so an epoch revisits the same digits under new motion.
+#
+# Leave these empty to use all of them; set them only to shorten an epoch, and
+# note that lowering TRAIN_SAMPLES reduces the number of DISTINCT DIGITS seen,
+# not just the wall-clock per epoch.
+TRAIN_SAMPLES=""   # empty = all 54000
+VAL_SAMPLES=""     # empty = all 6000
 CURVE_EVERY=25     # record the fixed-set val loss every N optimizer steps, for a
 CURVE_SIZE=256     # loss-vs-steps curve far finer than one point per epoch
 POOL=attention     # 'max' is the repo default elsewhere and is expected to fail
@@ -106,7 +109,8 @@ python moving_mnist/train_classification.py \
   --data_v_range $DATA_V --bg_mode $BG_MODE \
   --motion_mode $MOTION --corr_len $CORR_LEN \
   --batch_size $BATCH --epochs $EPOCHS --lr $LR \
-  --max_train_samples $TRAIN_SAMPLES --val_size $VAL_SAMPLES \
+  ${TRAIN_SAMPLES:+--max_train_samples $TRAIN_SAMPLES} \
+  ${VAL_SAMPLES:+--val_size $VAL_SAMPLES} \
   --use_lr_scheduler --early_stop_patience 0 \
   --val_curve_interval $CURVE_EVERY --val_curve_size $CURVE_SIZE \
   --save_dir $SAVE_DIR \

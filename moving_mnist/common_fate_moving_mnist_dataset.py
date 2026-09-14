@@ -315,6 +315,17 @@ class CommonFateMovingMNISTDataset(TDMovingMNISTDataset):
     ----------------------------------------
     num_figures   : how many motion-defined digits. Each gets its own texture,
                     so they remain distinguishable only by motion and shape.
+    digit_indices : which MNIST indices this dataset may draw figure glyphs from.
+                    Pass disjoint lists to two instances to get a genuine
+                    train/val split AT THE GLYPH LEVEL -- necessary for a
+                    classification task, where sharing glyphs between train and
+                    val makes the val number optimistic.
+
+                    Without it the dataset IGNORES its index and samples a glyph
+                    at random from the whole split on every access, so splitting
+                    by index (random_split and friends) separates nothing. That
+                    is harmless for next-frame prediction, which is what the
+                    parent class was built for, and wrong for classification.
     variant       : 'moving_mask' | 'static_mask' -- the experimental variable.
     corr_len      : correlation length of every texture, in pixels. DEFAULT 0
                     (white noise), and anything above ~0.5 breaks the premise of
@@ -433,6 +444,8 @@ class CommonFateMovingMNISTDataset(TDMovingMNISTDataset):
         require_distinct_velocities=True,
         require_distinct_digits=True,
 
+        digit_indices=None,
+
         return_motion=True,
         return_positions=False,
         return_mask=False,
@@ -507,6 +520,8 @@ class CommonFateMovingMNISTDataset(TDMovingMNISTDataset):
         )
 
         self.num_figures = num_figures
+        self.digit_indices = (None if digit_indices is None
+                              else list(int(i) for i in digit_indices))
         self.variant = variant
         self.corr_len = corr_len
         self.digit_scale = digit_scale
@@ -550,10 +565,14 @@ class CommonFateMovingMNISTDataset(TDMovingMNISTDataset):
     # Dataset interface
     # ------------------------------------------------------------------
 
+    def __len__(self):
+        # With a digit pool, one epoch is one pass over THOSE glyphs.
+        return len(self.mnist) if self.digit_indices is None else len(self.digit_indices)
+
     def __getitem__(self, index):
         S, N = self.image_size, self.num_figures
 
-        glyphs, labels = self._sample_glyphs()
+        glyphs, labels = self._sample_glyphs(index)
         positions = self._sample_initial_positions(N)      # figures only
         motions, separated = self._sample_separated_motion()
 
@@ -601,13 +620,38 @@ class CommonFateMovingMNISTDataset(TDMovingMNISTDataset):
     # Sampling helpers
     # ------------------------------------------------------------------
 
-    def _sample_glyphs(self):
-        """N raw uint8 glyphs and their labels, honouring require_distinct_digits."""
+    def _sample_glyphs(self, index):
+        """
+        N raw uint8 glyphs and their labels, honouring require_distinct_digits.
+
+        With `digit_indices`, figure 0's glyph is `digit_indices[index]` -- the
+        dataset index actually SELECTS the digit, so splitting the index range
+        splits the glyphs. Without it the index is ignored and every glyph is
+        drawn at random from the whole split, which is fine for a prediction task
+        and WRONG for classification: a train/val split by index would then draw
+        both halves from the same pool and the val metric would be measured on
+        digits the model had already trained on.
+
+        Any additional figures are drawn from the same pool, so they cannot leak
+        across a split either.
+        """
+        pool = self.digit_indices
         glyphs, labels, used = [], [], set()
-        for _ in range(self.num_figures):
+        for i in range(self.num_figures):
+            if i == 0 and pool is not None:
+                mnist_idx = pool[index % len(pool)]
+                img, lbl = self.mnist[mnist_idx]
+                if self.require_distinct_digits:
+                    used.add(lbl)
+                glyphs.append(np.asarray(img, dtype=np.uint8))
+                labels.append(lbl)
+                continue
             while True:
-                idx = self._randint(0, len(self.mnist))
-                img, lbl = self.mnist[idx]
+                if pool is None:
+                    mnist_idx = self._randint(0, len(self.mnist))
+                else:
+                    mnist_idx = pool[self._randint(0, len(pool))]
+                img, lbl = self.mnist[mnist_idx]
                 if (not self.require_distinct_digits) or (lbl not in used):
                     break
             glyphs.append(np.asarray(img, dtype=np.uint8))

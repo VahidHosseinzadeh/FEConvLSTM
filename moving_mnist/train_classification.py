@@ -61,6 +61,7 @@ if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
 
 from common_fate_moving_mnist_dataset import CommonFateMovingMNISTDataset
+from torchvision.datasets import MNIST
 from motion_classification_model import build_classifier
 from mps_integer_warp import enable_integer_shift_warp
 
@@ -173,15 +174,15 @@ def get_args(argv=None):
     p.add_argument('--weight_decay', type=float, default=0.0)
     p.add_argument('--grad_clip', type=float, default=1.0)
     p.add_argument('--num_workers', type=int, default=4)
-    p.add_argument('--max_train_samples', type=int, default=20000,
-                   help='MNIST has 60k, but each sample is a freshly rendered sequence; '
-                        'cap it so an epoch is a sane unit of time.')
+    p.add_argument('--max_train_samples', type=int, default=None,
+                   help='Cap on training glyphs per epoch (None = all of them, 54000 at '
+                        'the default --val_fraction). Each glyph is re-rendered with fresh '
+                        'velocities and textures on every access, so lowering this reduces '
+                        'the number of DISTINCT DIGITS seen, not just the epoch length.')
     p.add_argument('--val_fraction', type=float, default=0.1)
-    p.add_argument('--val_size', type=int, default=2000,
-                   help='Cap on validation sequences per epoch. --val_fraction of MNIST '
-                        'is 6000, which is far more than a val estimate needs and is paid '
-                        'EVERY epoch -- at felstm cost that roughly doubles epoch time for '
-                        'no statistical benefit. 0 = no cap.')
+    p.add_argument('--val_size', type=int, default=None,
+                   help='Cap on validation glyphs per epoch (None = all 6000). The val '
+                        'set is fixed, so this trades statistical precision for epoch time.')
     p.add_argument('--test_size', type=int, default=2000)
     p.add_argument('--early_stop_patience', type=int, default=0,
                    help='Stop once the selection metric (val accuracy) has not improved for '
@@ -248,21 +249,39 @@ def build_datasets(args):
         min_segment=args.min_segment, max_segment=args.max_segment,
         return_motion=True, return_mask=want_mask, download=True,
     )
-    train = CommonFateMovingMNISTDataset(train=True, random=True, seed=args.data_seed, **common)
-    # Fixed benchmark: seeded and stateful, so reset_rng() before every pass and
-    # never use persistent workers (they would carry advanced RNG state forward).
+    # Split the MNIST TRAIN split's glyphs into train / val, disjointly.
+    #
+    # This has to be done at the glyph level, not by dataset index: without
+    # `digit_indices` the dataset ignores its index and draws a random glyph on
+    # every access, so a random_split would hand both halves the same 60k pool
+    # and the val number would be measured on digits already trained on. Fine for
+    # next-frame prediction (what the parent class was built for), wrong for
+    # classification.
+    n_mnist = len(MNIST(root=args.root, train=True, download=True))
+    perm = torch.randperm(n_mnist, generator=torch.Generator().manual_seed(args.data_seed))
+    n_val = int(round(args.val_fraction * n_mnist))
+    val_idx = perm[:n_val].tolist()
+    train_idx = perm[n_val:].tolist()
+
+    train = CommonFateMovingMNISTDataset(train=True, random=True, seed=args.data_seed,
+                                         digit_indices=train_idx, **common)
+    # Val and test are both FIXED benchmarks: seeded and stateful, so reset_rng()
+    # before every pass and never use persistent workers (they would carry
+    # advanced RNG state forward). A fixed val set also makes the epoch-to-epoch
+    # curve readable instead of mostly resampling noise.
+    val = CommonFateMovingMNISTDataset(train=True, random=False, seed=777,
+                                       digit_indices=val_idx, **common)
+    # Test comes from MNIST's own TEST split -- a third disjoint glyph set.
     test = CommonFateMovingMNISTDataset(train=False, random=False, seed=123, **common)
-    return train, test
+    return train, val, test
 
 
-def make_loaders(args, train_ds, test_ds):
-    n_val = int(args.val_fraction * len(train_ds))
-    n_train = len(train_ds) - n_val
-    tr, va = random_split(train_ds, [n_train, n_val],
-                          generator=torch.Generator().manual_seed(args.data_seed))
+def make_loaders(args, train_ds, val_ds, test_ds):
+    # The datasets already hold disjoint glyph pools; these only cap how many of
+    # them an epoch visits.
+    tr, va = train_ds, val_ds
     if args.max_train_samples and args.max_train_samples < len(tr):
-        idx = torch.randperm(len(tr), generator=torch.Generator().manual_seed(args.data_seed))
-        tr = Subset(tr, idx[:args.max_train_samples].tolist())
+        tr = Subset(tr, list(range(args.max_train_samples)))
     if args.val_size and args.val_size < len(va):
         va = Subset(va, list(range(args.val_size)))
     if args.smoke_test:
@@ -634,9 +653,9 @@ def main(argv=None):
     for d in (models_dir, results_dir, state_dir):
         d.mkdir(parents=True, exist_ok=True)
 
-    train_ds, test_ds = build_datasets(args)
+    train_ds, val_ds, test_ds = build_datasets(args)
     train_loader, val_loader, test_loader, state_loader = make_loaders(
-        args, train_ds, test_ds)
+        args, train_ds, val_ds, test_ds)
 
     model = build_classifier(args).to(device)
     report = model.parameter_report()
@@ -698,6 +717,7 @@ def main(argv=None):
         tr = run_epoch(model, train_loader, device, args.num_figures, criterion,
                        optimizer, args.grad_clip, curve=curve, global_step=global_step,
                        curve_log_fn=curve_log_fn)
+        val_ds.reset_rng()          # fixed benchmark: identical sequences every epoch
         va = run_epoch(model, val_loader, device, args.num_figures, criterion)
 
         if scheduler:

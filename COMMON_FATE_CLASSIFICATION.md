@@ -95,13 +95,23 @@ inherits its whole motion vocabulary (`constant` / `piecewise` / `stochastic` /
 | `--val_curve_interval` | 25 | fixed-set val loss every N optimizer steps |
 | `--val_curve_size` | 256 | how many fixed sequences behind that curve |
 
-### `--max_train_samples` is epoch length, not dataset size
+### The splits are disjoint at the GLYPH level
 
-The training split uses `random=True`, which renders a **fresh** sequence on every
-access — new digit, new textures, new velocities. So this flag does not limit data
-diversity and there is no small-dataset overfitting to worry about: at 50 epochs ×
-50k it is 2.5M distinct sequences, every one seen once. The only thing raising it
-buys is **gradient steps** (~39k at `BATCH=64`).
+MNIST's 60k training images are split **54000 train / 6000 val**, with no shared
+glyphs, and test draws from MNIST's own 10k test split — three disjoint sets.
+Velocities and textures are re-drawn on every access, so an epoch revisits the
+same digits under fresh motion; only the glyph identity is held fixed by the
+index.
+
+This matters for classification and is easy to get wrong. Without
+`digit_indices` the dataset **ignores its index** and samples a random glyph on
+every access, so a `random_split` hands both halves the same 60k pool and val is
+measured on digits the model already trained on. That is harmless for next-frame
+prediction — what the parent class was built for — and wrong here.
+
+`--max_train_samples` therefore caps **distinct digits per epoch**, not just
+epoch length: lowering it genuinely reduces data diversity. Leave it unset to use
+all 54000.
 
 Measured cost at 36px, batch 32, `T=15`, hidden 32 on an M-series GPU (the A100 is
 much faster; the ratios are what transfer):

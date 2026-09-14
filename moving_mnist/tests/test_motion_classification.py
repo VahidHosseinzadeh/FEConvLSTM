@@ -358,10 +358,9 @@ def test_state_visualisation_uses_identical_sequences_every_epoch():
     The picture is meant to show ONE sample developing as training proceeds, so
     the sequences it draws must be byte-identical at every epoch.
 
-    They cannot come from val: val is split off a random=True dataset, which
-    renders a fresh sequence on every access. That is correct for an unbiased
-    val metric and useless here -- each epoch would show a different sample and
-    nothing could be compared across them.
+    The TRAIN split resamples on every access (random=True), which is what makes
+    it useless for this; val and test are seeded benchmarks and reproduce exactly
+    after reset_rng(). The state images come from test.
     """
     from train_classification import build_datasets, get_args, make_loaders
 
@@ -371,8 +370,8 @@ def test_state_visualisation_uses_identical_sequences_every_epoch():
         "--log_states_every", "1", "--log_states_samples", "2",
         "--max_train_samples", "16", "--val_size", "8", "--test_size", "8",
     ])
-    train_ds, test_ds = build_datasets(args)
-    _, val_loader, _, state_loader = make_loaders(args, train_ds, test_ds)
+    train_ds, val_ds, test_ds = build_datasets(args)
+    _, val_loader, _, state_loader = make_loaders(args, train_ds, val_ds, test_ds)
 
     test_ds.reset_rng()
     first = next(iter(state_loader))[0].clone()
@@ -382,12 +381,21 @@ def test_state_visualisation_uses_identical_sequences_every_epoch():
         "state-visualisation sequences differ between passes; the picture cannot " \
         "show one sample developing"
 
-    # and the contrast that motivates it: val really does resample
+    # val is a fixed benchmark too now, so its curve is comparable across epochs
+    val_ds.reset_rng()
     a = next(iter(val_loader))[0].clone()
+    val_ds.reset_rng()
     b = next(iter(val_loader))[0]
-    assert not torch.equal(a, b), \
-        "val stopped resampling -- if this changed, re-check whether the separate " \
-        "fixed state loader is still needed"
+    assert torch.equal(a, b), \
+        "val is not reproducible after reset_rng; its epoch-to-epoch curve would be " \
+        "mostly resampling noise"
+
+    # the train split, by contrast, must keep resampling -- that is the augmentation
+    c = train_ds[0][0].clone()
+    d = train_ds[0][0]
+    assert not torch.equal(c, d), \
+        "the train split stopped resampling motion/texture; each glyph should be " \
+        "re-rendered with fresh velocities every access"
 
     # the mask must be present, since it is the answer key beside the states
     assert len(next(iter(state_loader))) > 3, \
@@ -595,3 +603,48 @@ def test_batch_norm_head_is_still_reachable_but_not_default():
         b = net(x)
     assert not torch.allclose(a, b, atol=1e-5), \
         "head_norm='batch' should still exhibit the train/eval gap it is kept to demonstrate"
+
+
+def test_train_val_test_use_disjoint_mnist_glyphs():
+    """
+    For CLASSIFICATION the splits must be disjoint at the GLYPH level, not just
+    by dataset index.
+
+    Without `digit_indices` this dataset ignores its index and draws a random
+    glyph from the whole MNIST split on every access, so a random_split hands
+    both halves the same pool and the val number is measured on digits the model
+    already trained on. That is harmless for next-frame prediction -- what the
+    parent class was built for -- and wrong here.
+    """
+    from train_classification import build_datasets, get_args
+
+    args = get_args(["--root", DATA_ROOT, "--seq_len", "3", "--image_size", "32"])
+    train_ds, val_ds, test_ds = build_datasets(args)
+
+    assert train_ds.digit_indices and val_ds.digit_indices
+    assert set(train_ds.digit_indices).isdisjoint(set(val_ds.digit_indices)), \
+        "train and val share MNIST glyphs; the val accuracy would be optimistic"
+    assert len(train_ds) + len(val_ds) == 60000, \
+        f"the split lost glyphs: {len(train_ds)} + {len(val_ds)}"
+    assert len(train_ds) == 54000 and len(val_ds) == 6000
+    # test draws from MNIST's own test split, a third disjoint set
+    assert test_ds.digit_indices is None and len(test_ds) == 10000
+    assert test_ds.mnist.train is False and train_ds.mnist.train is True
+
+
+def test_index_selects_the_glyph_when_a_pool_is_given():
+    """The dataset index must determine the digit, or splitting by index is a no-op."""
+    ds = _ds(seq_len=2, image_size=32, digit_indices=list(range(0, 200)))
+    labels_7 = {ds[7][1] for _ in range(4)}
+    assert len(labels_7) == 1, "the same index gave different digits"
+
+    # and different indices reach different glyphs
+    seen = {ds[i][1] for i in range(40)}
+    assert len(seen) > 3, "indices are not spreading over the glyph pool"
+
+    # without a pool the index is ignored -- the behaviour the parent relies on
+    ds2 = _ds(seq_len=2, image_size=32)
+    assert ds2.digit_indices is None
+    ds2.reset_rng(); a = [ds2[7][1] for _ in range(4)]
+    ds2.reset_rng(); b = [ds2[999][1] for _ in range(4)]
+    assert a == b, "unpooled behaviour changed; the parent class depends on it"
