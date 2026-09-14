@@ -42,11 +42,19 @@ from common_fate_moving_mnist_dataset import CommonFateMovingMNISTDataset
 
 
 def single_frame_cnn(n_classes=10):
-    """Deliberately a strong per-frame model: if a cue exists, this should find it."""
+    """
+    Deliberately a strong per-frame model: if a cue exists, this should find it.
+
+    GroupNorm rather than BatchNorm, to match the classifier head. BatchNorm's
+    train/eval mismatch would depress the measured accuracy, and a leak probe
+    that under-reports is worse than no probe at all -- it would certify a
+    leaking dataset as clean.
+    """
+    gn = lambda c: nn.GroupNorm(min(8, c), c)
     return nn.Sequential(
-        nn.Conv2d(1, 32, 3, 2, 1, padding_mode="circular"), nn.BatchNorm2d(32), nn.ReLU(),
-        nn.Conv2d(32, 64, 3, 2, 1, padding_mode="circular"), nn.BatchNorm2d(64), nn.ReLU(),
-        nn.Conv2d(64, 64, 3, 2, 1, padding_mode="circular"), nn.BatchNorm2d(64), nn.ReLU(),
+        nn.Conv2d(1, 32, 3, 2, 1, padding_mode="circular", bias=False), gn(32), nn.ReLU(),
+        nn.Conv2d(32, 64, 3, 2, 1, padding_mode="circular", bias=False), gn(64), nn.ReLU(),
+        nn.Conv2d(64, 64, 3, 2, 1, padding_mode="circular", bias=False), gn(64), nn.ReLU(),
         nn.AdaptiveAvgPool2d(1), nn.Flatten(), nn.Linear(64, n_classes))
 
 

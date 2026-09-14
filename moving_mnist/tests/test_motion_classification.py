@@ -549,3 +549,49 @@ def test_val_curve_survives_across_epochs_and_resume():
         "the checkpoint does not save the step counter"
     assert re.search(r"curve=curve, global_step=global_step", src), \
         "the recorder is not threaded through the training epoch"
+
+
+def test_head_behaves_identically_in_train_and_eval():
+    """
+    Regression: the head used BatchNorm, whose running statistics never matched
+    because its input is an attention-weighted pool of a RECURRENT state, and
+    that distribution shifts as both the cell and the attention weights train.
+
+    Symptom: val accuracy oscillated between chance and 0.94 across epochs on a
+    2000-sequence set -- far outside sampling noise -- while training accuracy
+    rose smoothly. Evaluated with batch statistics the same model tracked
+    training accuracy (0.11 -> 0.22 over 14 epochs); in eval mode it sat at
+    chance and bounced (0.082 to 0.218).
+
+    GroupNorm has no running statistics, so the two modes agree exactly. Any
+    normalisation added to this head must keep that property.
+    """
+    x = torch.randn(4, 6, 1, 32, 32)
+    for model, kw in (("lstm", {}), ("melstm", dict(n_slots=2))):
+        net = MotionDigitClassifier(model=model, hidden_channels=8, **kw)
+        net.eval()
+        with torch.no_grad():
+            a = net(x)
+        net.train()
+        with torch.no_grad():
+            b = net(x)
+        assert torch.allclose(a, b, atol=1e-5), (
+            f"{model}: train and eval forward passes differ, so val accuracy will not "
+            f"reflect what the model actually learned")
+
+
+def test_batch_norm_head_is_still_reachable_but_not_default():
+    """'batch' stays available to reproduce the failure; it must not be the default."""
+    import inspect
+    from motion_classification_model import ConvClassifierHead
+    assert inspect.signature(ConvClassifierHead).parameters["norm"].default == "group"
+    x = torch.randn(4, 6, 1, 32, 32)
+    net = MotionDigitClassifier(model="lstm", hidden_channels=8, head_norm="batch")
+    net.eval()
+    with torch.no_grad():
+        a = net(x)
+    net.train()
+    with torch.no_grad():
+        b = net(x)
+    assert not torch.allclose(a, b, atol=1e-5), \
+        "head_norm='batch' should still exhibit the train/eval gap it is kept to demonstrate"

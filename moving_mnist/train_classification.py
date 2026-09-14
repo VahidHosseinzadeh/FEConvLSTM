@@ -114,6 +114,15 @@ def get_args(argv=None):
     p.add_argument('--head_blocks', type=int, default=3)
     p.add_argument('--head_mlp_hidden', type=int, default=128)
     p.add_argument('--head_dropout', type=float, default=0.0)
+    p.add_argument('--head_norm', choices=['group', 'batch', 'none'], default='group',
+                   help="Normalisation in the classifier head. 'batch' is BROKEN for this "
+                        "model: the head's input is an attention-weighted pool of a "
+                        "recurrent state whose distribution shifts as the cell and the "
+                        "attention train, so BatchNorm's running statistics never match and "
+                        "eval-mode accuracy oscillates between chance and the true value "
+                        "across epochs while training accuracy rises smoothly. 'group' "
+                        "(default) has no running statistics and behaves identically in "
+                        "train and eval.")
 
     # --- data
     p.add_argument('--root', type=str, default=str(_HERE.parent / 'data'))

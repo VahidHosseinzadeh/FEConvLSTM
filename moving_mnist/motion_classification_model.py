@@ -124,17 +124,41 @@ class ConvClassifierHead(nn.Module):
     space, after learned convolutions, and it is the right tool for an object
     covering ~3% of the frame: a pure average would drown the figure in the
     background it shares its statistics with.
+
+    Normalisation is GroupNorm, not BatchNorm, and that is not a style choice.
+    BatchNorm keeps running statistics for eval and uses batch statistics while
+    training. This head's input is an attention-weighted pool of a RECURRENT
+    state, whose distribution moves as both the cell and the attention weights
+    train, so the running statistics chase a target that keeps shifting and never
+    match. Measured: with BatchNorm, val accuracy evaluated with batch statistics
+    tracked training accuracy smoothly (0.11 -> 0.22 over 14 epochs) while the
+    same model evaluated in eval mode sat at chance and bounced erratically
+    (0.082 to 0.218) -- the reported val accuracy oscillated between chance and
+    0.94 across epochs on a 2000-sequence set, which is far outside sampling
+    noise. GroupNorm normalises per sample over channel groups, has no running
+    statistics, and so behaves identically in both modes.
     """
 
     def __init__(self, in_channels, n_classes=10, channels=64, n_blocks=3,
-                 mlp_hidden=128, dropout=0.0):
+                 mlp_hidden=128, dropout=0.0, norm="group", groups=8):
         super().__init__()
+        if norm not in ("group", "batch", "none"):
+            raise ValueError(f"unknown head norm {norm!r}")
+        self.norm = norm
+
+        def make_norm(c):
+            if norm == "batch":
+                return nn.BatchNorm2d(c)
+            if norm == "group":
+                return nn.GroupNorm(min(groups, c), c)
+            return nn.Identity()
+
         layers, ch = [], in_channels
         for _ in range(n_blocks):
             layers += [
                 nn.Conv2d(ch, channels, 3, stride=2, padding=1,
-                          padding_mode="circular", bias=False),
-                nn.BatchNorm2d(channels),
+                          padding_mode="circular", bias=(norm == "none")),
+                make_norm(channels),
                 nn.ReLU(inplace=True),
             ]
             ch = channels
@@ -168,7 +192,7 @@ class MotionDigitClassifier(nn.Module):
                  velocity_pool="attention", pool_temperature=1.0,
                  velocity_source="bootstrap",
                  head_channels=64, head_blocks=3, head_mlp_hidden=128,
-                 head_dropout=0.0, input_channels=1):
+                 head_dropout=0.0, head_norm="group", input_channels=1):
         super().__init__()
         self.model = model
         self.hidden_channels = hidden_channels
@@ -202,7 +226,8 @@ class MotionDigitClassifier(nn.Module):
                                  hidden_channels, temperature=pool_temperature)
         self.head = ConvClassifierHead(
             self.pool.out_channels, n_classes=n_classes, channels=head_channels,
-            n_blocks=head_blocks, mlp_hidden=head_mlp_hidden, dropout=head_dropout)
+            n_blocks=head_blocks, mlp_hidden=head_mlp_hidden, dropout=head_dropout,
+            norm=head_norm)
 
     # ------------------------------------------------------------------
     @staticmethod
@@ -461,4 +486,5 @@ def build_classifier(cfg):
         head_blocks=get("head_blocks", 3),
         head_mlp_hidden=get("head_mlp_hidden", 128),
         head_dropout=get("head_dropout", 0.0),
+        head_norm=get("head_norm", "group"),
     )

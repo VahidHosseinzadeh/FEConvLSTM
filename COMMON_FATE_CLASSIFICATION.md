@@ -184,6 +184,34 @@ architecture : melstm  V=2 velocity slots  velocity_source=bootstrap
 The backbone's decoder is built (so the recurrent cell matches the prediction
 experiments exactly) but never run, and is excluded from the optimizer.
 
+### Normalisation — GroupNorm, not BatchNorm
+
+`--head_norm group` (default). This is not a style choice, and getting it wrong
+produces a failure that looks like a data problem.
+
+BatchNorm uses batch statistics while training and running statistics at eval.
+This head's input is an attention-weighted pool of a **recurrent** state, and
+that distribution shifts as both the cell and the attention weights train, so the
+running statistics chase a moving target and never match.
+
+Measured over 14 epochs with BatchNorm:
+
+| | epoch 3 | 9 | 12 | 13 |
+|---|---|---|---|---|
+| train acc | 0.200 | 0.208 | 0.217 | 0.215 |
+| val, **batch** statistics | 0.223 | 0.229 | 0.221 | 0.221 |
+| val, **eval** (running) statistics | 0.122 | 0.127 | **0.082** | 0.123 |
+
+The model is learning normally — evaluating with batch statistics tracks training
+accuracy smoothly. Only the eval-mode forward pass is broken, and it lands at
+chance or below. On a full run this showed up as val accuracy oscillating between
+0.11 and 0.94 **between epochs** on a 2000-sequence set, which is far outside
+sampling noise (±0.007 at 0.9).
+
+GroupNorm normalises per sample over channel groups, keeps no running statistics,
+and so behaves identically in both modes. `--head_norm batch` is kept to
+reproduce the failure; `none` is also available.
+
 ### Velocity pooling — why not `max`
 
 `--velocity_pool attention` (default). Max-pooling over the velocity axis is the
