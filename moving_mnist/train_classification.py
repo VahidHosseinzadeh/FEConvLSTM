@@ -433,6 +433,15 @@ def main(argv=None):
     if wandb:
         wandb.log({"test_acc": te["acc"], "test_loss": te["loss"]})
         wandb.finish()
+
+    # All --epochs completed (not just this Slurm submission's walltime slice):
+    # marks the run finished so submit_classification.sbatch's self-chaining
+    # knows to stop resubmitting. Same convention as train.py.
+    if not args.smoke_test:
+        done = state_dir / f"DONE_{args.model}_{run_name}.flag"
+        done.touch()
+        print(f"training complete ({args.epochs} epochs) — wrote {done}")
+
     return history
 
 
