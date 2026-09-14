@@ -22,7 +22,6 @@ MODEL=${1:?usage: bash run_classification.sh lstm|felstm|melstm}
 HIDDEN=32
 HEAD_CH=64
 HEAD_BLOCKS=3
-BATCH=64
 EPOCHS=40
 LR=1e-3
 SEQ_LEN=15         # context T
@@ -46,6 +45,27 @@ CORR_LEN=1.0       # keep <= 1.0: above that the texture seam makes the digit
 V_RANGE=2          # felstm: (2*2+1)^2 = 25 transported copies, covers |v| <= 2
 N_SLOTS=4          # melstm: slot_hit_fig 62%/78%/94% at K=2/4/6 on this data
 VEL_SRC=frame_pair # melstm: 'tracked' measurably fails here -- see --help
+
+# Batch size is NOT shared, because memory is not. The recurrent state is carried
+# on every velocity copy at every timestep and kept for BPTT, so felstm's 25
+# copies cost ~25x melstm's 4 at the same hidden size. Profiled per piece, the
+# cost is the cell's CONVOLUTION (164 ms/step at B=16,K=4,64px on an M-series
+# GPU) -- the warp is 5 ms and the phase correlation under 1 ms, so neither is
+# worth optimising.
+#
+# Calibrated from run_comparison.sh, which measured ~62GB for felstm at
+# hidden=32 / batch=32 / seq_len=25 on the 80GB A100. This task runs seq_len=15,
+# so ~0.6x that: batch 32 lands near 37GB and fits, batch 64 would sit at the
+# ceiling. Lower the felstm arm of the case below first if a run OOMs.
+case "$MODEL" in
+  felstm) BATCH=32 ;;
+  *)      BATCH=64 ;;
+esac
+
+# Local runs: lstm is fine (~0.3 s/batch at B=16/64px on an M-series GPU),
+# melstm is slow but possible (~14 s/batch), and felstm OOMs outright at B=16
+# within a 20GB MPS budget. felstm is a cluster-only run -- use
+# submit_classification.sbatch.
 
 SAVE_DIR=./experiments_classification
 
