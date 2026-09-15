@@ -372,13 +372,18 @@ still shows the *same* sequences developing across epochs. Every timestep
 
 Rows, top to bottom:
 
-- **one row per velocity copy**, the FIGURE one in bold. For `felstm` the
-  informative copies are selected (matching the figure's velocity, matching the
-  background's, plus controls) because its whole lattice is unreadable; for
-  `melstm` all `K` slots; for `lstm` the single untransported state, labelled as
-  such — it has no lattice, so no lattice vocabulary appears on it.
-- **`input frame (figure outlined)`** — what the model saw, with the
-  ground-truth figure drawn on it as a hairline contour.
+- **`s_0`, `s_1`, …** — one row per velocity copy. For `felstm` the informative
+  copies are selected (the one matching the figure's velocity first, then the
+  background's, then controls) because its whole lattice is unreadable; for
+  `melstm` all `K` slots; for `lstm` the single untransported state.
+- **`input + GT mask`** — the frames the model saw, with the ground-truth figure
+  contoured on them.
+
+Row labels deliberately carry **no claim** about which copy holds the figure, and
+no velocity. Under `piecewise` motion the velocity changes mid-sequence, so a
+`(FIGURE)` tag or a single `v` is true of at most the last step — and for
+`felstm`'s fixed lattice especially, a copy only matches while the figure happens
+to move at its velocity. Say what the rows are in the caption instead.
 
 The ground-truth mask is an **overlay, not its own row**: a row of pure noise
 beside a row of pure mask wastes vertical space and reads oddly, and the outline

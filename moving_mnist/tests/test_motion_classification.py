@@ -752,3 +752,37 @@ def test_attention_scores_are_inert_at_one_velocity():
     grads = [float(p.grad.abs().sum()) for p in net.pool.parameters() if p.grad is not None]
     assert grads and all(g == 0.0 for g in grads), \
         f"attention scores got gradient at V=1: {grads}"
+
+
+def test_mask_contour_is_not_vertically_mirrored():
+    """
+    Regression: contour with `extent` and origin=None places Z[0,0] at the
+    BOTTOM-left, while imshow defaults to origin='upper' and places it top-left.
+    The ground-truth outline was therefore mirrored against the very frame it
+    annotates -- and invisibly so, since the figure is not visible in the noise.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    m = np.zeros((20, 20)); m[2:7, 8:12] = 1.0     # blob in the TOP rows
+    pad = 3
+    mp = np.pad(m, pad, mode="wrap")
+    H, W = m.shape
+    ext = (-pad - 0.5, W + pad - 0.5, H + pad - 0.5, -pad - 0.5)
+
+    def contour_mid_y(**kw):
+        fig, ax = plt.subplots()
+        cs = ax.contour(mp, levels=[0.5], extent=ext, **kw)
+        ys = np.concatenate([p.vertices[:, 1] for p in cs.get_paths()])
+        plt.close(fig)
+        return float(ys.mean())
+
+    # the blob sits in rows 2..7 of 20, so with origin='upper' its contour must
+    # land in the upper half of the *display* coordinates (small y)
+    assert contour_mid_y(origin="upper") < H / 2, \
+        "origin='upper' should place the outline where imshow places the blob"
+    assert contour_mid_y() > H / 2, \
+        "origin=None should mirror it -- if this stops being true, matplotlib " \
+        "changed and the explicit origin may no longer be needed"

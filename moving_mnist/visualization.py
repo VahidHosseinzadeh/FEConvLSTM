@@ -416,37 +416,41 @@ def log_motion_classification_states(
             v_fig = tuple(int(x) for x in g[-2, 0])
             v_bg = tuple(int(x) for x in g[-2, -1])
 
+        # Row labels carry NO claim about which copy holds the figure, and no
+        # velocity. Under piecewise motion the velocity changes mid-sequence, so
+        # a "(FIGURE)" tag or a single v is true of at most the last step and
+        # misleading about the rest -- for felstm's fixed lattice especially,
+        # where a copy only matches while the figure happens to move at its
+        # velocity. Rows are just s_0, s_1, ... and the caption says what they
+        # are. `fig_row` is tracked by INDEX for the readout, not by parsing the
+        # label text.
         missing = []
+        fig_row = None
         if has_lattice:                                       # felstm
             index = {tuple(v): k for k, v in enumerate(v_list)}
-            chosen, labels = [], []
-            for tag, vel in (("FIGURE", v_fig), ("background", v_bg)):
+            chosen = []
+            for vel in (v_fig, v_bg):
                 if vel in index and index[vel] not in chosen:
+                    if vel == v_fig:
+                        fig_row = len(chosen)
                     chosen.append(index[vel])
-                    labels.append(f"$v$ = {vel}\n({tag})")
                 elif vel is not None:
-                    missing.append(f"{tag} {vel}")
+                    missing.append(str(vel))
             for k in range(len(v_list)):
                 if len(chosen) >= max_slots:
                     break
                 if k not in chosen:
                     chosen.append(k)
-                    labels.append(f"$v$ = {tuple(v_list[k])}")
         elif velocities is not None:                          # melstm
             vl = velocities[i, -1].detach().cpu().round().long()
-            chosen, labels = [], []
-            for k in range(min(V, max_slots)):
-                vk = tuple(int(x) for x in vl[k])
-                # No velocity on the label: a melstm slot RE-ESTIMATES its velocity
-                # every step, so any single value is a snapshot of the last one and
-                # misrepresents the sequence. Which motion the slot followed is the
-                # informative part, and that is what the tag says.
-                tag = (" (FIGURE)" if vk == v_fig else
-                       (" (background)" if vk == v_bg else ""))
-                chosen.append(k)
-                labels.append(f"slot {k}{tag}")
+            chosen = list(range(min(V, max_slots)))
+            for k in chosen:
+                if tuple(int(x) for x in vl[k]) == v_fig:
+                    fig_row = k
+                    break
         else:                                                 # lstm
-            chosen, labels = [0], ["hidden state\n(no transport)"]
+            chosen, fig_row = [0], 0
+        labels = [f"$s_{{{k}}}$" for k in range(len(chosen))]
 
         def local_var(x, k=3):
             """Local variance in a kxk window; circular, because the canvas is a torus."""
@@ -458,7 +462,6 @@ def log_motion_classification_states(
                 torch.nn.functional.pad(x * x, (pad,) * 4, mode="circular"), k, stride=1)
             return (mu2 - mu * mu).clamp(min=0)[0, 0]
 
-        fig_row = next((r for r, lab in enumerate(labels) if "FIGURE" in lab), None)
         add_readout = show_shape_readout and fig_row is not None
 
         rows = len(chosen) + int(add_readout) + 1
@@ -477,7 +480,7 @@ def log_motion_classification_states(
         # fraction clips "slot 0 (background)" in the wandb copy -- the saved PNG
         # and PDF escape it only because bbox_inches="tight" crops afterwards.
         all_labels = [ln for lab in labels for ln in lab.split("\n")]
-        all_labels += ["input frame", "(figure outlined)"]
+        all_labels += ["input", "+ GT mask"]
         longest = max(len(x.replace("$", "")) for x in all_labels)
         left_margin = min(0.30, (longest * 0.078 + 0.30) / fig_w)
 
@@ -502,8 +505,14 @@ def log_motion_classification_states(
                 pad = 3
                 mp = np.pad(m2, pad, mode="wrap")
                 Hm, Wm = m2.shape
+                # origin="upper" is REQUIRED. With origin=None, contour reads
+                # `extent` as (x0, x1, y0, y1) placing Z[0, 0] at (x0, y0) -- the
+                # BOTTOM-left -- while imshow defaults to origin="upper" and puts
+                # it top-left. Without this the outline is mirrored vertically
+                # against the very frame it is annotating.
                 cs = ax.contour(mp, levels=[0.5], colors=[mask_color],
                                 linewidths=mask_lw, antialiased=True,
+                                origin="upper",
                                 extent=(-pad - 0.5, Wm + pad - 0.5,
                                         Hm + pad - 0.5, -pad - 0.5))
                 if mask_halo:
@@ -522,15 +531,15 @@ def log_motion_classification_states(
                 for sp in axes[r, col].spines.values():
                     sp.set_linewidth(0.4); sp.set_color("0.75")
 
-        def ylabel(row, text, weight="normal"):
-            axes[row, 0].set_ylabel(text, fontsize=10, rotation=0, ha="right",
-                                    va="center", labelpad=10, fontweight=weight)
+        def ylabel(row, text):
+            axes[row, 0].set_ylabel(text, fontsize=11, rotation=0, ha="right",
+                                    va="center", labelpad=8)
 
         for r, lab in enumerate(labels):
-            ylabel(r, lab, "bold" if "FIGURE" in lab else "normal")
+            ylabel(r, lab)
         if add_readout:
-            ylabel(readout_row, "local variance\n(figure copy)")
-        ylabel(frame_row, "input frame" + ("\n(figure outlined)" if mk is not None else ""))
+            ylabel(readout_row, f"local var\n$s_{{{fig_row}}}$")
+        ylabel(frame_row, "input\n+ GT mask" if mk is not None else "input")
 
         # No ground-truth velocity in the title: the motion is piecewise-constant,
         # so quoting a single v_fig / v_bg for the whole sequence is simply wrong.
@@ -542,7 +551,7 @@ def log_motion_classification_states(
         if epoch is not None:
             title += f"   (epoch {epoch})"
         if missing:
-            title += f"\nnot representable on this model's velocity lattice: {', '.join(missing)}"
+            title += f"\nvelocities off this model's lattice: {', '.join(missing)}"
         fig.suptitle(title, fontsize=12, y=0.995)
         fig.subplots_adjust(top=0.90 - 0.02 * (title.count(chr(10))),
                             bottom=0.015, left=left_margin, right=0.995)
