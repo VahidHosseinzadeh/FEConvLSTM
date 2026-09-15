@@ -223,13 +223,15 @@ def get_args(argv=None):
                         'the picture the experiment rests on: the frame row is noise, and '
                         'the question is whether the copy transported at the figure '
                         'velocity grows the digit while the others do not.')
-    p.add_argument('--log_states_samples', type=int, default=2,
-                   help='How many sequences to DRAW. Kept small: the state tensor is '
-                        '(B, T, V, H, W) and felstm has 25 copies.')
-    p.add_argument('--state_metric_samples', type=int, default=32,
-                   help='How many sequences the val_state_shape_iou scalar averages over. '
-                        'Larger than --log_states_samples because two would be far too '
-                        'noisy for a curve you want to read across epochs.')
+    p.add_argument('--log_states_samples', type=int, default=10,
+                   help='How many sequences to DRAW each time states are logged. Chosen at '
+                        'random from the fixed benchmark set, then held fixed, so the '
+                        'pictures span different digits and speeds while still showing the '
+                        'SAME sequences developing across epochs.')
+    p.add_argument('--state_metric_samples', type=int, default=64,
+                   help='How many sequences val_state_shape_iou averages over. Independent '
+                        'of --log_states_samples: the scalar wants many for a readable '
+                        'curve, the pictures want few to stay legible.')
     p.add_argument('--wandb_project', type=str, default='FERNN-common-fate')
     p.add_argument('--wandb_entity', type=str, default=None)
     p.add_argument('--wandb_dir', type=str, default='./tmp/')
@@ -305,8 +307,19 @@ def make_loaders(args, train_ds, val_ds, test_ds):
     # train.py does), useless for watching one sample develop across epochs,
     # which is the entire point of the picture. Paired with reset_rng() before
     # each logging pass, this yields the identical sequences every time.
-    n_state = min(args.log_states_samples, len(test_ds))
-    st = Subset(test_ds, list(range(n_state)))
+    # One pool serves both the pictures and the shape-IoU scalar, so size it for
+    # the larger of the two. Sizing it to log_states_samples silently capped the
+    # metric to that many sequences, which made the curve mostly noise.
+    #
+    # The indices are drawn at RANDOM but then held fixed: random so the pictures
+    # span different digits, speeds and placements instead of whatever happens to
+    # sit at indices 0..n; fixed so the wandb slider shows the SAME sequences
+    # developing across epochs, which is the point of logging them repeatedly.
+    n_state = min(max(args.log_states_samples, args.state_metric_samples), len(test_ds))
+    state_idx = torch.randperm(
+        len(test_ds), generator=torch.Generator().manual_seed(args.data_seed + 1)
+    )[:n_state].tolist()
+    st = Subset(test_ds, state_idx)
 
     kw = dict(num_workers=args.num_workers, pin_memory=torch.cuda.is_available())
     return (DataLoader(tr, batch_size=args.batch_size, shuffle=True,

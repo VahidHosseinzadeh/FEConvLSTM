@@ -672,3 +672,39 @@ def test_index_selects_the_glyph_when_a_pool_is_given():
     ds2.reset_rng(); a = [ds2[7][1] for _ in range(4)]
     ds2.reset_rng(); b = [ds2[999][1] for _ in range(4)]
     assert a == b, "unpooled behaviour changed; the parent class depends on it"
+
+
+def test_state_pool_serves_both_the_pictures_and_the_metric():
+    """
+    Regression: the state loader was sized to --log_states_samples, so
+    --state_metric_samples was silently capped to it and val_state_shape_iou was
+    averaged over 2 sequences instead of 64 -- a curve that was mostly noise.
+
+    Also pins that the sequences are drawn at random (spanning different digits
+    and speeds) but then held FIXED, so the wandb slider compares like with like
+    across epochs.
+    """
+    from train_classification import build_datasets, get_args, make_loaders
+
+    args = get_args([
+        "--root", DATA_ROOT, "--seq_len", "4", "--image_size", "32",
+        "--batch_size", "4", "--num_workers", "0", "--use_wandb",
+        "--log_states_samples", "6", "--state_metric_samples", "20",
+        "--test_size", "64",
+    ])
+    train_ds, val_ds, test_ds = build_datasets(args)
+    *_, state_loader = make_loaders(args, train_ds, val_ds, test_ds)
+
+    batch = next(iter(state_loader))
+    assert batch[0].shape[0] == 20, (
+        f"state pool holds {batch[0].shape[0]} sequences; it must cover the LARGER of "
+        f"log_states_samples and state_metric_samples, or the metric is silently capped")
+
+    # not simply indices 0..n-1
+    idx = state_loader.dataset.indices
+    assert idx != list(range(len(idx))), "state sequences are not randomised"
+
+    # but stable across passes, so epochs are comparable
+    test_ds.reset_rng(); first = next(iter(state_loader))[0].clone()
+    test_ds.reset_rng(); second = next(iter(state_loader))[0]
+    assert torch.equal(first, second), "state sequences changed between passes"
