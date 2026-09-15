@@ -245,10 +245,10 @@ def get_args(argv=None):
                         'because it is a diagnostic about the metric, not about the model. '
                         '0 = off.')
     p.add_argument('--states_fig_dir', type=str, default=None,
-                   help='Also write each state panel here as PNG and PDF, for the paper. '
-                        'Off by default; a 50-epoch run would otherwise write thousands of '
-                        'files. Point it somewhere for a single run, or set '
-                        '--log_states_every to the epoch count you actually want.')
+                   help='Write the state panels here as PNG and PDF, for the paper. Only '
+                        'the FINAL epoch is written, however often --log_states_every logs '
+                        'to wandb: the slider there is for watching training, the files are '
+                        'for the paper and want one trained model, not fifty.')
     p.add_argument('--state_metric_samples', type=int, default=64,
                    help='How many sequences val_state_shape_iou averages over. Independent '
                         'of --log_states_samples: the scalar wants many for a readable '
@@ -485,7 +485,7 @@ def state_shape_iou(model, states, velocities, motion, mask):
     return float(matched[valid].mean()), float(best.mean())
 
 
-def log_states(model, loader, fixed_ds, device, args, epoch, step):
+def log_states(model, loader, fixed_ds, device, args, epoch, step, save=False):
     """
     One small forward with return_states=True, on a FIXED set of sequences.
 
@@ -530,7 +530,7 @@ def log_states(model, loader, fixed_ds, device, args, epoch, step):
         states, seq, mask_track=mask, velocities=velocities,
         v_list=v_list, gt_motion=motion, split_name="val", epoch=epoch,
         step=step, num_samples=min(args.log_states_samples, seq.shape[0]),
-        save_dir=args.states_fig_dir)
+        save_dir=args.states_fig_dir if save else None)
 
     # A few diagnostic panels WITH the local-variance readout, under their own
     # key so they never end up in a paper figure by accident.
@@ -807,7 +807,8 @@ def main(argv=None):
         # Before the print and the log, so the shape IoU appears in both.
         if wandb and args.log_states_every and epoch % args.log_states_every == 0:
             row.update(log_states(model, state_loader, test_ds, device, args, epoch,
-                                  global_step) or {})
+                                  global_step,
+                                  save=(epoch == args.epochs - 1)) or {})
         history["epochs"].append(row)
 
         extra = "".join(f"  {k}={va[k]:.3f}" for k in

@@ -328,6 +328,7 @@ def log_motion_classification_states(
     save_dir=None,
     dpi=160,
     show_shape_readout=False,
+    mask_color="#56B4E9",
 ):
     """
     Publication-quality view of what each velocity copy accumulated.
@@ -341,7 +342,11 @@ def log_motion_classification_states(
 
     h_states   : (B, T, V, H, W) per-timestep CHANNEL-MEAN of each velocity copy.
     frames     : (B, T, C, H, W) the input the model saw.
-    mask_track : (B, T, N, H, W) ground-truth figure aperture, or None.
+    mask_track : (B, T, N, H, W) ground-truth figure aperture, or None. Drawn as
+        a thin contour ON the input frame rather than as its own row: a row of
+        pure noise beside a row of pure mask wastes vertical space and reads
+        oddly, while the outline puts the answer key exactly where the reader
+        needs it -- over the frame that appears to contain nothing.
     velocities : (B, T-1, K, 2) tracked slot velocities (melstm), or None.
     v_list     : the fixed lattice, model.cell.v_list (felstm/lstm), or None.
     gt_motion  : (B, T, N+1, 2) true (vx, vy), figures then background last.
@@ -443,7 +448,7 @@ def log_motion_classification_states(
         fig_row = next((r for r, lab in enumerate(labels) if "FIGURE" in lab), None)
         add_readout = show_shape_readout and fig_row is not None
 
-        rows = len(chosen) + int(add_readout) + 1 + (mk is not None)
+        rows = len(chosen) + int(add_readout) + 1
         readout_row = len(chosen)
         frame_row = readout_row + int(add_readout)
 
@@ -459,7 +464,7 @@ def log_motion_classification_states(
         # fraction clips "slot 0 (background)" in the wandb copy -- the saved PNG
         # and PDF escape it only because bbox_inches="tight" crops afterwards.
         all_labels = [ln for lab in labels for ln in lab.split("\n")]
-        all_labels += ["input frame", "figure mask", "(ground truth)"]
+        all_labels += ["input frame", "(figure outlined)"]
         longest = max(len(x.replace("$", "")) for x in all_labels)
         left_margin = min(0.30, (longest * 0.078 + 0.30) / fig_w)
 
@@ -472,11 +477,24 @@ def log_motion_classification_states(
             if add_readout:
                 axes[readout_row, col].imshow(local_var(h[t, chosen[fig_row]]),
                                               cmap="magma", interpolation="nearest")
-            axes[frame_row, col].imshow(fr[t].mean(0), cmap="gray",
-                                        interpolation="nearest")
+            ax = axes[frame_row, col]
+            ax.imshow(fr[t].mean(0), cmap="gray", interpolation="nearest")
             if mk is not None:
-                axes[rows - 1, col].imshow(mk[t].amax(0), cmap="gray", vmin=0, vmax=1,
-                                           interpolation="nearest")
+                # Contour rather than a pixel mask: anti-aliased, hairline, and it
+                # sits over the texture instead of blocking it. Drawn on a
+                # circularly PADDED copy and then clipped back, so a figure that
+                # wraps around the torus keeps a continuous outline instead of
+                # picking up a spurious straight segment along the frame edge.
+                m2 = mk[t].amax(0).numpy()
+                pad = 3
+                mp = np.pad(m2, pad, mode="wrap")
+                Hm, Wm = m2.shape
+                ax.contour(mp, levels=[0.5], colors=[mask_color], linewidths=0.7,
+                           alpha=0.85, antialiased=True,
+                           extent=(-pad - 0.5, Wm + pad - 0.5,
+                                   Hm + pad - 0.5, -pad - 0.5))
+                ax.set_xlim(-0.5, Wm - 0.5)
+                ax.set_ylim(Hm - 0.5, -0.5)
             axes[0, col].set_title(f"$t$ = {t}", fontsize=11, pad=5)
             for r in range(rows):
                 axes[r, col].set_xticks([]); axes[r, col].set_yticks([])
@@ -491,9 +509,7 @@ def log_motion_classification_states(
             ylabel(r, lab, "bold" if "FIGURE" in lab else "normal")
         if add_readout:
             ylabel(readout_row, "local variance\n(figure copy)")
-        ylabel(frame_row, "input frame\n(ground truth)")
-        if mk is not None:
-            ylabel(rows - 1, "figure mask\n(ground truth)")
+        ylabel(frame_row, "input frame" + ("\n(figure outlined)" if mk is not None else ""))
 
         # No ground-truth velocity in the title: the motion is piecewise-constant,
         # so quoting a single v_fig / v_bg for the whole sequence is simply wrong.
@@ -511,7 +527,9 @@ def log_motion_classification_states(
                             bottom=0.015, left=left_margin, right=0.995)
 
         if save_dir is not None:
-            stem = f"{split_name}_states_sample{i}" + (f"_ep{epoch}" if epoch is not None else "")
+            # No epoch in the name: only the final epoch is written, so a bare
+            # name is what a paper wants to cite.
+            stem = f"{split_name}_states_sample{i}"
             fig.savefig(save_dir / f"{stem}.png", dpi=dpi, bbox_inches="tight")
             fig.savefig(save_dir / f"{stem}.pdf", bbox_inches="tight")
 

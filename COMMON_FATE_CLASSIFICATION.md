@@ -377,9 +377,18 @@ Rows, top to bottom:
   background's, plus controls) because its whole lattice is unreadable; for
   `melstm` all `K` slots; for `lstm` the single untransported state, labelled as
   such — it has no lattice, so no lattice vocabulary appears on it.
-- **`input frame (ground truth)`** — what the model saw. Noise. The digit is
-  genuinely not in it.
-- **`figure mask (ground truth)`** — where the figure actually was.
+- **`input frame (figure outlined)`** — what the model saw, with the
+  ground-truth figure drawn on it as a hairline contour.
+
+The ground-truth mask is an **overlay, not its own row**: a row of pure noise
+beside a row of pure mask wastes vertical space and reads oddly, and the outline
+puts the answer key exactly where the reader needs it — over the frame that
+appears to contain nothing. It is drawn with `contour` rather than as a pixel
+mask, so it is anti-aliased and does not obscure the texture, on a circularly
+padded copy so a figure wrapping around the torus keeps a continuous outline
+instead of picking up a straight segment along the frame edge. Colour is
+`--mask_color`-free but easy to change in `log_motion_classification_states`
+(default `#56B4E9`, Okabe–Ito sky blue: colourblind-safe and legible on grey).
 
 **What to look for:** the copy marked FIGURE should develop the digit's shape
 over time while the others stay textureless.
@@ -390,7 +399,10 @@ Velocities appear on a row only where they are genuinely constant — felstm's
 fixed lattice copies. A melstm slot re-estimates every step, so its row is
 labelled by which motion it followed, not by a number.
 
-`--states_fig_dir DIR` also writes each panel as PNG and PDF for the paper.
+`--states_fig_dir DIR` writes each panel as PNG and PDF for the paper. **Only
+the final epoch** is written, however often `--log_states_every` logs to wandb:
+the slider there is for watching training, the files are for the paper and want
+one trained model, not fifty. Filenames carry no epoch number for that reason.
 
 ### `val_readout_states_*` — diagnostic, not for the paper
 
