@@ -386,9 +386,19 @@ puts the answer key exactly where the reader needs it — over the frame that
 appears to contain nothing. It is drawn with `contour` rather than as a pixel
 mask, so it is anti-aliased and does not obscure the texture, on a circularly
 padded copy so a figure wrapping around the torus keeps a continuous outline
-instead of picking up a straight segment along the frame edge. Colour is
-`--mask_color`-free but easy to change in `log_motion_classification_states`
-(default `#56B4E9`, Okabe–Ito sky blue: colourblind-safe and legible on grey).
+instead of picking up a straight segment along the frame edge.
+
+It is drawn over a **halo** — a thicker dark stroke underneath the coloured line
+— and that is what makes it survive. Against high-frequency noise a plain
+hairline is lighter than the texture in some places and darker in others, so it
+keeps disappearing; a halo gives it local contrast wherever it runs. Section 12
+of `test_common_fate_moving_mnist.ipynb` compares eight styles side by side and
+across time: a 0.7pt line with no halo is barely findable, while 1.2pt over a
+1.6pt black halo reads at every timestep.
+
+Defaults live in `log_motion_classification_states`: `mask_color="#E69F00"`
+(Okabe–Ito amber, colourblind-safe and the strongest hue against neutral grey),
+`mask_lw=1.2`, `mask_halo=1.6`. `"#56B4E9"` (sky) and `"white"` also read well.
 
 **What to look for:** the copy marked FIGURE should develop the digit's shape
 over time while the others stay textureless.

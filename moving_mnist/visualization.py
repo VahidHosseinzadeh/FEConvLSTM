@@ -2,6 +2,7 @@ import torch
 import torch.nn.functional as F
 from torchvision.utils import make_grid
 import matplotlib.pyplot as plt
+import matplotlib.patheffects as patheffects
 import numpy as np
 import math
 import wandb
@@ -328,7 +329,10 @@ def log_motion_classification_states(
     save_dir=None,
     dpi=160,
     show_shape_readout=False,
-    mask_color="#56B4E9",
+    mask_color="#E69F00",
+    mask_lw=1.2,
+    mask_halo=1.6,
+    mask_halo_color="black",
 ):
     """
     Publication-quality view of what each velocity copy accumulated.
@@ -343,10 +347,19 @@ def log_motion_classification_states(
     h_states   : (B, T, V, H, W) per-timestep CHANNEL-MEAN of each velocity copy.
     frames     : (B, T, C, H, W) the input the model saw.
     mask_track : (B, T, N, H, W) ground-truth figure aperture, or None. Drawn as
-        a thin contour ON the input frame rather than as its own row: a row of
-        pure noise beside a row of pure mask wastes vertical space and reads
-        oddly, while the outline puts the answer key exactly where the reader
-        needs it -- over the frame that appears to contain nothing.
+        a contour ON the input frame rather than as its own row: a row of pure
+        noise beside a row of pure mask wastes vertical space and reads oddly,
+        while the outline puts the answer key exactly where the reader needs it
+        -- over the frame that appears to contain nothing.
+
+        mask_halo draws a darker, thicker stroke UNDER the coloured line. That is
+        what makes it survive: against high-frequency noise a plain hairline is
+        lighter than the texture in some places and darker in others, so it keeps
+        disappearing. A halo gives the line local contrast wherever it runs.
+        Compared side by side (see the notebook), a 0.7pt line with no halo is
+        barely findable; 1.2pt over a 1.6pt black halo reads at every timestep.
+        Okabe-Ito amber by default -- colourblind-safe and the strongest hue
+        against neutral grey; "#56B4E9" (sky) and "white" also work.
     velocities : (B, T-1, K, 2) tracked slot velocities (melstm), or None.
     v_list     : the fixed lattice, model.cell.v_list (felstm/lstm), or None.
     gt_motion  : (B, T, N+1, 2) true (vx, vy), figures then background last.
@@ -489,10 +502,18 @@ def log_motion_classification_states(
                 pad = 3
                 mp = np.pad(m2, pad, mode="wrap")
                 Hm, Wm = m2.shape
-                ax.contour(mp, levels=[0.5], colors=[mask_color], linewidths=0.7,
-                           alpha=0.85, antialiased=True,
-                           extent=(-pad - 0.5, Wm + pad - 0.5,
-                                   Hm + pad - 0.5, -pad - 0.5))
+                cs = ax.contour(mp, levels=[0.5], colors=[mask_color],
+                                linewidths=mask_lw, antialiased=True,
+                                extent=(-pad - 0.5, Wm + pad - 0.5,
+                                        Hm + pad - 0.5, -pad - 0.5))
+                if mask_halo:
+                    fx = [patheffects.withStroke(linewidth=mask_lw + mask_halo,
+                                                 foreground=mask_halo_color,
+                                                 alpha=0.9)]
+                    # matplotlib >= 3.8 makes ContourSet a Collection itself;
+                    # older versions expose .collections.
+                    for coll in (cs.collections if hasattr(cs, "collections") else [cs]):
+                        coll.set_path_effects(fx)
                 ax.set_xlim(-0.5, Wm - 0.5)
                 ax.set_ylim(Hm - 0.5, -0.5)
             axes[0, col].set_title(f"$t$ = {t}", fontsize=11, pad=5)
