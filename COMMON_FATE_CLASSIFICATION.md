@@ -306,27 +306,42 @@ help — a defect of the peak selection, not evidence the scene has more motions
 
 **Chance is 10%.**
 
-### `val_state_shape_iou` — the one to watch
+### `val_state_shape_iou` — transport coherence, NOT a predictor of accuracy
 
-**Does the hidden state actually contain the digit's shape?** Accuracy cannot
-answer this; a model can be right for the wrong reason, and once was. This asks
-directly: take the velocity copy transported at the figure's velocity, take the
-local variance of its channel-mean, and score that against the true mask
-(area-matched IoU, so the threshold is not a free parameter).
+Takes the velocity copy transported at the figure's velocity, takes the local
+variance of its channel mean, and scores it against the true mask (area-matched
+IoU). `val_state_shape_iou_best` is the same over the best copy;
+`val_state_shape_iou_chance` is the mask's area fraction.
 
-`val_state_shape_iou_chance` is logged beside it — the mask's area fraction.
+Read it as a measure of **transport coherence**. Three limits, all measured, and
+worth knowing before you draw conclusions from it:
 
-Measured on **untrained** models, which is already diagnostic:
+**It does not predict accuracy.** felstm reached 0.976 val accuracy with a
+matched IoU sitting at chance — its information is spread across copies and over
+time rather than concentrated in one copy at the end.
 
-| model | shape IoU (chance 0.062) | |
-|---|---|---|
-| `lstm` | **0.019** | below chance — no transport, so the figure smears along its path |
-| `felstm` | 0.119 | ~2x chance |
-| `melstm` | **0.328** | 5x chance — the figure slot holds the shape |
+**It penalises fixed velocity lattices under time-varying motion.** Under
+`--motion_mode constant` melstm and felstm score *identically*; only under
+`piecewise` does felstm fall behind:
 
-This separates the three models by **mechanism** before any training, and it is
-the metric that would have caught the seam leak: a leaking `lstm` shows high
-accuracy and a flat, near-chance shape IoU.
+| model | constant | piecewise | chance |
+|---|---|---|---|
+| melstm | 0.521 | 0.494 | ~0.10 |
+| felstm | **0.521** | **0.317** | ~0.10 |
+
+felstm's copies sit at fixed lattice velocities, so a copy only accumulates
+coherently while the figure's velocity matches it; melstm re-estimates its slots
+every step and stays locked on through a change. That is a real architectural
+difference, not a defect in either — and it is arguably the most interesting
+thing this metric shows.
+
+**It reads the channel MEAN**, so it measures raw accumulated texture. A trained
+cell may encode the figure in particular channels that cancel in the mean, which
+is why the number tends to fall rather than rise during training.
+
+`best` is the fairer cross-architecture number — "is the digit anywhere in the
+state" — but it favours models with more copies, since taking the best of V gets
+more chances as V grows.
 
 ### Velocity diagnostics — melstm only
 

@@ -398,20 +398,33 @@ def _area_matched_iou(score, mask):
 
 def state_shape_iou(model, states, velocities, motion, mask):
     """
-    Does the hidden state actually CONTAIN the digit's shape?
+    Does the hidden state CONTAIN the digit's shape, in the copy transported at
+    the figure's velocity?
 
-    This is the mechanism the whole experiment rests on, and accuracy does not
-    measure it: a model can be right for the wrong reason (it was, when the
-    texture seam leaked the outline per frame). This asks the question directly
-    -- take the velocity copy transported at the FIGURE's velocity, take the
-    local variance of its channel-mean, and score that against the true mask.
+    Take that copy, take the local variance of its CHANNEL MEAN, and score it
+    against the true mask (area-matched IoU). Returns two numbers: `matched`, for
+    the velocity-matched copy, and `best`, the best over all copies.
 
-    High only if the figure accumulated coherently in that copy. lstm has no
-    transport, so its single state smears the figure across its path and should
-    score near the mask's area fraction however good its accuracy looks. That
-    contrast is the point.
+    Read it as a measure of TRANSPORT COHERENCE, not of task performance. Three
+    limits are worth knowing, all measured:
 
-    Returns a scalar, or None when nothing can be scored.
+    * It is not a predictor of accuracy. felstm reached 0.976 val accuracy with a
+      matched IoU at chance, because its information is spread across copies and
+      over time rather than concentrated in one copy at the end.
+    * It penalises FIXED velocity lattices under time-varying motion. Under
+      constant motion melstm and felstm both score 0.521 (chance 0.095); under
+      piecewise motion melstm holds 0.494 while felstm falls to 0.317, because
+      felstm's copies cannot follow a velocity that changes mid-sequence while
+      melstm re-estimates its slots every step. That is a real architectural
+      difference, not a defect in either.
+    * It reads the channel MEAN, so it measures raw accumulated texture. A
+      trained cell may encode the figure in particular channels that cancel in
+      the mean, which is why the number tends to fall rather than rise during
+      training.
+
+    `best` is the fairer cross-architecture number -- "is the digit anywhere in
+    the state" -- but it is biased toward models with more copies, since taking
+    the best of V gets more chances as V grows.
     """
     if mask is None or motion is None or states is None:
         return None
@@ -445,8 +458,10 @@ def state_shape_iou(model, states, velocities, motion, mask):
     if not bool(valid.any()):
         return None
     sel = h[torch.arange(B, device=h.device), idx]      # (B, H, W)
-    iou = _area_matched_iou(_local_var(sel), target)
-    return float(iou[valid].mean())
+    matched = _area_matched_iou(_local_var(sel), target)
+    best = torch.stack([_area_matched_iou(_local_var(h[:, v]), target)
+                        for v in range(V)]).max(dim=0).values
+    return float(matched[valid].mean()), float(best.mean())
 
 
 def log_states(model, loader, fixed_ds, device, args, epoch, step):
@@ -481,7 +496,8 @@ def log_states(model, loader, fixed_ds, device, args, epoch, step):
     extra = {}
     iou = state_shape_iou(model, states, velocities, motion, mask)
     if iou is not None:
-        extra["val_state_shape_iou"] = iou
+        extra["val_state_shape_iou"] = iou[0]          # velocity-matched copy
+        extra["val_state_shape_iou_best"] = iou[1]     # best copy, fairer across V
         if mask is not None:
             # Chance for an area-matched IoU is the mask's area fraction.
             extra["val_state_shape_iou_chance"] = float(mask[:, -1].amax(1).mean())
