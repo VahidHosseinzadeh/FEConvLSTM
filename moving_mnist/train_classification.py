@@ -233,11 +233,22 @@ def get_args(argv=None):
                         'the picture the experiment rests on: the frame row is noise, and '
                         'the question is whether the copy transported at the figure '
                         'velocity grows the digit while the others do not.')
-    p.add_argument('--log_states_samples', type=int, default=10,
+    p.add_argument('--log_states_samples', type=int, default=30,
                    help='How many sequences to DRAW each time states are logged. Chosen at '
                         'random from the fixed benchmark set, then held fixed, so the '
                         'pictures span different digits and speeds while still showing the '
                         'SAME sequences developing across epochs.')
+    p.add_argument('--log_states_readout_samples', type=int, default=3,
+                   help='Additional DIAGNOSTIC panels, logged under val_readout_states_*, '
+                        'that add a local-variance row under the figure copy -- the picture '
+                        'form of val_state_shape_iou. Kept separate from the paper panels '
+                        'because it is a diagnostic about the metric, not about the model. '
+                        '0 = off.')
+    p.add_argument('--states_fig_dir', type=str, default=None,
+                   help='Also write each state panel here as PNG and PDF, for the paper. '
+                        'Off by default; a 50-epoch run would otherwise write thousands of '
+                        'files. Point it somewhere for a single run, or set '
+                        '--log_states_every to the epoch count you actually want.')
     p.add_argument('--state_metric_samples', type=int, default=64,
                    help='How many sequences val_state_shape_iou averages over. Independent '
                         'of --log_states_samples: the scalar wants many for a readable '
@@ -514,10 +525,22 @@ def log_states(model, loader, fixed_ds, device, args, epoch, step):
 
     v_list = (model.backbone.cell.v_list
               if model.model in ("lstm", "felstm") else None)
+    # Paper panels: no readout row, optionally written to disk as PNG/PDF.
     log_motion_classification_states(
         states, seq, mask_track=mask, velocities=velocities,
         v_list=v_list, gt_motion=motion, split_name="val", epoch=epoch,
-        step=step, num_samples=min(args.log_states_samples, seq.shape[0]))
+        step=step, num_samples=min(args.log_states_samples, seq.shape[0]),
+        save_dir=args.states_fig_dir)
+
+    # A few diagnostic panels WITH the local-variance readout, under their own
+    # key so they never end up in a paper figure by accident.
+    if args.log_states_readout_samples:
+        log_motion_classification_states(
+            states, seq, mask_track=mask, velocities=velocities,
+            v_list=v_list, gt_motion=motion, split_name="val_readout", epoch=epoch,
+            step=step,
+            num_samples=min(args.log_states_readout_samples, seq.shape[0]),
+            show_shape_readout=True)
     return extra
 
 

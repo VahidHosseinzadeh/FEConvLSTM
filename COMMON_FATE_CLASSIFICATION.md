@@ -364,47 +364,44 @@ head never learned to select it, and the pool is doing nothing.
 
 ### The state images
 
-`val_states_sample0`, `val_states_sample1` — logged every `--log_states_every`
-epochs (default 1) on a **fixed** set of sequences, so the wandb step slider
-shows the *same* sample developing as training proceeds. **Every timestep
-`0 … T-1` is shown**, one per column.
+`val_states_sample0 … sample29` — the paper figure. Logged every
+`--log_states_every` epochs (default 1) on a **random but fixed** set of
+sequences, so the panels span different digits and speeds while the wandb slider
+still shows the *same* sequences developing across epochs. Every timestep
+`0 … T-1` is a column.
 
-Each figure is, top to bottom:
+Rows, top to bottom:
 
-- **one row per velocity copy**, labelled with its velocity and marked `<- FIGURE`
-  or `<- bg` when it matches ground truth. For `felstm` the informative copies are
-  selected (the one matching the figure, the one matching the background, plus
-  controls) because its whole lattice is unreadable; for `melstm` all `K` slots;
-  for `lstm` the single untransported state.
-- **`local var (figure copy)`** — the shape readout, computed from the row marked
-  `<- FIGURE`. This is the picture-form of `val_state_shape_iou`: structure
-  appearing here *is* the digit being recovered.
-- **`frame (input)`** — what the model saw. This is noise. The digit is genuinely
-  not in it.
-- **`figure (GT mask)`** — the answer key: where the figure actually was.
+- **one row per velocity copy**, the FIGURE one in bold. For `felstm` the
+  informative copies are selected (matching the figure's velocity, matching the
+  background's, plus controls) because its whole lattice is unreadable; for
+  `melstm` all `K` slots; for `lstm` the single untransported state, labelled as
+  such — it has no lattice, so no lattice vocabulary appears on it.
+- **`input frame (ground truth)`** — what the model saw. Noise. The digit is
+  genuinely not in it.
+- **`figure mask (ground truth)`** — where the figure actually was.
 
-**What you are looking for:** the copy marked `<- FIGURE` should develop the
-digit's shape over time while the others stay textureless, and the `local var`
-row should come to match the `GT mask` row. That is the entire experiment in one
-picture.
+**What to look for:** the copy marked FIGURE should develop the digit's shape
+over time while the others stay textureless.
 
-### `val_curve` and `val_curve_acc`
+Ground-truth velocities are deliberately **not** printed. The motion is
+piecewise-constant, so a single `v_fig` for the whole sequence would be wrong.
+Velocities appear on a row only where they are genuinely constant — felstm's
+fixed lattice copies. A melstm slot re-estimates every step, so its row is
+labelled by which motion it followed, not by a number.
 
-Loss and accuracy against **optimizer steps** rather than epochs, sampled every
-`--val_curve_interval` steps on a fixed set of `--val_curve_size` sequences. One
-point per epoch is a coarse picture of a 50-epoch run; this is the fine one.
+`--states_fig_dir DIR` also writes each panel as PNG and PDF for the paper.
 
-The set is **materialised into a tensor** at construction, not held by index —
-this dataset resamples on every access, so an indexed set would measure something
-different each time and the curve would be mostly resampling noise.
+### `val_readout_states_*` — diagnostic, not for the paper
 
-Both are logged once, at the end, as line charts, because their x axis is
-optimizer steps and this run's wandb step axis is the epoch. The raw points are
-also written to `history_<run>.json` under `val_curve`, so you can re-plot them
-without wandb. The step counter is checkpointed, so the curve continues across a
-resume rather than restarting at 0.
+A few extra panels (`--log_states_readout_samples`, default 3) that add a
+**local variance (figure copy)** row: the picture form of
+`val_state_shape_iou`, showing where that copy accumulated coherent structure.
+Kept under a separate key, and never written to `--states_fig_dir`, because it
+is a diagnostic about the metric rather than about the model — and the metric
+measures transport coherence rather than anything predictive of accuracy.
 
-### `test_confusion`
+### `test_confusion`### `test_confusion`
 
 A 10x10 confusion matrix on the test set, logged at the end, plus
 `test_acc_digit0 … digit9` in the summary. The *structure* of the errors says

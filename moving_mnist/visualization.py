@@ -325,71 +325,71 @@ def log_motion_classification_states(
     num_samples=2,
     subsample_t=1,
     max_slots=6,
-    show_shape_readout=True,
+    save_dir=None,
+    dpi=160,
+    show_shape_readout=False,
 ):
     """
-    Show what each velocity copy accumulated, for the motion-defined-digit task.
+    Publication-quality view of what each velocity copy accumulated.
 
-    This is the picture the whole experiment rests on. The frame row is noise --
-    the digit is genuinely not in it -- so the question is whether the copy
-    transported at the FIGURE's velocity develops the digit's shape while the
-    others average their drifting texture into mush. The mask row is the answer
-    key: it is where the figure actually was.
+    This is the picture the whole experiment rests on. The bottom two rows are
+    ground truth: the frames the model saw -- which are noise, the digit is
+    genuinely not in them -- and the figure's true aperture. Above them sits one
+    row per velocity copy, so the question the figure asks reads top-to-bottom:
+    does the copy transported at the FIGURE's velocity develop the digit's shape
+    while the others stay textureless?
 
     h_states   : (B, T, V, H, W) per-timestep CHANNEL-MEAN of each velocity copy.
     frames     : (B, T, C, H, W) the input the model saw.
     mask_track : (B, T, N, H, W) ground-truth figure aperture, or None.
     velocities : (B, T-1, K, 2) tracked slot velocities (melstm), or None.
-    v_list     : the fixed lattice, model.cell.v_list (felstm), or None.
+    v_list     : the fixed lattice, model.cell.v_list (felstm/lstm), or None.
     gt_motion  : (B, T, N+1, 2) true (vx, vy), figures then background last.
+    save_dir   : also write each panel as PNG and PDF here, for the paper.
+    show_shape_readout : add a row under the FIGURE copy holding the local
+        variance of its channel mean -- the picture form of
+        val_state_shape_iou, showing where that copy accumulated coherent
+        structure. Off for paper panels: it is a diagnostic about the metric,
+        not about the model, and the metric turned out to measure transport
+        coherence rather than anything predictive of accuracy.
 
     Slot selection. felstm's lattice can be dozens of copies, which is
-    unreadable, so the ones actually worth seeing are picked: the copy matching
-    the figure's velocity, the copy matching the background's, and a few others
-    as a control. Selection uses the velocity at the LAST encoder step -- the one
-    h_T was most recently transported at, and the same step the slot_hit_fig
-    scalar is computed on.
+    unreadable, so the ones worth seeing are picked: the copy matching the
+    figure's velocity, the copy matching the background's, and a few others as a
+    control. Selection uses the velocity at the LAST encoder step -- the one h_T
+    was most recently transported at, and the same step slot_hit_fig uses.
 
     Sample keys are positional and stable across epochs on purpose: wandb then
     gives one slider per sample showing the SAME sequence developing as training
-    proceeds, which is the thing to watch. Random sample indices would scatter
-    the keys and make that impossible.
+    proceeds. Random sample indices would scatter the keys and make that
+    impossible.
 
     `step` MUST be passed by any caller whose other wandb.log calls use an
     explicit step. Every sample is logged in ONE call at that step: a wandb.log
-    without `step` commits and advances wandb's internal counter, so logging
-    per sample would push the counter past the epoch and the NEXT epoch's
-    metrics would be silently dropped with "Tried to log to step N that is less
-    than the current step". Images and scalars then also land on different x
-    axes, which is what makes the epoch slider useless.
+    without `step` commits and advances wandb's internal counter, so logging per
+    sample would push the counter past the epoch and the NEXT epoch's metrics
+    would be silently dropped.
     """
     payload = {}
     B, T, V, H, W = h_states.shape
     n = min(num_samples, B)
     steps = list(range(0, T, max(1, subsample_t)))
     if steps[-1] != T - 1:
-        steps.append(T - 1)          # always show the final state the head reads
+        steps.append(T - 1)
 
-    def local_var(x, k=3):
-        """
-        Local variance in a kxk window -- the 'is there structure here' readout.
+    # One untransported state is not a "lattice", so the lattice vocabulary --
+    # per-copy velocity labels, and the note about velocities it cannot
+    # represent -- is meaningless for lstm and was only ever noise there.
+    has_lattice = v_list is not None and len(v_list) > 1
 
-        This is what turns a coherently accumulated copy into a shape: inside the
-        figure the copy adds in register and keeps its variance, outside it
-        averages a drifting texture toward a smooth mean. Circular padding
-        because the canvas is a torus.
-        """
-        x = x[None, None]
-        pad = k // 2
-        mu = torch.nn.functional.avg_pool2d(
-            torch.nn.functional.pad(x, (pad,) * 4, mode="circular"), k, stride=1)
-        mu2 = torch.nn.functional.avg_pool2d(
-            torch.nn.functional.pad(x * x, (pad,) * 4, mode="circular"), k, stride=1)
-        return (mu2 - mu * mu).clamp(min=0)[0, 0]
+    if save_dir is not None:
+        from pathlib import Path as _Path
+        save_dir = _Path(save_dir)
+        save_dir.mkdir(parents=True, exist_ok=True)
 
     for i in range(n):
-        h = h_states[i].detach().cpu()                       # (T, V, H, W)
-        fr = frames[i].detach().cpu()                        # (T, C, H, W)
+        h = h_states[i].detach().cpu()
+        fr = frames[i].detach().cpu()
         mk = mask_track[i].detach().cpu() if mask_track is not None else None
 
         v_fig = v_bg = None
@@ -398,105 +398,123 @@ def log_motion_classification_states(
             v_fig = tuple(int(x) for x in g[-2, 0])
             v_bg = tuple(int(x) for x in g[-2, -1])
 
-        # ---- choose which copies to draw, and name them
         missing = []
-        if v_list is not None:                                # felstm lattice
+        if has_lattice:                                       # felstm
             index = {tuple(v): k for k, v in enumerate(v_list)}
             chosen, labels = [], []
-            for tag, vel in (("FIGURE", v_fig), ("bg", v_bg)):
+            for tag, vel in (("FIGURE", v_fig), ("background", v_bg)):
                 if vel in index and index[vel] not in chosen:
                     chosen.append(index[vel])
-                    labels.append(f"v={vel}\n<- {tag}")
+                    labels.append(f"$v$ = {vel}\n({tag})")
                 elif vel is not None:
-                    # Say so rather than quietly dropping the row. felstm's
-                    # lattice is sized to cover the FIGURE; the background moves
-                    # faster than any copy on purpose, since covering it would
-                    # need (2*5+1)^2 = 121 copies. A reader who does not know
-                    # that would just see a missing row and assume a plotting bug.
-                    missing.append(f"{tag} v={vel}")
-            for k in range(len(v_list)):                      # controls
+                    missing.append(f"{tag} {vel}")
+            for k in range(len(v_list)):
                 if len(chosen) >= max_slots:
                     break
                 if k not in chosen:
                     chosen.append(k)
-                    labels.append(f"v={tuple(v_list[k])}")
-        elif velocities is not None:                          # melstm slots
+                    labels.append(f"$v$ = {tuple(v_list[k])}")
+        elif velocities is not None:                          # melstm
             vl = velocities[i, -1].detach().cpu().round().long()
             chosen, labels = [], []
             for k in range(min(V, max_slots)):
                 vk = tuple(int(x) for x in vl[k])
-                tag = ("\n<- FIGURE" if vk == v_fig else
-                       ("\n<- bg" if vk == v_bg else ""))
+                # No velocity on the label: a melstm slot RE-ESTIMATES its velocity
+                # every step, so any single value is a snapshot of the last one and
+                # misrepresents the sequence. Which motion the slot followed is the
+                # informative part, and that is what the tag says.
+                tag = (" (FIGURE)" if vk == v_fig else
+                       (" (background)" if vk == v_bg else ""))
                 chosen.append(k)
-                labels.append(f"slot{k} v={vk}{tag}")
-        else:                                                 # lstm: nothing to pick
-            chosen, labels = [0], ["h\n(no transport)"]
+                labels.append(f"slot {k}{tag}")
+        else:                                                 # lstm
+            chosen, labels = [0], ["hidden state\n(no transport)"]
 
-        # The shape readout goes directly under the copy it is computed from, so
-        # "this copy accumulated the digit" can be read off without inferring it
-        # from a difference map.
-        # Whichever copy is the figure's, not necessarily the first one listed --
-        # melstm's slot order comes from the bootstrap, which puts the dominant
-        # background first.
+        def local_var(x, k=3):
+            """Local variance in a kxk window; circular, because the canvas is a torus."""
+            x = x[None, None]
+            pad = k // 2
+            mu = torch.nn.functional.avg_pool2d(
+                torch.nn.functional.pad(x, (pad,) * 4, mode="circular"), k, stride=1)
+            mu2 = torch.nn.functional.avg_pool2d(
+                torch.nn.functional.pad(x * x, (pad,) * 4, mode="circular"), k, stride=1)
+            return (mu2 - mu * mu).clamp(min=0)[0, 0]
+
         fig_row = next((r for r, lab in enumerate(labels) if "FIGURE" in lab), None)
         add_readout = show_shape_readout and fig_row is not None
-        rows = len(chosen) + int(add_readout) + 1 + (mk is not None)
 
+        rows = len(chosen) + int(add_readout) + 1 + (mk is not None)
+        readout_row = len(chosen)
+        frame_row = readout_row + int(add_readout)
+
+        fig_w = max(7, len(steps) * 0.92)
         fig, axes = plt.subplots(
             rows, len(steps),
-            figsize=(max(6, len(steps) * 1.05), max(2, rows * 1.15) + 0.5),
-            gridspec_kw={"wspace": 0.04, "hspace": 0.28},
+            figsize=(fig_w, rows * 1.02 + 0.85),
+            gridspec_kw={"wspace": 0.035, "hspace": 0.16},
             squeeze=False,
         )
 
-        readout_row = len(chosen)
-        frame_row = readout_row + int(add_readout)
+        # Reserve the left margin from the LONGEST label actually drawn. A fixed
+        # fraction clips "slot 0 (background)" in the wandb copy -- the saved PNG
+        # and PDF escape it only because bbox_inches="tight" crops afterwards.
+        all_labels = [ln for lab in labels for ln in lab.split("\n")]
+        all_labels += ["input frame", "figure mask", "(ground truth)"]
+        longest = max(len(x.replace("$", "")) for x in all_labels)
+        left_margin = min(0.30, (longest * 0.078 + 0.30) / fig_w)
+
         for col, t in enumerate(steps):
             for r, k in enumerate(chosen):
                 m = h[t, k]
                 lim = m.abs().max().clamp(min=1e-8).item()
-                axes[r, col].imshow(m, cmap="coolwarm", vmin=-lim, vmax=lim)
+                axes[r, col].imshow(m, cmap="coolwarm", vmin=-lim, vmax=lim,
+                                    interpolation="nearest")
             if add_readout:
-                lv = local_var(h[t, chosen[fig_row]])
-                axes[readout_row, col].imshow(lv, cmap="magma")
-            axes[frame_row, col].imshow(fr[t].mean(0), cmap="gray")
+                axes[readout_row, col].imshow(local_var(h[t, chosen[fig_row]]),
+                                              cmap="magma", interpolation="nearest")
+            axes[frame_row, col].imshow(fr[t].mean(0), cmap="gray",
+                                        interpolation="nearest")
             if mk is not None:
-                axes[rows - 1, col].imshow(mk[t].amax(0), cmap="gray", vmin=0, vmax=1)
-            axes[0, col].set_title(f"t={t}", fontsize=7)
+                axes[rows - 1, col].imshow(mk[t].amax(0), cmap="gray", vmin=0, vmax=1,
+                                           interpolation="nearest")
+            axes[0, col].set_title(f"$t$ = {t}", fontsize=11, pad=5)
             for r in range(rows):
-                axes[r, col].axis("off")
+                axes[r, col].set_xticks([]); axes[r, col].set_yticks([])
+                for sp in axes[r, col].spines.values():
+                    sp.set_linewidth(0.4); sp.set_color("0.75")
+
+        def ylabel(row, text, weight="normal"):
+            axes[row, 0].set_ylabel(text, fontsize=10, rotation=0, ha="right",
+                                    va="center", labelpad=10, fontweight=weight)
 
         for r, lab in enumerate(labels):
-            axes[r, 0].text(-0.45, 0.5, lab, rotation=90, va="center", ha="center",
-                            fontsize=6.5, transform=axes[r, 0].transAxes)
+            ylabel(r, lab, "bold" if "FIGURE" in lab else "normal")
         if add_readout:
-            axes[readout_row, 0].text(-0.45, 0.5, "local var\n(figure copy)", rotation=90,
-                                      va="center", ha="center", fontsize=6.5,
-                                      transform=axes[readout_row, 0].transAxes)
-        axes[frame_row, 0].text(-0.45, 0.5, "frame\n(input)", rotation=90,
-                                va="center", ha="center", fontsize=6.5,
-                                transform=axes[frame_row, 0].transAxes)
+            ylabel(readout_row, "local variance\n(figure copy)")
+        ylabel(frame_row, "input frame\n(ground truth)")
         if mk is not None:
-            axes[rows - 1, 0].text(-0.45, 0.5, "figure\n(GT mask)", rotation=90,
-                                   va="center", ha="center", fontsize=6.5,
-                                   transform=axes[rows - 1, 0].transAxes)
+            ylabel(rows - 1, "figure mask\n(ground truth)")
 
-        title = f"{split_name} — velocity copies, sample {i}"
-        if v_fig is not None:
-            title += f"   GT v_fig={v_fig}  v_bg={v_bg}"
+        # No ground-truth velocity in the title: the motion is piecewise-constant,
+        # so quoting a single v_fig / v_bg for the whole sequence is simply wrong.
+        # Where a velocity IS constant -- felstm's lattice copies -- it is shown on
+        # the row instead.
+        what = "hidden state over time" if not has_lattice and velocities is None \
+            else "hidden state per velocity copy"
+        title = f"{split_name} — {what}, sample {i}"
         if epoch is not None:
-            title += f"   epoch {epoch}"
+            title += f"   (epoch {epoch})"
         if missing:
-            title += f"\nnot on this model's velocity lattice: {', '.join(missing)}"
-        fig.suptitle(title, fontsize=9, y=0.995)
-        fig.subplots_adjust(top=0.88 if not missing else 0.85, bottom=0.02,
-                            left=0.045, right=0.995)
+            title += f"\nnot representable on this model's velocity lattice: {', '.join(missing)}"
+        fig.suptitle(title, fontsize=12, y=0.995)
+        fig.subplots_adjust(top=0.90 - 0.02 * (title.count(chr(10))),
+                            bottom=0.015, left=left_margin, right=0.995)
 
-        # No "/" in the key. A slash makes wandb file the panel under a grouped
-        # section, which an existing saved workspace layout often does not
-        # surface -- the images are logged but the user never finds them. This
-        # matches log_state_evolution's flat "{split}_states_sample{i}" naming,
-        # which is where these already appear for the prediction experiments.
+        if save_dir is not None:
+            stem = f"{split_name}_states_sample{i}" + (f"_ep{epoch}" if epoch is not None else "")
+            fig.savefig(save_dir / f"{stem}.png", dpi=dpi, bbox_inches="tight")
+            fig.savefig(save_dir / f"{stem}.pdf", bbox_inches="tight")
+
         payload[f"{split_name}_states_sample{i}"] = wandb.Image(fig)
         plt.close(fig)
 
