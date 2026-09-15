@@ -11,6 +11,13 @@
 # script, so a sweep needs no edits here:
 #   sbatch --job-name=cf_k6 submit_classification.sbatch melstm --num_vel_modes 6
 #
+# For a seed sweep, set SEED in the environment (sbatch exports it by default):
+#   for s in 0 1 2; do
+#     SEED=$s sbatch --job-name=cf_melstm_s$s submit_classification.sbatch melstm
+#   done
+# Each seed gets its own run name and checkpoint. --data_seed stays fixed at 42
+# inside run_classification.sh so every seed is scored on the same val set.
+#
 # NOTE: submit the SBATCH file, not run_classification.sh. The latter is a plain
 # shell script holding the hyperparameters and carries no #SBATCH directives, so
 # `sbatch run_classification.sh` fails with "No partition specified". This file
@@ -70,7 +77,8 @@ RESUBMIT_COUNT_FILE="${RUN_STATE_DIR}/.resubmit_count_${MODEL}"
 RESUBMIT_COUNT=$(cat "$RESUBMIT_COUNT_FILE" 2>/dev/null || echo 0)
 
 # Resume automatically if a previous attempt was cut off.
-CKPT="${RUN_STATE_DIR}/checkpoint_cf_cls_${MODEL}.pth"
+SEED=${SEED:-0}
+CKPT="${RUN_STATE_DIR}/checkpoint_cf_cls_${MODEL}_s${SEED}.pth"
 RESUME=""
 if [ -f "$CKPT" ]; then
   echo ">>> Resuming from $CKPT"

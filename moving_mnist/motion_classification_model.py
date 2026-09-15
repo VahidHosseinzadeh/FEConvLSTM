@@ -73,6 +73,11 @@ class VelocityPool(nn.Module):
                   up doing the work.
     """
 
+    @staticmethod
+    def output_channels(mode, n_velocities, hidden_channels):
+        """Channel count without building the module, so the head can be sized first."""
+        return hidden_channels * (n_velocities if mode == "concat" else 1)
+
     def __init__(self, mode, n_velocities, hidden_channels, score_hidden=32,
                  temperature=1.0):
         super().__init__()
@@ -81,7 +86,7 @@ class VelocityPool(nn.Module):
         self.mode = mode
         self.n_velocities = n_velocities
         self.temperature = temperature
-        self.out_channels = hidden_channels * (n_velocities if mode == "concat" else 1)
+        self.out_channels = self.output_channels(mode, n_velocities, hidden_channels)
 
         if mode == "attention":
             # Input is [spatial mean, spatial std] per feature channel.
@@ -234,12 +239,26 @@ class MotionDigitClassifier(nn.Module):
         self._frame_pair_pc = PhaseCorrelation(n_modes=max(1, self.n_velocities))
         self._pc1 = PhaseCorrelation(n_modes=1)
 
-        self.pool = VelocityPool(velocity_pool, self.n_velocities,
-                                 hidden_channels, temperature=pool_temperature)
+        # The head is built BEFORE the pool, and the pool last of all, so that
+        # changing --velocity_pool cannot shift anyone else's initialisation.
+        #
+        # 'attention' allocates a score MLP and the others do not, so building the
+        # pool first made it consume RNG and hand the head different weights. At
+        # V=1 that produced two visibly different lstm runs from what is
+        # mathematically the SAME model -- softmax over one element is constant
+        # 1.0, so max and attention compute the same thing and the score MLP gets
+        # exactly zero gradient. One run reached 0.60 val accuracy and another sat
+        # at chance purely on that initialisation difference. With this ordering
+        # the backbone and the head are bit-identical across pooling modes, and a
+        # seed sweep measures the pooling rather than the random stream.
+        head_in = VelocityPool.output_channels(
+            velocity_pool, self.n_velocities, hidden_channels)
         self.head = ConvClassifierHead(
-            self.pool.out_channels, n_classes=n_classes, channels=head_channels,
+            head_in, n_classes=n_classes, channels=head_channels,
             n_blocks=head_blocks, mlp_hidden=head_mlp_hidden, dropout=head_dropout,
             norm=head_norm)
+        self.pool = VelocityPool(velocity_pool, self.n_velocities,
+                                 hidden_channels, temperature=pool_temperature)
 
     # ------------------------------------------------------------------
     @staticmethod

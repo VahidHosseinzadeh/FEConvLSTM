@@ -209,8 +209,18 @@ def get_args(argv=None):
     p.add_argument('--lr_factor', type=float, default=0.5)
 
     # --- bookkeeping
-    p.add_argument('--data_seed', type=int, default=42)
-    p.add_argument('--model_seed', type=int, default=None)
+    p.add_argument('--data_seed', type=int, default=42,
+                   help='Governs the DATA and should be held FIXED across a seed sweep: '
+                        'the 54000/6000 train/val glyph split, the seeded val and test '
+                        'benchmarks, and which sequences the state images use. Changing it '
+                        'changes the benchmark itself, so runs with different data_seeds '
+                        'are not comparable to each other.')
+    p.add_argument('--model_seed', type=int, default=None,
+                   help='Governs the RUN and is what to vary across a seed sweep: weight '
+                        'initialisation and the order training data is visited. None = '
+                        'follow --data_seed. Vary this alone and every run is scored on '
+                        'the identical val set, so the spread you measure is run-to-run '
+                        'variance rather than a different benchmark each time.')
     p.add_argument('--run_name', type=str, default=None)
     p.add_argument('--save_dir', type=str, default='./experiments_classification/')
     p.add_argument('--resume', type=str, default=None)

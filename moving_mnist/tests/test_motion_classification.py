@@ -708,3 +708,47 @@ def test_state_pool_serves_both_the_pictures_and_the_metric():
     test_ds.reset_rng(); first = next(iter(state_loader))[0].clone()
     test_ds.reset_rng(); second = next(iter(state_loader))[0]
     assert torch.equal(first, second), "state sequences changed between passes"
+
+
+def test_pooling_choice_does_not_perturb_other_initialisation():
+    """
+    Regression: 'attention' allocates a score MLP and the other modes do not, so
+    building the pool BEFORE the head made it consume RNG and hand the head
+    different weights.
+
+    At V=1 that was pure noise in the experiment: softmax over one element is
+    constant 1.0, so max and attention compute exactly the same thing and the
+    score MLP receives zero gradient -- yet one lstm run reached 0.60 val accuracy
+    and another sat at chance, purely on that initialisation difference. The pool
+    is now built last, so a pooling sweep measures the pooling.
+    """
+    def build(pool, model, **kw):
+        torch.manual_seed(42)
+        return MotionDigitClassifier(model=model, hidden_channels=8,
+                                     velocity_pool=pool, **kw)
+
+    for model, kw in (("lstm", {}), ("melstm", dict(n_slots=2)), ("felstm", dict(v_range=1))):
+        a, b = build("attention", model, **kw), build("max", model, **kw)
+        assert all(torch.equal(p, q) for p, q in
+                   zip(a.backbone.parameters(), b.backbone.parameters())), \
+            f"{model}: pooling changed the backbone initialisation"
+        assert all(torch.equal(p, q) for p, q in
+                   zip(a.head.parameters(), b.head.parameters())), \
+            f"{model}: pooling changed the head initialisation"
+
+    # and at V=1 the two are the same function, so the forward pass must agree
+    x = torch.randn(3, 5, 1, 32, 32)
+    a, b = build("attention", "lstm"), build("max", "lstm")
+    a.eval(); b.eval()
+    with torch.no_grad():
+        assert torch.allclose(a(x), b(x), atol=1e-6), \
+            "at V=1 max and attention must compute the same thing"
+
+
+def test_attention_scores_are_inert_at_one_velocity():
+    """softmax over a single element is constant, so those parameters cannot learn."""
+    net = MotionDigitClassifier(model="lstm", hidden_channels=8, velocity_pool="attention")
+    net(torch.randn(2, 5, 1, 32, 32)).sum().backward()
+    grads = [float(p.grad.abs().sum()) for p in net.pool.parameters() if p.grad is not None]
+    assert grads and all(g == 0.0 for g in grads), \
+        f"attention scores got gradient at V=1: {grads}"

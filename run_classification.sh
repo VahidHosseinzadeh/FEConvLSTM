@@ -21,8 +21,24 @@
 #
 # Early stopping is OFF (--early_stop_patience 0): every model runs the full
 # EPOCHS so the three curves are directly comparable end to end.
+#
+# SEEDS. Two of them, and they do different jobs:
+#
+#   --data_seed  (fixed at 42 below) governs the DATA: the 54000/6000 train/val
+#                glyph split and the seeded val/test benchmarks. Hold it fixed,
+#                or each run is scored against a different benchmark and the
+#                numbers stop being comparable.
+#   SEED         governs the RUN: weight init and the order data is visited.
+#                This is the one to vary.
+#
+#   SEED=0 bash run_classification.sh melstm
+#   for s in 0 1 2; do SEED=$s sbatch --job-name=cf_melstm_s$s \
+#       submit_classification.sbatch melstm; done
+#
+# Each seed writes its own run name and checkpoint, so they do not collide.
 set -e
 MODEL=${1:?usage: bash run_classification.sh lstm|felstm|melstm}
+SEED=${SEED:-0}
 
 # ---- shared ---------------------------------------------------------------
 HIDDEN=32
@@ -47,10 +63,12 @@ TRAIN_SAMPLES=""   # empty = all 54000
 VAL_SAMPLES=""     # empty = all 6000
 CURVE_EVERY=25     # record the fixed-set val loss every N optimizer steps, for a
 CURVE_SIZE=256     # loss-vs-steps curve far finer than one point per epoch
-POOL=attention     # 'max' is the repo default elsewhere and is expected to fail
-                   # here: every velocity copy carries equal-amplitude noise, so
-                   # the informative one differs by spatial COHERENCE, not by
-                   # magnitude. Worth running once as a contrast.
+POOL=max           # MEASURED, not assumed. With attention, felstm sat at chance for
+                   # 50 epochs; with max it reaches 0.976, because attention AVERAGES
+                   # over 25 copies and dilutes the informative one ~25x while max
+                   # preserves it. melstm is ~0.99 either way. (I predicted the
+                   # opposite -- that max would fail on equal-amplitude noise -- and
+                   # the data disagreed.) 'attention' is still worth a contrast run.
 
 # ---- data -----------------------------------------------------------------
 DATA_V=2           # figure max speed. felstm needs V_RANGE >= this, and its cost
@@ -114,5 +132,6 @@ python moving_mnist/train_classification.py \
   --use_lr_scheduler --early_stop_patience 0 \
   --val_curve_interval $CURVE_EVERY --val_curve_size $CURVE_SIZE \
   --save_dir $SAVE_DIR \
-  --run_name "cf_cls_${MODEL}" \
+  --data_seed 42 --model_seed $SEED \
+  --run_name "cf_cls_${MODEL}_s${SEED}" \
   "${@:2}"
