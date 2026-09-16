@@ -578,7 +578,7 @@ class ValCurveRecorder:
     """
 
     def __init__(self, dataset, n_sequences, interval, device, batch_size=64,
-                 bn_loader=None, bn_batches=0):
+                 bn_dataset=None, bn_batches=0):
         n = min(n_sequences, len(dataset))
         if hasattr(dataset, "reset_rng"):
             dataset.reset_rng()
@@ -592,8 +592,25 @@ class ValCurveRecorder:
         self.interval = interval
         self.device = device
         self.batch_size = batch_size
-        self.bn_loader = bn_loader
-        self.bn_batches = bn_batches
+        # Training sequences for the precise-BN pass, MATERIALISED here rather than
+        # taken by iterating the live train_loader. Iterating it would be a bug, not
+        # a slow path: make_loaders sets persistent_workers=True whenever
+        # num_workers > 0, and for such a loader DataLoader.__iter__ RESETS the one
+        # shared iterator instead of returning a new one -- including the iterator
+        # the training loop is in the middle of. The epoch then never reaches
+        # StopIteration and never ends. (num_workers=0 makes a fresh iterator and
+        # hides this entirely, so it must not be the only configuration tested.)
+        # Fixed batches are also the better estimator here: identical statistics at
+        # every curve point means the curve moves because the model moved.
+        self._bn = []
+        if bn_batches > 0 and bn_dataset is not None:
+            want = min(bn_batches * batch_size, len(bn_dataset))
+            pick = torch.randperm(
+                len(bn_dataset), generator=torch.Generator().manual_seed(0)
+            )[:want].tolist()
+            xs = torch.stack([bn_dataset[i][0] for i in pick])
+            self._bn = [(xs[i:i + batch_size],)
+                        for i in range(0, len(xs), batch_size)]
         self.steps, self.val_loss, self.val_acc, self.train_loss = [], [], [], []
 
     def maybe_record(self, model, step, train_loss, criterion, log_fn=None):
@@ -611,13 +628,13 @@ class ValCurveRecorder:
         # observation -- recompute_bn_stats() replaces running_mean/var by design and
         # would otherwise reset the EMA mid-epoch as a side effect of looking.
         saved_bn = None
-        if self.bn_batches > 0 and self.bn_loader is not None:
+        if self._bn:
             bns = [m for m in model.modules()
                    if isinstance(m, nn.modules.batchnorm._BatchNorm)]
             if bns:
                 saved_bn = [(bn, {k: v.clone() for k, v in bn.state_dict().items()})
                             for bn in bns]
-                recompute_bn_stats(model, self.bn_loader, self.device, self.bn_batches)
+                recompute_bn_stats(model, self._bn, self.device, len(self._bn))
         model.eval()
         tot_loss = correct = n = 0
         with torch.no_grad():
@@ -812,7 +829,7 @@ def main(argv=None):
         # series differ only in size and cadence.
         curve = ValCurveRecorder(val_ds, args.val_curve_size,
                                  args.val_curve_interval, device, args.batch_size,
-                                 bn_loader=train_loader,
+                                 bn_dataset=train_loader.dataset,
                                  bn_batches=args.val_curve_bn_batches)
 
     if args.resume and Path(args.resume).exists():

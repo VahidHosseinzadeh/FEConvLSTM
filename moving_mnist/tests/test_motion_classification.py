@@ -834,11 +834,11 @@ def test_val_curve_uses_precise_bn_and_leaves_bn_untouched():
         bn.running_var.fill_(0.01)
     corrupt = [{k: v.clone() for k, v in bn.state_dict().items()} for bn in bns]
 
-    ema = ValCurveRecorder(DS(), 12, 1, "cpu", 4, bn_loader=None, bn_batches=0)
+    ema = ValCurveRecorder(DS(), 12, 1, "cpu", 4, bn_dataset=None, bn_batches=0)
     ema.maybe_record(model, 1, 0.0, crit)
 
     precise = ValCurveRecorder(DS(), 12, 1, "cpu", 4,
-                               bn_loader=batches, bn_batches=len(batches))
+                               bn_dataset=DS(), bn_batches=3)
     precise.maybe_record(model, 1, 0.0, crit)
 
     # the buffers are put back: looking at the curve must not alter the run
@@ -852,9 +852,59 @@ def test_val_curve_uses_precise_bn_and_leaves_bn_untouched():
         "precise BN made no difference -- the curve is still on the running EMA"
 
     # and the precise reading is exactly a manual recompute-then-evaluate
-    recompute_bn_stats(model, batches, "cpu", len(batches))
+    recompute_bn_stats(model, precise._bn, "cpu", len(precise._bn))
     model.eval()
     with torch.no_grad():
         ref = sum(crit(model(a), b).item() * b.numel() for a, b in batches) / len(seq)
     assert precise.val_loss[0] == pytest.approx(ref, rel=1e-5), \
         "curve is not measuring what the per-epoch val measures"
+
+
+def test_recording_the_curve_does_not_reset_the_training_iterator():
+    """
+    Regression, and the reason the curve materialises its own BatchNorm batches.
+
+    make_loaders sets persistent_workers=True whenever num_workers > 0 (default
+    4). For such a loader DataLoader.__iter__ does NOT return a new iterator --
+    it RESETS the single shared one. So a recorder that re-estimated BatchNorm by
+    iterating the live train_loader reset the iterator the training loop was in
+    the middle of, every --val_curve_interval steps, and the epoch never reached
+    StopIteration. Nothing after the epoch ever ran: no per-epoch val, no state
+    images, no diagnostics -- only the curve, which logs from inside the loop.
+
+    num_workers=0 builds a fresh iterator each time and cannot show this, so the
+    worker path is the one that has to be tested.
+    """
+    import torch.nn as nn
+    from torch.utils.data import DataLoader, TensorDataset
+    from train_classification import ValCurveRecorder
+
+    model, _ = _curve_probe_model()
+    seq = torch.randn(8, 6, 1, 28, 28)
+    lab = torch.randint(0, 10, (8,))
+
+    class DS:
+        def __len__(self): return len(seq)
+        def __getitem__(self, i): return seq[i], int(lab[i])
+
+    rec = ValCurveRecorder(DS(), 8, 2, "cpu", 4, bn_dataset=DS(), bn_batches=2)
+    assert rec._bn and all(isinstance(b[0], torch.Tensor) for b in rec._bn), \
+        "the BN batches must be materialised tensors, not a live loader"
+
+    train = DataLoader(TensorDataset(torch.arange(40).float().unsqueeze(1)),
+                       batch_size=4, shuffle=True,
+                       num_workers=1, persistent_workers=True)
+    crit = nn.CrossEntropyLoss()
+    n_batches, step = 0, 0
+    try:
+        for _ in train:                      # stands in for the training loop
+            n_batches += 1
+            step += 1
+            rec.maybe_record(model, step, 0.0, crit)
+            if n_batches > 40:               # 10 expected; bail rather than hang
+                break
+    finally:
+        del train
+    assert n_batches == 10, (
+        f"training loop ran {n_batches} batches over a 10-batch epoch -- the "
+        f"recorder reset the training iterator, so the epoch never ends")
