@@ -204,6 +204,14 @@ def get_args(argv=None):
                         'materialised into a tensor once: this dataset resamples content on '
                         'every access, so holding indices fixed is not enough to keep the '
                         'measured set fixed.')
+    p.add_argument('--val_curve_bn_batches', type=int, default=8,
+                   help='Batches used to re-estimate BatchNorm before each point of that '
+                        'curve (0 = off, use the running EMA). Without this the curve is '
+                        'measured under a different BatchNorm regime than the per-epoch '
+                        'val_acc and swings between chance and the true accuracy while the '
+                        'model improves smoothly -- see --precise_bn_batches. Smaller than '
+                        'that default because it runs every --val_curve_interval steps: 8 '
+                        'batches is already ~500 sequences of statistics per channel.')
     p.add_argument('--use_lr_scheduler', action='store_true')
     p.add_argument('--lr_patience', type=int, default=4)
     p.add_argument('--lr_factor', type=float, default=0.5)
@@ -557,6 +565,9 @@ class ValCurveRecorder:
     mostly resampling noise. (Same reason the state images use the fixed
     benchmark split.)
 
+    Measured under precise BatchNorm (see `bn_batches`), like the per-epoch val --
+    the two series are meant to be read against each other.
+
     Points are logged LIVE, through `log_fn`, so the curve is watchable while a
     50-epoch run is still going rather than appearing only at the end. That is
     possible because this script's wandb step axis is the OPTIMIZER STEP, not the
@@ -566,7 +577,8 @@ class ValCurveRecorder:
     whichever is behind.)
     """
 
-    def __init__(self, dataset, n_sequences, interval, device, batch_size=64):
+    def __init__(self, dataset, n_sequences, interval, device, batch_size=64,
+                 bn_loader=None, bn_batches=0):
         n = min(n_sequences, len(dataset))
         if hasattr(dataset, "reset_rng"):
             dataset.reset_rng()
@@ -580,12 +592,32 @@ class ValCurveRecorder:
         self.interval = interval
         self.device = device
         self.batch_size = batch_size
+        self.bn_loader = bn_loader
+        self.bn_batches = bn_batches
         self.steps, self.val_loss, self.val_acc, self.train_loss = [], [], [], []
 
     def maybe_record(self, model, step, train_loss, criterion, log_fn=None):
         if self.interval <= 0 or step % self.interval:
             return
         was_training = model.training
+        # Measure under the SAME BatchNorm regime as the per-epoch val, or the two
+        # series are not comparable and this one is not interpretable. Straight
+        # model.eval() uses the running EMA, which on this model lags the weights so
+        # badly that the reading swings between chance and the true accuracy between
+        # adjacent points while the model is in fact improving monotonically.
+        # Measured on 64 overfit sequences, identical weights, felstm/max at step 40:
+        # batch-stats 1.000, precise 1.000, EMA 0.062.
+        # The BN buffers are snapshotted and put back, so this stays a pure
+        # observation -- recompute_bn_stats() replaces running_mean/var by design and
+        # would otherwise reset the EMA mid-epoch as a side effect of looking.
+        saved_bn = None
+        if self.bn_batches > 0 and self.bn_loader is not None:
+            bns = [m for m in model.modules()
+                   if isinstance(m, nn.modules.batchnorm._BatchNorm)]
+            if bns:
+                saved_bn = [(bn, {k: v.clone() for k, v in bn.state_dict().items()})
+                            for bn in bns]
+                recompute_bn_stats(model, self.bn_loader, self.device, self.bn_batches)
         model.eval()
         tot_loss = correct = n = 0
         with torch.no_grad():
@@ -596,6 +628,9 @@ class ValCurveRecorder:
                 tot_loss += criterion(logits, y).item() * y.numel()
                 correct += (logits.argmax(1) == y).sum().item()
                 n += y.numel()
+        if saved_bn is not None:
+            for bn, state in saved_bn:
+                bn.load_state_dict(state)
         model.train(was_training)
         vl, vacc = tot_loss / max(n, 1), correct / max(n, 1)
         self.steps.append(step)
@@ -770,8 +805,15 @@ def main(argv=None):
     curve = None
     if args.val_curve_interval > 0:
         print(f"materialising {args.val_curve_size} fixed val sequences for the loss curve...")
-        curve = ValCurveRecorder(test_ds, args.val_curve_size,
-                                 args.val_curve_interval, device, args.batch_size)
+        # val_ds, not test_ds: these points are logged as curve/val_* and are watched
+        # live during a run, so a human reading them to judge progress is selecting on
+        # whatever they measure. val is just as fixed a benchmark (random=False,
+        # seed=777) and is the population the per-epoch number reports, so the two
+        # series differ only in size and cadence.
+        curve = ValCurveRecorder(val_ds, args.val_curve_size,
+                                 args.val_curve_interval, device, args.batch_size,
+                                 bn_loader=train_loader,
+                                 bn_batches=args.val_curve_bn_batches)
 
     if args.resume and Path(args.resume).exists():
         ck = torch.load(args.resume, map_location=device)

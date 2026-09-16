@@ -786,3 +786,75 @@ def test_mask_contour_is_not_vertically_mirrored():
     assert contour_mid_y() > H / 2, \
         "origin=None should mirror it -- if this stops being true, matplotlib " \
         "changed and the explicit origin may no longer be needed"
+
+
+def _curve_probe_model():
+    import torch.nn as nn
+    from motion_classification_model import build_classifier
+    torch.manual_seed(0)
+    m = build_classifier(dict(model="melstm", hidden_size=8, num_vel_modes=2,
+                              velocity_source="frame_pair", velocity_pool="max",
+                              head_norm="batch", n_classes=10, head_channels=16,
+                              head_mlp_hidden=32))
+    bns = [x for x in m.modules() if isinstance(x, nn.modules.batchnorm._BatchNorm)]
+    assert bns, "probe needs a BatchNorm to be meaningful"
+    return m, bns
+
+
+def test_val_curve_uses_precise_bn_and_leaves_bn_untouched():
+    """
+    The fine-grained curve must be measured under the SAME BatchNorm regime as the
+    per-epoch val_acc. Recorded off the running EMA instead, it swings between
+    chance and the true accuracy while the model improves monotonically -- which
+    is not a property of the model, only of which statistics were used.
+
+    Driven by CORRUPTING the running stats: precise BN must ignore them (and
+    reproduce a manual recompute), the EMA path must be affected by them, and
+    either way the buffers must come back exactly as they were, so that reading
+    the curve cannot perturb the run.
+    """
+    import torch.nn as nn
+    from train_classification import ValCurveRecorder
+    from motion_classification_model import recompute_bn_stats
+
+    model, bns = _curve_probe_model()
+    seq = torch.randn(12, 6, 1, 28, 28)
+    lab = torch.randint(0, 10, (12,))
+
+    class DS:
+        def __len__(self): return len(seq)
+        def __getitem__(self, i): return seq[i], int(lab[i])
+
+    batches = [(seq[i:i + 4], lab[i:i + 4]) for i in range(0, len(seq), 4)]
+    crit = nn.CrossEntropyLoss()
+
+    # statistics the model was never trained under
+    for bn in bns:
+        bn.running_mean.fill_(37.0)
+        bn.running_var.fill_(0.01)
+    corrupt = [{k: v.clone() for k, v in bn.state_dict().items()} for bn in bns]
+
+    ema = ValCurveRecorder(DS(), 12, 1, "cpu", 4, bn_loader=None, bn_batches=0)
+    ema.maybe_record(model, 1, 0.0, crit)
+
+    precise = ValCurveRecorder(DS(), 12, 1, "cpu", 4,
+                               bn_loader=batches, bn_batches=len(batches))
+    precise.maybe_record(model, 1, 0.0, crit)
+
+    # the buffers are put back: looking at the curve must not alter the run
+    for bn, want in zip(bns, corrupt):
+        got = bn.state_dict()
+        for k, v in want.items():
+            assert torch.equal(got[k], v), f"maybe_record left {k} modified"
+
+    # the EMA reading is the one the corrupted statistics reach
+    assert ema.val_loss[0] != precise.val_loss[0], \
+        "precise BN made no difference -- the curve is still on the running EMA"
+
+    # and the precise reading is exactly a manual recompute-then-evaluate
+    recompute_bn_stats(model, batches, "cpu", len(batches))
+    model.eval()
+    with torch.no_grad():
+        ref = sum(crit(model(a), b).item() * b.numel() for a, b in batches) / len(seq)
+    assert precise.val_loss[0] == pytest.approx(ref, rel=1e-5), \
+        "curve is not measuring what the per-epoch val measures"

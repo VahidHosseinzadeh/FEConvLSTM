@@ -94,6 +94,32 @@ inherits its whole motion vocabulary (`constant` / `piecewise` / `stochastic` /
 | `--max_train_samples` | 50000 | **not a dataset size** — see below |
 | `--val_curve_interval` | 25 | fixed-set val loss every N optimizer steps |
 | `--val_curve_size` | 256 | how many fixed sequences behind that curve |
+| `--val_curve_bn_batches` | 8 | batches used to re-estimate BatchNorm before each of those points |
+
+### Why `curve/val_*` and `val_*` must share a BatchNorm regime
+
+`val_*` is recorded once per epoch on all 6000 val sequences, **after**
+`recompute_bn_stats`. `curve/val_*` is recorded every 25 optimizer steps on 256
+fixed sequences. If the curve is taken straight off `model.eval()` it uses
+BatchNorm's running EMA instead, and the two series stop being comparable: the
+per-epoch number climbs smoothly while the curve swings between chance and the
+true accuracy, for the same weights.
+
+That is a property of the statistics, not of the model. Measured on 64 overfit
+sequences with identical weights (`felstm`, max pooling, step 40):
+
+| | batch stats | precise BN | running EMA |
+|---|---|---|---|
+| accuracy | 1.000 | 1.000 | **0.062** |
+
+The EMA lags worst where the head's input distribution moves most, which is
+`felstm` with max pooling — the max runs over 25 velocity copies, so which copy
+wins shifts as the lattice trains and the head's input is an extreme-value
+statistic with no reason to sit still. `melstm` (2 slots) settles much sooner.
+
+So the curve gets the same treatment, with fewer batches because it runs ~50x
+more often. It also measures **val**, not test: it is logged live and watched
+during a run, so whatever it reports is something a human selects on.
 
 ### The splits are disjoint at the GLYPH level
 
