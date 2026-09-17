@@ -116,7 +116,7 @@ BATCH=64
 # within a 20GB MPS budget. felstm is a cluster-only run -- use
 # submit_classification.sbatch.
 
-SAVE_DIR=./experiments_classification
+SAVE_DIR=${SAVE_DIR:-./experiments_classification}
 
 python moving_mnist/train_classification.py \
   --model "$MODEL" \

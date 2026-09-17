@@ -11,6 +11,11 @@
 # script, so a sweep needs no edits here:
 #   sbatch --job-name=cf_k6 submit_classification.sbatch melstm --num_vel_modes 6
 #
+# Sweeping a SETTING rather than a seed: give each arm a TAG, or the arms share
+# one checkpoint and the second job resumes the first one's weights.
+#   TAG=head8 sbatch --job-name=cf_melstm_head8 submit_classification.sbatch \
+#       melstm --head_channels 8 --head_blocks 3 --head_mlp_hidden 16
+#
 # For a seed sweep, set SEED in the environment (sbatch exports it by default):
 #   for s in 0 1 2; do
 #     SEED=$s sbatch --job-name=cf_melstm_s$s submit_classification.sbatch melstm
@@ -66,19 +71,29 @@
 MODEL=${1:?usage: sbatch submit_classification.sbatch lstm|felstm|melstm}
 shift
 
-SAVE_DIR=./experiments_classification   # must match run_classification.sh's SAVE_DIR
+SAVE_DIR=${SAVE_DIR:-./experiments_classification}   # run_classification.sh reads the same var
 RUN_STATE_DIR="${SAVE_DIR}/run_state"
+
+# TAG namespaces an ARM of a sweep. Everything this script remembers between
+# submissions -- the checkpoint it auto-resumes, the DONE flag, the resubmit
+# counter -- and the run name itself are keyed on it. Without that, two arms of
+# a sweep share one checkpoint: the second job resumes the first one's weights,
+# which for a different --head_channels is a shape mismatch and for a same-shape
+# change is silent contamination. Set one per config:
+#   TAG=head8 sbatch ... submit_classification.sbatch melstm --head_channels 8
+TAG=${TAG:-}
+RUN_NAME="cf_cls_${MODEL}_s${SEED:-0}${TAG:+_$TAG}"
 
 TIME_LIMIT_SEC=$((24 * 3600))
 NEAR_LIMIT_SEC=$((TIME_LIMIT_SEC - 15 * 60))   # within 15 min of the wall = plausible timeout
 MAX_RESUBMITS=8                                # hard backstop regardless of the heuristic above
 
-RESUBMIT_COUNT_FILE="${RUN_STATE_DIR}/.resubmit_count_${MODEL}"
+RESUBMIT_COUNT_FILE="${RUN_STATE_DIR}/.resubmit_count_${RUN_NAME}"
 RESUBMIT_COUNT=$(cat "$RESUBMIT_COUNT_FILE" 2>/dev/null || echo 0)
 
 # Resume automatically if a previous attempt was cut off.
 SEED=${SEED:-0}
-CKPT="${RUN_STATE_DIR}/checkpoint_cf_cls_${MODEL}_s${SEED}.pth"
+CKPT="${RUN_STATE_DIR}/checkpoint_${RUN_NAME}.pth"
 RESUME=""
 if [ -f "$CKPT" ]; then
   echo ">>> Resuming from $CKPT"
@@ -86,11 +101,11 @@ if [ -f "$CKPT" ]; then
 fi
 
 START_TS=$(date +%s)
-bash run_classification.sh "$MODEL" --use_wandb $RESUME "$@"
+bash run_classification.sh "$MODEL" --use_wandb --run_name "$RUN_NAME" $RESUME "$@"
 ELAPSED=$(( $(date +%s) - START_TS ))
 
-if ls ${RUN_STATE_DIR}/DONE_${MODEL}_*.flag >/dev/null 2>&1; then
-  echo ">>> Training complete for $MODEL — not resubmitting."
+if [ -f "${RUN_STATE_DIR}/DONE_${MODEL}_${RUN_NAME}.flag" ]; then
+  echo ">>> Training complete for $RUN_NAME — not resubmitting."
   rm -f "$RESUBMIT_COUNT_FILE"
 
 elif [ "$ELAPSED" -ge "$NEAR_LIMIT_SEC" ] && [ "$RESUBMIT_COUNT" -lt "$MAX_RESUBMITS" ]; then
