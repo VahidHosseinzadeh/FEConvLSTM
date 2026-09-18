@@ -43,6 +43,7 @@ Usage
 """
 import argparse
 import json
+import math
 import warnings
 import os
 import random
@@ -191,7 +192,28 @@ def get_args(argv=None):
     p.add_argument('--val_size', type=int, default=None,
                    help='Cap on validation glyphs per epoch (None = all 6000). The val '
                         'set is fixed, so this trades statistical precision for epoch time.')
-    p.add_argument('--test_size', type=int, default=2000)
+    p.add_argument('--test_size', type=int, default=None,
+                   help='Cap on test glyphs (None = all 10000, MNIST\'s entire test '
+                        'split). With --val_fraction 0.1 the three pools are then '
+                        '54000/6000/10000, i.e. MNIST\'s own split, re-rendered under '
+                        'motion. Only the reported test number is affected; lowering '
+                        'this trades statistical precision for time.')
+    p.add_argument('--test_every', type=int, default=1,
+                   help='Also evaluate the TEST set every N epochs, so wandb gets a '
+                        'test_acc/test_loss curve rather than one final point (0 = off). '
+                        'Model selection still reads val only -- the checkpoint, the '
+                        'scheduler and early stopping never see this number, and the '
+                        'reported test_acc is still the best-val checkpoint measured '
+                        'once at the end. Treat the curve as a diagnostic: a human '
+                        'watching it and stopping a run on it is selecting on test.')
+    p.add_argument('--test_curve_size', type=int, default=2000,
+                   help='How many test sequences each per-epoch curve point uses '
+                        '(0 = all of them). The FINAL number always uses the full '
+                        '--test_size; this only caps the diagnostic curve, which at '
+                        '10000 sequences would otherwise add ~19%% to every epoch for '
+                        'a standard error already below 0.2%%. The subset is the '
+                        'loader\'s first N sequences, so it is the same set every '
+                        'epoch rather than a fresh sample.')
     p.add_argument('--early_stop_patience', type=int, default=0,
                    help='Stop once the selection metric (val accuracy) has not improved for '
                         'this many consecutive epochs. 0 = DISABLED, always run the full '
@@ -327,8 +349,11 @@ def make_loaders(args, train_ds, val_ds, test_ds):
         tr = Subset(tr, list(range(2 * args.batch_size)))
         va = Subset(va, list(range(args.batch_size)))
 
-    n_test = min(args.test_size, len(test_ds))
-    te = Subset(test_ds, list(range(args.batch_size if args.smoke_test else n_test)))
+    te = test_ds
+    if args.test_size and args.test_size < len(te):
+        te = Subset(te, list(range(args.test_size)))
+    if args.smoke_test:
+        te = Subset(test_ds, list(range(args.batch_size)))
 
     # Sequences for the state visualisation come from the FIXED benchmark set,
     # not from val. val is split off a random=True dataset, so every access
@@ -791,8 +816,13 @@ def main(argv=None):
                else f"|v| in [{args.bg_speed_min}, {args.bg_speed_max}] (disjoint grid)")
     print(f"data         : figure |v|<={args.data_v_range} ({args.motion_mode}), "
           f"background {bg_desc}, corr_len={args.corr_len}, T={args.seq_len}")
+    test_curve_batches = (math.ceil(args.test_curve_size / args.batch_size)
+                          if args.test_curve_size else None)
     print(f"batches      : train {len(train_loader)}, val {len(val_loader)}, "
           f"test {len(test_loader)}  (chance accuracy = 10%)")
+    print(f"glyphs       : train {len(train_loader.dataset)}, "
+          f"val {len(val_loader.dataset)}, test {len(test_loader.dataset)} "
+          f"(disjoint pools; test is MNIST's own split)")
 
     optimizer = torch.optim.Adam(model.trainable_parameters(), lr=args.lr,
                                  weight_decay=args.weight_decay)
@@ -856,12 +886,26 @@ def main(argv=None):
         if scheduler:
             scheduler.step(va["acc"])
 
+        # Test curve. Runs on the same weights and the same freshly recomputed
+        # BatchNorm statistics as the val pass above -- nothing updates the model
+        # between the two -- so the two curves are measured under one protocol and
+        # differ only in which disjoint glyph pool they draw from. Capped at
+        # test_curve_batches; the full test set is measured once at the end.
+        te_row = {}
+        if args.test_every and epoch % args.test_every == 0:
+            test_ds.reset_rng()     # fixed benchmark, same sequences every epoch
+            te_epoch = run_epoch(model, test_loader, device, args.num_figures, criterion,
+                                 max_batches=test_curve_batches)
+            te_epoch.pop("_global_step", None)
+            te_row = {f"test_{k}": v for k, v in te_epoch.items()}
+
         global_step = tr.pop("_global_step", global_step)
         va.pop("_global_step", None)
         row = {"epoch": epoch, "time": time.time() - t0,
                "lr": optimizer.param_groups[0]["lr"],
                **{f"train_{k}": v for k, v in tr.items()},
-               **{f"val_{k}": v for k, v in va.items()}}
+               **{f"val_{k}": v for k, v in va.items()},
+               **te_row}
 
         # Before the print and the log, so the shape IoU appears in both.
         if wandb and args.log_states_every and epoch % args.log_states_every == 0:
@@ -875,8 +919,10 @@ def main(argv=None):
         if "val_state_shape_iou" in row:
             extra += (f"  shape_iou={row['val_state_shape_iou']:.3f}"
                       f"(chance {row['val_state_shape_iou_chance']:.3f})")
+        te_desc = (f" | test loss {te_row['test_loss']:.4f} acc {te_row['test_acc']:.3f}"
+                   if "test_acc" in te_row else "")
         print(f"epoch {epoch:3d} | train loss {tr['loss']:.4f} acc {tr['acc']:.3f} "
-              f"| val loss {va['loss']:.4f} acc {va['acc']:.3f}{extra} "
+              f"| val loss {va['loss']:.4f} acc {va['acc']:.3f}{extra}{te_desc} "
               f"| {row['time']:.0f}s")
 
         if wandb:
@@ -945,6 +991,12 @@ def main(argv=None):
                 wandb.summary[f"test_acc_digit{d}"] = c / max(n, 1)
         # Final numbers go in the summary, not the history: a step-less wandb.log
         # here would advance the counter past the last epoch for no benefit.
+        #
+        # This assignment lands AFTER every wandb.log above, so it overwrites the
+        # value wandb mirrors into the summary from the per-epoch test curve. The
+        # two are different quantities and the summary holds the one to quote: the
+        # BEST-VAL CHECKPOINT's test accuracy, not the last epoch's.
+        # report_test_accuracy.py reads exactly this key.
         wandb.summary["test_acc"] = te["acc"]
         wandb.summary["test_loss"] = te["loss"]
         wandb.summary["best_val_acc"] = best_val

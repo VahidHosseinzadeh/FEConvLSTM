@@ -61,6 +61,8 @@ IMAGE=36           # a 28px digit still has room to travel on the torus, and fel
 # not just the wall-clock per epoch.
 TRAIN_SAMPLES=""   # empty = all 54000
 VAL_SAMPLES=""     # empty = all 6000
+TEST_SAMPLES=""    # empty = all 10000 -- MNIST's test split entire, so the reported
+                   # test number is on the standard benchmark size
 CURVE_EVERY=25     # record the fixed-set val loss every N optimizer steps, for a
 CURVE_SIZE=256     # loss-vs-steps curve far finer than one point per epoch
 POOL=max           # MEASURED, not assumed. With attention, felstm sat at chance for
@@ -129,6 +131,7 @@ python moving_mnist/train_classification.py \
   --batch_size $BATCH --epochs $EPOCHS --lr $LR \
   ${TRAIN_SAMPLES:+--max_train_samples $TRAIN_SAMPLES} \
   ${VAL_SAMPLES:+--val_size $VAL_SAMPLES} \
+  ${TEST_SAMPLES:+--test_size $TEST_SAMPLES} \
   --use_lr_scheduler --early_stop_patience 0 \
   --val_curve_interval $CURVE_EVERY --val_curve_size $CURVE_SIZE \
   --save_dir $SAVE_DIR \
