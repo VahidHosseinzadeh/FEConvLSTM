@@ -264,12 +264,31 @@ def main():
               f"trained motion={cfg['motion_mode']} {cfg['min_segment']}-{cfg['max_segment']} "
               f"{cfg['transition_mode']}")
 
+    # Every cell is generated ONCE from ref_cfg and shown to all three models, which is
+    # only legitimate if they were trained on the same data. A --run_filter that picks,
+    # say, a seq_len=10 lstm beside a seq_len=15 felstm would otherwise be evaluated
+    # silently on the wrong sequences.
+    for key in ("seq_len", "image_size", "num_figures", "variant", "corr_len",
+                "digit_scale", "normalize", "data_v_range", "bg_mode", "motion_mode",
+                "transition_mode", "min_segment", "max_segment"):
+        seen = {m: cfg[key] for m, (cfg, _, _) in runs.items()}
+        if len(set(map(str, seen.values()))) > 1:
+            raise SystemExit(
+                f"the selected runs disagree on {key!r}: {seen}\n"
+                f"they were not trained on the same data, so one sweep cannot compare "
+                f"them. Narrow --run_filter to one matched set of arms.")
+
     todo = cells()[:args.limit_cells] if args.limit_cells else cells()
     out = {"regime": [], "axis": [], "level": [], "rate": [], "jump": [], "travel": [], "u": []}
     correct = {m: [] for m in args.models}
     M = None
 
-    dest = args.out or os.path.join(args.save_dir, "motion_sweep_classification.npz")
+    # The filter goes in the filename: sweeping several arms out of one save_dir
+    # (s1/s2/s3, head16 vs head32) would otherwise have each run overwrite the last.
+    stem = "motion_sweep_classification"
+    if args.run_filter:
+        stem += "_" + slug(args.run_filter)
+    dest = args.out or os.path.join(args.save_dir, stem + ".npz")
     for i, (regime, axis, level, kw) in enumerate(todo):
         t0 = time.time()
         ds = make_dataset(ref_cfg, kw, args.data_seed, args.train_split, args.download)
