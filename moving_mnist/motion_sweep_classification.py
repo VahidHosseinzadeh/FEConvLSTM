@@ -426,6 +426,12 @@ def main():
         "mps" if torch.backends.mps.is_available() else "cpu")
     if dev.type == "mps":
         enable_integer_shift_warp(device="mps")
+    # Printed loudly: on CPU felstm's 25 transported copies make this hundreds of times
+    # slower, which looks like a hang rather than a slow run. If this says "cpu" on a
+    # cluster you are on the login node -- submit with sbatch instead.
+    print(f"device       : {dev}"
+          + ("   <-- NO GPU FOUND; felstm will be impractically slow"
+             if dev.type == "cpu" else ""), flush=True)
 
     runs = find_runs(args.save_dir, args.models, args.run_filter)
     nets = {m: load_model(cfg, ck, dev) for m, (cfg, ck, _) in runs.items()}
@@ -509,10 +515,19 @@ def main():
 
     for i, (regime, axis, level, kw) in enumerate(todo):
         t0 = time.time()
+        # Announced BEFORE the work, not after: a cell at 5000 sequences takes minutes
+        # (materialising alone is ~40s) and the result line only lands at the end, which
+        # makes a healthy run look hung.
+        print(f"[{i + 1:2d}/{len(todo)}] {regime:18s} generating {args.n_sequences} "
+              f"sequences ...", end="", flush=True)
         ds = make_dataset(ref_cfg, kw, args.data_seed, args.train_split, args.download)
         seqs, labels, motion = materialise(ds, args.n_sequences)
-        if M is None:                      # an image statistic: one regime's frames suffice
-            M = shift_msd(seqs[:200, :, 0].numpy())
+        print(f" {time.time() - t0:.0f}s, evaluating ...", end="", flush=True)
+        if M is None:
+            # An image statistic. Flattened to (N, H, W) first: shift_msd rolls axes
+            # (1, 2), so handing it (N, T, H, W) would roll along TIME, not height.
+            f = seqs[:200, :, 0].numpy()
+            M = shift_msd(f.reshape(-1, *f.shape[-2:]))
         rate, jump, travel = motion_stats(motion)
         out["regime"].append(regime); out["axis"].append(axis); out["level"].append(level)
         out["rate"].append(rate); out["jump"].append(jump); out["travel"].append(travel)
@@ -540,7 +555,7 @@ def main():
                 for m in args.models))
         write_npz(dest, out, correct, args.models, args.n_sequences, diag,
                   ref_cfg["seq_len"], ref_cfg["data_v_range"])
-        print(f"[{i + 1:2d}/{len(todo)}] {regime:18s} rate={rate:.3f} jump={jump:.2f} "
+        print(f"\r[{i + 1:2d}/{len(todo)}] {regime:18s} rate={rate:.3f} jump={jump:.2f} "
               f"u={out['u'][-1]:.3f} travel={travel:4.1f}px | " + "  ".join(accs)
               + f"  ({time.time() - t0:.0f}s)", flush=True)
 

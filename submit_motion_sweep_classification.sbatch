@@ -9,6 +9,11 @@
 #   sbatch --job-name=cls_sweep submit_motion_sweep_classification.sbatch 5000
 #   RUN_FILTER=s1_stress_test sbatch --job-name=cls_sweep submit_motion_sweep_classification.sbatch
 #
+# Recovering a few cells without repeating the sweep (ONLY merges into the existing
+# .npz and leaves every other cell alone; --n_sequences must match that file):
+#   RUN_FILTER=s1_head16 ONLY="E:v=3 E:v=4 E:v=5" \
+#       sbatch --job-name=cls_fix submit_motion_sweep_classification.sbatch 5000
+#
 # Arguments are  [N_SEQ] [SAVE_DIR] [BATCH]  -- pick ONE line, they are not a
 # sequence to run in order.
 #
@@ -86,6 +91,9 @@ DIAG=${DIAG:-1}                           # state diagnostics (slot hit, shape I
 GEN=${GEN:-1}                             # context-length and speed generalization
 DIAG_SEQ=${DIAG_SEQ:-256}                 # diagnostics need far fewer sequences
 DIAG_BATCH=${DIAG_BATCH:-32}              # the state tensor is (B, T, V, H, W)
+ONLY=${ONLY:-}                            # recompute ONLY these cells and merge them
+                                          # into the existing .npz, e.g.
+                                          #   ONLY="E:v=3 E:v=4 E:v=5"
 
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
@@ -102,6 +110,13 @@ if [ "$DIAG" != "0" ]; then
 fi
 if [ "$GEN" != "0" ]; then
   CMD+=(--generalization)
+fi
+
+if [ -n "$ONLY" ]; then
+  # shellcheck disable=SC2206
+  ONLY_ARR=($ONLY)
+  CMD+=(--only "${ONLY_ARR[@]}")
+  echo "recomputing only: $ONLY"
 fi
 
 if [ -n "$RUN_FILTER" ]; then
