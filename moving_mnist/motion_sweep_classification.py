@@ -61,7 +61,6 @@ from motion_factors_sweep import (D_GRID, S_GRID, TRAIN_D, TRAIN_S, TRAIN_N,  # 
 # felstm carries (2R+1)^2 = 25 copies of the state, so it needs a smaller batch than
 # the other two; 250 of them overruns a 20GB MPS budget outright.
 BATCH = {"lstm": 250, "melstm": 250, "felstm": 50}
-U_SHIFT_R = 4        # m(d) is needed for d in [-4, 4]^2, since velocities are +-2
 
 
 # ------------------------------------------------------------------- the cells
@@ -94,6 +93,13 @@ def cells():
 # measures it, and regenerating it would be a bit-identical duplicate.
 LEN_GRID = (5, 8, 10,12,14,16,18, 20, 25, 30)          # trained at 15
 SPEED_GRID = (1, 3, 4,5)                     # trained at 2
+
+# m(d) is indexed by the velocity CHANGE dv = v_t - v_{t-1}, so the table must cover
+# TWICE the largest speed in the sweep, not the speed itself. It was a hard-coded 4 --
+# sized back when "velocities are +-2" -- which is why the E:v=3 and E:v=4 cells died
+# with an out-of-bounds index. Derived from SPEED_GRID so widening that grid cannot
+# reintroduce the crash.
+U_SHIFT_R = 2 * max(SPEED_GRID + (TRAIN_N,))
 
 
 def train_motion_kwargs(cfg):
@@ -346,8 +352,12 @@ def u_of(motion, M, r=U_SHIFT_R):
     """
     v = np.asarray(motion, np.int64)
     dv = v[:, 1:] - v[:, :-1]
-    A = float(M[dv[..., 0] + r, dv[..., 1] + r].mean())
-    B = float(M[v[..., 0] + r, v[..., 1] + r].mean())
+    lo, hi = -r, r
+    if dv.min() < lo or dv.max() > hi or v.min() < lo or v.max() > hi:
+        warnings.warn(f"u_of: velocities/changes exceed the m(d) table (|d|<={r}); "
+                      f"clipping. Raise U_SHIFT_R if u matters for this run.")
+    A = float(M[np.clip(dv[..., 0], lo, hi) + r, np.clip(dv[..., 1], lo, hi) + r].mean())
+    B = float(M[np.clip(v[..., 0], lo, hi) + r, np.clip(v[..., 1], lo, hi) + r].mean())
     return A / B
 
 
@@ -395,6 +405,10 @@ def main():
     p.add_argument('--diag_batch', type=int, default=32,
                    help='The state tensor is (B, T, V, H, W); at felstm 25 copies this is '
                         'what keeps it in memory.')
+    p.add_argument('--only', nargs='+', default=None,
+                   help='Recompute ONLY these cells by name (e.g. E:v=3 E:v=4) and merge '
+                        'them into the existing .npz, leaving every other cell alone. '
+                        'For recovering from a crash without repeating the whole sweep.')
     p.add_argument('--append_matched_rate', action='store_true',
                    help="Evaluate ONE extra axis-A cell whose realised switching rate "
                         "equals the training motion's, in the axis's own stochastic "
@@ -452,7 +466,10 @@ def main():
         stem += "_" + slug(args.run_filter)
     dest = args.out or os.path.join(args.save_dir, stem + ".npz")
 
-    if args.append_matched_rate:
+    if args.append_matched_rate or args.only:
+        # Recompute a FEW cells and merge them into the existing file, leaving the rest
+        # untouched. This is how you recover from a crash in one cell without paying for
+        # the whole sweep again.
         if not os.path.exists(dest):
             raise SystemExit(f"{dest} does not exist -- run the full sweep first.")
         prev = np.load(dest, allow_pickle=False)
@@ -460,8 +477,22 @@ def main():
             raise SystemExit(
                 f"{dest} holds {int(prev['n_sequences'])} sequences per cell but this run "
                 f"asks for {args.n_sequences}; the per-sequence arrays would not line up.")
-        # Drop any earlier matched cell so repeated runs replace rather than accumulate.
-        keep = [i for i, r in enumerate(prev["regime"]) if str(r) != "A:matched"]
+        if args.append_matched_rate:
+            train_rate = measure_train_rate(ref_cfg, args.data_seed, args.n_sequences,
+                                            args.train_split, args.download)
+            todo = [matched_rate_cell(train_rate)]
+        else:
+            want = set(args.only)
+            known = {c[0] for c in todo}
+            if want - known:
+                raise SystemExit(
+                    f"unknown cell(s) {sorted(want - known)}.\nthis sweep defines:\n  "
+                    + "\n  ".join(sorted(known)))
+            todo = [c for c in todo if c[0] in want]
+        # Whatever is being recomputed is dropped first, so a rerun replaces rather
+        # than duplicates.
+        recompute = {c[0] for c in todo}
+        keep = [i for i, r in enumerate(prev["regime"]) if str(r) not in recompute]
         for k in ("regime", "axis", "level", "rate", "jump", "travel", "u"):
             out[k] = list(prev[k][keep])
         for m in args.models:
@@ -470,11 +501,11 @@ def main():
             diag = [{m: {k: float(prev[f"diag_{m}_{k}"][i]) for k in DIAG_KEYS
                          if f"diag_{m}_{k}" in prev.files}
                      for m in args.models} for i in keep]
-        train_rate = measure_train_rate(ref_cfg, args.data_seed, args.n_sequences,
-                                        args.train_split, args.download)
-        todo = [matched_rate_cell(train_rate)]
-        print(f"training motion's realised rate: {train_rate:.4f}  ->  matched "
-              f"stochastic cell p_change={todo[0][3]['p_change']:.4f}")
+        print(f"merging into {dest}: keeping {len(keep)} cells, recomputing "
+              + ", ".join(sorted(recompute)))
+        if args.append_matched_rate:
+            print(f"training motion's realised rate: {train_rate:.4f}  ->  matched "
+                  f"stochastic cell p_change={todo[0][3]['p_change']:.4f}")
 
     for i, (regime, axis, level, kw) in enumerate(todo):
         t0 = time.time()
