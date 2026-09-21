@@ -53,6 +53,8 @@ from common_fate_moving_mnist_dataset import CommonFateMovingMNISTDataset  # noq
 from motion_classification_model import build_classifier                   # noqa: E402
 from mps_integer_warp import enable_integer_shift_warp                     # noqa: E402
 from motion_difficulty_sweep import NAMED_REGIMES                          # noqa: E402
+from train_classification import (velocity_diagnostics,                    # noqa: E402
+                                  state_shape_iou)
 from motion_factors_sweep import (D_GRID, S_GRID, TRAIN_D, TRAIN_S, TRAIN_N,  # noqa: E402
                                   TARGET_RATE, compensated_p)
 
@@ -84,6 +86,69 @@ def cells():
     for name, kw in NAMED_REGIMES.items():
         out.append((f"C:{name}", "named", float("nan"), dict(kw, **base)))
     return out
+
+
+# Generalization axes. Both hold the TRAINING motion fixed and vary one thing the
+# models never saw, so they measure extrapolation rather than a different motion law.
+# The trained value is deliberately absent from each grid: the `reference` cell already
+# measures it, and regenerating it would be a bit-identical duplicate.
+LEN_GRID = (5, 8, 10,12,14,16,18, 20, 25, 30)          # trained at 15
+SPEED_GRID = (1, 3, 4,5)                     # trained at 2
+
+
+def train_motion_kwargs(cfg):
+    """The checkpoint's own motion law, as explicit kwargs."""
+    return dict(motion_mode=cfg["motion_mode"], transition_mode=cfg["transition_mode"],
+                min_segment=cfg["min_segment"], max_segment=cfg["max_segment"])
+
+
+def generalization_cells(cfg, lengths=LEN_GRID, speeds=SPEED_GRID):
+    """Context length and figure speed, one factor at a time.
+
+    LENGTH is free at evaluation time: the encoder is recurrent and the head reads the
+    final pooled state, so any T runs on a model trained at another one.
+
+    SPEED is the lattice-coverage test. felstm's v_range is frozen at training, so at a
+    figure speed above it part of the motion is literally outside what it can represent,
+    while melstm re-estimates its slots per frame pair and is not bounded that way.
+    """
+    base = train_motion_kwargs(cfg)
+    out = [(f"D:T={T}", "length", float(T), dict(base, seq_len=int(T)))
+           for T in lengths if int(T) != int(cfg["seq_len"])]
+    out += [(f"E:v={n}", "speed", float(n), dict(base, max_speed=int(n)))
+            for n in speeds if int(n) != int(cfg["data_v_range"])]
+    return out
+
+
+def matched_rate_cell(train_rate, max_speed=TRAIN_N, s=TRAIN_S):
+    """An axis-A cell whose realised switching rate equals the TRAINING rate.
+
+    The reference cell is the model's own training motion, which for these classifiers
+    is `piecewise` -- a different family from axis A's `stochastic` cells. Placing it on
+    the axis by its measured rate still leaves an off-family point on the curve, and the
+    step between it and its neighbours mixes a change of family with a change of rate.
+    This cell is on the axis's OWN family at the same rate, so the curve has a legitimate
+    point there and the training motion can be drawn as a separate marker.
+
+    (motion_factors_sweep builds its centre this way from the start; it could, because
+    the prediction models were trained on the stochastic family to begin with.)
+    """
+    p = compensated_p(train_rate, s, max_speed)
+    if not 0.0 < p <= 1.0:
+        raise SystemExit(
+            f"cannot match a realised rate of {train_rate:.3f} in the stochastic family "
+            f"at s={s}: it needs p_change={p:.3f}, outside (0, 1].")
+    return ("A:matched", "rate", float("nan"),
+            dict(neighbor_kernel="symmetric", motion_mode="stochastic",
+                 transition_mode="smooth", p_change=p, smooth_probability=s,
+                 max_speed=max_speed))
+
+
+def measure_train_rate(cfg, seed, n, train_split=False, download=False):
+    """Realised switching rate of the checkpoint's own training motion."""
+    ds = make_dataset(cfg, None, seed, train_split, download)
+    _, _, motion = materialise(ds, n)
+    return motion_stats(motion)[0]
 
 
 def slug(regime):
@@ -190,7 +255,62 @@ def shift_msd(frames, r=U_SHIFT_R):
     return M
 
 
-def write_npz(dest, out, correct, models, n_sequences):
+def materialise_masked(ds, n):
+    """Sequences, motion and the ground-truth figure mask, from one pass.
+
+    The mask costs extra rendering, so it is drawn only for the diagnostic subset.
+    Turning it on does NOT perturb the sample stream (verified: sequences and labels
+    are identical with and without it), so these are the same first `n` sequences the
+    accuracy pass scored.
+    """
+    ds.return_mask = True
+    ds.reset_rng()
+    items = [ds[i] for i in range(n)]
+    seqs = torch.stack([it[0] for it in items])
+    motion = torch.stack([torch.as_tensor(np.asarray(it[2])) for it in items])
+    mask = torch.stack([torch.as_tensor(np.asarray(it[3])) for it in items])
+    ds.return_mask = False
+    return seqs, motion, mask
+
+
+def diagnostics(net, seqs, motion, mask, n_figures, device, batch):
+    """Per-cell mechanism diagnostics: does the state still hold the figure?
+
+    slot_hit_fig / slot_hit_bg   melstm only -- did some tracked slot end the encoder
+        holding the figure's (background's) true velocity? felstm's lattice contains
+        every representable velocity by construction, so the question is vacuous there.
+    shape_iou / _best / _chance  area-matched IoU between the local variance of the
+        transported state and the true figure mask, for the velocity-MATCHED copy and
+        for the best copy. Read it as transport coherence, not as task performance:
+        felstm has reached 0.976 accuracy with a matched IoU at chance, because its
+        information is spread over copies and time rather than concentrated in one.
+        `_best` is biased toward models with more copies (best-of-25 vs best-of-2), so
+        compare it WITHIN a model across regimes, never across models.
+    """
+    sums, n_batches = {}, 0
+    for b in range(0, len(seqs), batch):
+        s = seqs[b:b + batch].to(device)
+        mo = motion[b:b + batch].to(device)
+        mk = mask[b:b + batch].to(device)
+        with torch.no_grad():
+            _h, v, st = net.encode(s, return_states=True)
+        d = dict(velocity_diagnostics({"velocities": v}, mo, n_figures))
+        iou = state_shape_iou(net, st, v, mo, mk)
+        if iou is not None:
+            d["shape_iou"], d["shape_iou_best"] = iou
+            d["shape_iou_chance"] = float(mk[:, -1].amax(1).mean())
+        for k, val in d.items():
+            sums[k] = sums.get(k, 0.0) + float(val)
+        n_batches += 1
+    return {k: v / n_batches for k, v in sums.items()} if n_batches else {}
+
+
+DIAG_KEYS = ("slot_hit_fig", "slot_hit_bg", "shape_iou", "shape_iou_best",
+             "shape_iou_chance")
+
+
+def write_npz(dest, out, correct, models, n_sequences, diag=None,
+              train_seq_len=0, train_max_speed=0):
     """Atomic rewrite of the whole result file.
 
     Called after EVERY cell, not once at the end: a job cut off by the walltime then
@@ -198,14 +318,23 @@ def write_npz(dest, out, correct, models, n_sequences):
     mid-write cannot truncate the previous version.
     """
     tmp = f"{dest}.tmp.npz"
+    extra = {}
+    if diag:
+        # One array per (model, metric), NaN where a metric does not apply -- slot_hit
+        # is melstm-only, and shape_iou is undefined when no copy matches the figure.
+        for m in models:
+            for k in DIAG_KEYS:
+                extra[f"diag_{m}_{k}"] = np.array(
+                    [d.get(m, {}).get(k, np.nan) for d in diag], float)
     np.savez_compressed(
         tmp,
         regime=np.array(out["regime"]), axis=np.array(out["axis"]),
         level=np.array(out["level"], float), rate=np.array(out["rate"], float),
         jump=np.array(out["jump"], float), travel=np.array(out["travel"], float),
         u=np.array(out["u"], float), models=np.array(models),
-        n_sequences=n_sequences,
-        **{f"correct_{m}": np.stack(correct[m]) for m in models})
+        n_sequences=n_sequences, train_seq_len=train_seq_len,
+        train_max_speed=train_max_speed,
+        **{f"correct_{m}": np.stack(correct[m]) for m in models}, **extra)
     os.replace(tmp, dest)
 
 
@@ -245,6 +374,34 @@ def main():
                         'and is much faster for it.')
     p.add_argument('--download', action='store_true',
                    help='Let torchvision fetch MNIST if ./data is empty.')
+    p.add_argument('--generalization', action='store_true',
+                   help='Also sweep CONTEXT LENGTH and FIGURE SPEED, holding the training '
+                        'motion fixed. Both are evaluation-only extrapolation tests: the '
+                        'encoder is recurrent so any T runs, and felstm\'s velocity '
+                        'lattice is frozen at training so speeds above it are outside '
+                        'what it can represent at all.')
+    p.add_argument('--lengths', type=int, nargs='+', default=list(LEN_GRID))
+    p.add_argument('--speeds', type=int, nargs='+', default=list(SPEED_GRID))
+    p.add_argument('--with_diagnostics', action='store_true',
+                   help='Also record, per cell, whether the STATE still holds the figure: '
+                        'melstm slot-hit rates and the area-matched shape IoU between the '
+                        'transported state and the true mask. Answers WHY a model holds up '
+                        'rather than only THAT it does. Needs the figure mask, so it runs '
+                        'on a small subset.')
+    p.add_argument('--diag_sequences', type=int, default=256,
+                   help='Sequences per cell for the diagnostics. Far fewer than the '
+                        'accuracy pass needs: these are means of per-sample rates, not '
+                        'a 1-in-50 accuracy difference.')
+    p.add_argument('--diag_batch', type=int, default=32,
+                   help='The state tensor is (B, T, V, H, W); at felstm 25 copies this is '
+                        'what keeps it in memory.')
+    p.add_argument('--append_matched_rate', action='store_true',
+                   help="Evaluate ONE extra axis-A cell whose realised switching rate "
+                        "equals the training motion's, in the axis's own stochastic "
+                        "family, and merge it into the existing .npz. The other cells are "
+                        'not recomputed. Gives the rate curve a legitimate point at the '
+                        'training rate, since the reference cell is a piecewise motion '
+                        'and so sits off that curve.')
     p.add_argument('--out', default=None)
     p.add_argument('--device', default=None)
     p.add_argument('--limit_cells', type=int, default=None, help='For a quick check.')
@@ -278,9 +435,14 @@ def main():
                 f"they were not trained on the same data, so one sweep cannot compare "
                 f"them. Narrow --run_filter to one matched set of arms.")
 
-    todo = cells()[:args.limit_cells] if args.limit_cells else cells()
+    todo = cells()
+    if args.generalization:
+        todo = todo + generalization_cells(ref_cfg, args.lengths, args.speeds)
+    if args.limit_cells:
+        todo = todo[:args.limit_cells]
     out = {"regime": [], "axis": [], "level": [], "rate": [], "jump": [], "travel": [], "u": []}
     correct = {m: [] for m in args.models}
+    diag = [] if args.with_diagnostics else None
     M = None
 
     # The filter goes in the filename: sweeping several arms out of one save_dir
@@ -289,6 +451,31 @@ def main():
     if args.run_filter:
         stem += "_" + slug(args.run_filter)
     dest = args.out or os.path.join(args.save_dir, stem + ".npz")
+
+    if args.append_matched_rate:
+        if not os.path.exists(dest):
+            raise SystemExit(f"{dest} does not exist -- run the full sweep first.")
+        prev = np.load(dest, allow_pickle=False)
+        if int(prev["n_sequences"]) != args.n_sequences:
+            raise SystemExit(
+                f"{dest} holds {int(prev['n_sequences'])} sequences per cell but this run "
+                f"asks for {args.n_sequences}; the per-sequence arrays would not line up.")
+        # Drop any earlier matched cell so repeated runs replace rather than accumulate.
+        keep = [i for i, r in enumerate(prev["regime"]) if str(r) != "A:matched"]
+        for k in ("regime", "axis", "level", "rate", "jump", "travel", "u"):
+            out[k] = list(prev[k][keep])
+        for m in args.models:
+            correct[m] = list(prev[f"correct_{m}"][keep])
+        if diag is not None:
+            diag = [{m: {k: float(prev[f"diag_{m}_{k}"][i]) for k in DIAG_KEYS
+                         if f"diag_{m}_{k}" in prev.files}
+                     for m in args.models} for i in keep]
+        train_rate = measure_train_rate(ref_cfg, args.data_seed, args.n_sequences,
+                                        args.train_split, args.download)
+        todo = [matched_rate_cell(train_rate)]
+        print(f"training motion's realised rate: {train_rate:.4f}  ->  matched "
+              f"stochastic cell p_change={todo[0][3]['p_change']:.4f}")
+
     for i, (regime, axis, level, kw) in enumerate(todo):
         t0 = time.time()
         ds = make_dataset(ref_cfg, kw, args.data_seed, args.train_split, args.download)
@@ -309,7 +496,19 @@ def main():
                     ok[b:b + B] = (pred == labels[b:b + B]).numpy()
             correct[m].append(ok)
             accs.append(f"{m} {ok.mean():.4f}")
-        write_npz(dest, out, correct, args.models, args.n_sequences)
+        if diag is not None:
+            dseqs, dmot, dmask = materialise_masked(ds, min(args.diag_sequences,
+                                                            args.n_sequences))
+            cell_diag = {m: diagnostics(nets[m], dseqs, dmot, dmask, ref_cfg["num_figures"],
+                                        dev, args.diag_batch) for m in args.models}
+            diag.append(cell_diag)
+            accs.append("| " + "  ".join(
+                f"{m}:iou {cell_diag[m].get('shape_iou', float('nan')):.2f}"
+                + (f" hit {cell_diag[m]['slot_hit_fig']:.2f}"
+                   if "slot_hit_fig" in cell_diag[m] else "")
+                for m in args.models))
+        write_npz(dest, out, correct, args.models, args.n_sequences, diag,
+                  ref_cfg["seq_len"], ref_cfg["data_v_range"])
         print(f"[{i + 1:2d}/{len(todo)}] {regime:18s} rate={rate:.3f} jump={jump:.2f} "
               f"u={out['u'][-1]:.3f} travel={travel:4.1f}px | " + "  ".join(accs)
               + f"  ({time.time() - t0:.0f}s)", flush=True)

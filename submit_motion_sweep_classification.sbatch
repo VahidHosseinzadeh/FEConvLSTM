@@ -18,8 +18,33 @@
 # lists them rather than silently evaluating the wrong checkpoints.
 #
 # Reads   $SAVE_DIR/models/*_best.pth  and  $SAVE_DIR/results/history_*.json
-# Writes  $SAVE_DIR/motion_sweep_classification.npz   -- ONE file, all 21 cells
-#         (1 reference + 7 rate + 6 jump + 7 named regimes) x 3 models.
+# Writes  $SAVE_DIR/motion_sweep_classification.npz   -- ONE file, 31 cells x 3 models:
+#           1 reference + 7 rate + 6 jump + 8 named regimes   (the motion sweep)
+#         + 6 context lengths + 3 figure speeds              (the generalization axes)
+#
+# WHAT EACH AXIS ANSWERS
+#   rate / jump / named   how accuracy moves as the MOTION LAW changes.
+#   length (D:T=...)      the encoder is recurrent and the head reads the final pooled
+#                         state, so a model trained at T=15 runs at any T. Free at
+#                         evaluation time, and the classification analogue of the
+#                         length-generalization experiment on the prediction side.
+#   speed  (E:v=...)      felstm's velocity lattice is frozen at training (v_range=2),
+#                         so a figure faster than that is outside what it can represent
+#                         at all, while melstm re-estimates its slots per frame pair.
+#                         This is the lattice-coverage cost, at zero training cost.
+#
+# DIAGNOSTICS (--with_diagnostics, on by default here) additionally record, per cell,
+# whether the STATE still holds the figure, which is the mechanism behind the accuracy:
+#   slot_hit_fig / _bg    melstm only -- did some tracked slot end the encoder holding
+#                         the figure's true velocity? Vacuous for felstm, whose lattice
+#                         contains every representable velocity by construction.
+#   shape_iou             area-matched IoU between the local variance of the transported
+#                         state and the true figure mask, for the velocity-matched copy.
+#                         Transport coherence, NOT task performance: felstm has reached
+#                         0.976 accuracy with this at chance. Chance is the mask's area
+#                         fraction (~0.09), reported as shape_iou_chance.
+#   shape_iou_best        best over all copies. Biased toward models with more copies
+#                         (best-of-25 vs best-of-2) -- compare within a model, not across.
 #
 # Copy that single .npz back to the repo beside the checkpoints and
 # make_figures_common_fate.ipynb draws the figure from it -- the notebook runs
@@ -39,23 +64,28 @@
 #
 # Cost note: felstm carries 25 hidden-state copies and dominates the runtime, as
 # in the prediction sweep. Measured on an M-series GPU it is ~2.5 min per cell at
-# 500 sequences (~1 h for the full 21), which is why this exists. On a cluster GPU
-# raise BATCH well above the MPS-safe default of 50 -- felstm is the only model
-# that needs a small one, and only because of memory.
+# 500 sequences, which is why this exists. On a cluster GPU raise BATCH well above
+# the MPS-safe default of 50 -- felstm is the only model that needs a small one, and
+# only because of memory. The length cells scale with T, so D:T=30 costs about twice
+# a T=15 cell; the walltime here allows for that.
 
 #SBATCH --partition=gpu
 #SBATCH --gres=gpu:1
-#SBATCH --time=04:00:00
+#SBATCH --time=12:00:00
 #SBATCH --mem=64G
 #SBATCH --cpus-per-task=8
 #SBATCH --output=slurm_%x_%j.log
 
 set -e
 
-N_SEQ=${1:-2000}                          # sequences per cell
+N_SEQ=${1:-5000}                          # sequences per cell
 SAVE_DIR=${2:-./experiments_classification}   # where run_classification.sh wrote them
 BATCH=${3:-250}                           # lower if the GPU OOMs
 RUN_FILTER=${RUN_FILTER:-}                # substring picking ONE arm per model
+DIAG=${DIAG:-1}                           # state diagnostics (slot hit, shape IoU)
+GEN=${GEN:-1}                             # context-length and speed generalization
+DIAG_SEQ=${DIAG_SEQ:-256}                 # diagnostics need far fewer sequences
+DIAG_BATCH=${DIAG_BATCH:-32}              # the state tensor is (B, T, V, H, W)
 
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
@@ -66,6 +96,13 @@ CMD=(python moving_mnist/motion_sweep_classification.py
      --batch_size "$BATCH"
      --data_seed 123
      --download)
+
+if [ "$DIAG" != "0" ]; then
+  CMD+=(--with_diagnostics --diag_sequences "$DIAG_SEQ" --diag_batch "$DIAG_BATCH")
+fi
+if [ "$GEN" != "0" ]; then
+  CMD+=(--generalization)
+fi
 
 if [ -n "$RUN_FILTER" ]; then
   CMD+=(--run_filter "$RUN_FILTER")
