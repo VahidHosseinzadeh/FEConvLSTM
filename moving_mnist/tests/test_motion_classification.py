@@ -1046,3 +1046,61 @@ def test_training_script_runs_with_an_incoherent_background(tmp_path):
                  "--batch_size", "4", "--image_size", "32", "--seq_len", "5",
                  "--bg_mode", "incoherent", "--root", DATA_ROOT, "--save_dir", str(tmp_path)])
     assert hist["config"]["bg_mode"] == "incoherent" and len(hist["epochs"]) == 2
+
+
+# ------------------------------------------------------ the velocity search window
+def test_search_window_finds_a_minority_motion_under_a_dominant_one():
+    """A large region at (5, 0) and a small patch at (1, 1): the whole surface picks
+    the large one, a |v| <= 2 window the patch -- and max_shift=None is untouched."""
+    from velocity_predictor_model import PhaseCorrelation
+    g = torch.Generator().manual_seed(0)
+    x0 = torch.randn(1, 1, 32, 32, generator=g)
+    x1 = torch.roll(x0, shifts=(0, 5), dims=(2, 3))
+    patch = torch.roll(x0, shifts=(1, 1), dims=(2, 3))
+    x1[..., 8:20, 8:20] = patch[..., 8:20, 8:20]
+    assert PhaseCorrelation(n_modes=1)(x0, x1)[0][0, 0].tolist() == [5.0, 0.0]
+    assert PhaseCorrelation(n_modes=1, max_shift=2)(x0, x1)[0][0, 0].tolist() == [1.0, 1.0]
+
+
+@pytest.mark.parametrize("scope", ["bootstrap", "all"])
+def test_search_window_scope(scope):
+    """'bootstrap' windows only the t=1 estimate, 'all' every step -- for the backbone's
+    own tracker and for the frame-pair sources alike."""
+    net = MotionDigitClassifier(model="melstm", hidden_channels=4, n_slots=1,
+                                velocity_source="tracked", vel_search_radius=2,
+                                vel_search_at=scope)
+    assert net.backbone.phase_corr_bootstrap.max_shift == 2
+    assert net.backbone.phase_corr_track.max_shift == (2 if scope == "all" else None)
+
+    torch.manual_seed(0)
+    fp = MotionDigitClassifier(model="melstm", hidden_channels=4, n_slots=1,
+                               velocity_source="frame_pair", vel_search_radius=2,
+                               vel_search_at=scope).eval()
+    with torch.no_grad():
+        v = fp.encode(torch.rand(8, 6, 1, 32, 32))[1]           # (B, T-1, K, 2), noise
+    speed = v.abs().amax(-1)
+    assert (speed[:, 0] <= 2).all(), "t=1 left the window"
+    if scope == "all":
+        assert (speed <= 2).all(), "a later step left the window"
+    else:
+        assert (speed[:, 1:] > 2).any(), "later steps should search the whole surface"
+
+
+def test_search_window_keeps_checkpoints_compatible():
+    """PhaseCorrelation has no parameters, so a window must not change the state dict."""
+    a = MotionDigitClassifier(model="melstm", hidden_channels=4, n_slots=1)
+    b = MotionDigitClassifier(model="melstm", hidden_channels=4, n_slots=1,
+                              vel_search_radius=2, vel_search_at="all")
+    assert list(a.state_dict()) == list(b.state_dict())
+
+
+def test_training_script_runs_single_slot_tracked_with_a_window(tmp_path):
+    from train_classification import main
+    hist = main(["--model", "melstm", "--smoke_test", "--hidden_size", "8",
+                 "--batch_size", "4", "--image_size", "32", "--seq_len", "5",
+                 "--velocity_source", "tracked", "--num_vel_modes", "1",
+                 "--vel_search_radius", "2", "--bg_mode", "incoherent",
+                 "--root", DATA_ROOT, "--save_dir", str(tmp_path)])
+    assert hist["config"]["vel_search_radius"] == 2
+    assert hist["config"]["vel_search_at"] == "bootstrap"
+    assert hist["parameters"]["n_velocities"] == 1

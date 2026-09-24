@@ -208,6 +208,7 @@ class MotionDigitClassifier(nn.Module):
                  v_range=2, n_slots=2, n_classes=10,
                  velocity_pool="attention", pool_temperature=1.0,
                  velocity_source="bootstrap",
+                 vel_search_radius=None, vel_search_at="bootstrap",
                  head_channels=64, head_blocks=3, head_mlp_hidden=128,
                  head_dropout=0.0, head_norm="batch", input_channels=1):
         super().__init__()
@@ -234,10 +235,30 @@ class MotionDigitClassifier(nn.Module):
 
         if velocity_source not in ("tracked", "frame_pair", "bootstrap"):
             raise ValueError(f"unknown velocity_source {velocity_source!r}")
+        if vel_search_at not in ("bootstrap", "all"):
+            raise ValueError(f"unknown vel_search_at {vel_search_at!r}")
+        # Velocity search window: slots may only take velocities with
+        # max(|vx|, |vy|) <= vel_search_radius. 'bootstrap' windows the t=1 estimate
+        # from the raw pair (x0, x1) alone -- where a slot is first placed -- and
+        # leaves every later step free; 'all' windows every step. On a background
+        # with no coherent motion the window hides nothing, and it is what lets the
+        # digit's peak win: it no longer has to beat every noise cell of the surface.
+        self.vel_search_radius = vel_search_radius
+        self.vel_search_at = vel_search_at
+        r_first = vel_search_radius
+        r_later = vel_search_radius if vel_search_at == "all" else None
         # Own modules: n_modes must equal the slot count, which the backbone's
-        # bootstrap module only coincidentally matches.
-        self._frame_pair_pc = PhaseCorrelation(n_modes=max(1, self.n_velocities))
-        self._pc1 = PhaseCorrelation(n_modes=1)
+        # bootstrap module only coincidentally matches. The *0 pair serves t=1.
+        self._frame_pair_pc = PhaseCorrelation(n_modes=max(1, self.n_velocities),
+                                               max_shift=r_later)
+        self._pc1 = PhaseCorrelation(n_modes=1, max_shift=r_later)
+        self._frame_pair_pc0 = PhaseCorrelation(n_modes=max(1, self.n_velocities),
+                                                max_shift=r_first)
+        self._pc10 = PhaseCorrelation(n_modes=1, max_shift=r_first)
+        if model == "melstm":
+            # 'tracked' uses the backbone's own two: bootstrap at t=1, track after.
+            self.backbone.phase_corr_bootstrap.max_shift = r_first
+            self.backbone.phase_corr_track.max_shift = r_later
 
         # The head is built BEFORE the pool, and the pool last of all, so that
         # changing --velocity_pool cannot shift anyone else's initialisation.
@@ -299,7 +320,7 @@ class MotionDigitClassifier(nn.Module):
         idx = (sy * W + sx).reshape(B, 1, H * W).expand(-1, C, -1)
         return x.reshape(B, C, H * W).gather(2, idx).view(B, C, H, W)
 
-    def _residual_bootstrap(self, x0, x1, blur=1.5):
+    def _residual_bootstrap(self, x0, x1, blur=1.5, pc1=None):
         """
         Batched residual bootstrap: the MINORITY motion, recovered from under the
         dominant one.
@@ -317,7 +338,8 @@ class MotionDigitClassifier(nn.Module):
         Torch port of `residual_bootstrap` in common_fate_diagnostics.py, which
         is the single-image numpy reference.
         """
-        v1 = self._pc1(x0, x1)[0][:, 0]                    # (B, 2) dominant
+        pc1 = self._pc1 if pc1 is None else pc1
+        v1 = pc1(x0, x1)[0][:, 0]                          # (B, 2) dominant
         R = (x0 - self._roll_batch(x1, -v1)).abs()
 
         H, W = x0.shape[-2:]
@@ -333,18 +355,21 @@ class MotionDigitClassifier(nn.Module):
         W1m = self._roll_batch(R, v1)
         a = R * (x0 - x0.mean(dim=(-2, -1), keepdim=True))
         b = W1m * (x1 - x1.mean(dim=(-2, -1), keepdim=True))
-        v2 = self._pc1(a, b)[0][:, 0]                      # (B, 2) minority
+        v2 = pc1(a, b)[0][:, 0]                            # (B, 2) minority
         return torch.stack([v1, v2], dim=1)                # (B, 2, 2)
 
-    def _candidate_velocities(self, x0, x1):
-        """K candidate velocities for one frame pair, per velocity_source."""
+    def _candidate_velocities(self, x0, x1, first=False):
+        """K candidate velocities for one frame pair, per velocity_source. `first`
+        marks the t=1 pair, which --vel_search_at bootstrap windows on its own."""
+        pcK, pc1 = ((self._frame_pair_pc0, self._pc10) if first
+                    else (self._frame_pair_pc, self._pc1))
         if self.velocity_source != "bootstrap":
-            return self._frame_pair_pc(x0, x1)[0]
-        cand = self._residual_bootstrap(x0, x1)            # (B, 2, 2)
+            return pcK(x0, x1)[0]
+        cand = self._residual_bootstrap(x0, x1, pc1=pc1)   # (B, 2, 2)
         if self.n_velocities <= 2:
             return cand[:, :self.n_velocities]
         # More slots than the scene has motions: top up with ordinary peaks.
-        extra = self._frame_pair_pc(x0, x1)[0][:, :self.n_velocities - 2]
+        extra = pcK(x0, x1)[0][:, :self.n_velocities - 2]
         return torch.cat([cand, extra], dim=1)
 
     def _encode_melstm_frame_pair(self, seq, return_states=False):
@@ -383,7 +408,8 @@ class MotionDigitClassifier(nn.Module):
         for t in range(T):
             if t > 0:
                 with torch.no_grad():
-                    cand = self._candidate_velocities(seq[:, t - 1], seq[:, t])
+                    cand = self._candidate_velocities(seq[:, t - 1], seq[:, t],
+                                                      first=(t == 1))
                 cand = cand.to(seq.dtype)
                 v = cand if t == 1 else self._match_to_slots(cand, v)
             h, c = cell(seq[:, t], h, c, v)
@@ -480,7 +506,10 @@ class MotionDigitClassifier(nn.Module):
                  f"V={self.n_velocities} velocity "
                  f"{'slots' if self.model == 'melstm' else 'copies'}"
                  + (f"  velocity_source={self.velocity_source}"
-                    if self.model == "melstm" else "")]
+                    if self.model == "melstm" else "")
+                 + (f"  search |v|<={self.vel_search_radius} at {self.vel_search_at}"
+                    if self.model == "melstm" and self.vel_search_radius is not None
+                    else "")]
         if self.model == "felstm":
             lines[0] += f"  (lattice v_range covers |v| <= {max(abs(v[0]) for v in self.backbone.cell.v_list)})"
         lines.append("")
@@ -561,6 +590,8 @@ def build_classifier(cfg):
         velocity_pool=get("velocity_pool", "attention"),
         pool_temperature=get("pool_temperature", 1.0),
         velocity_source=get("velocity_source", "bootstrap"),
+        vel_search_radius=get("vel_search_radius", None),
+        vel_search_at=get("vel_search_at", "bootstrap"),
         head_channels=get("head_channels", 64),
         head_blocks=get("head_blocks", 3),
         head_mlp_hidden=get("head_mlp_hidden", 128),

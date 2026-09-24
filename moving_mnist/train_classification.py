@@ -105,6 +105,18 @@ def get_args(argv=None):
                         "'bootstrap' (default) explains the dominant motion away first and "
                         "re-correlates the residual, which is what makes the MINORITY "
                         "motion reliably findable -- and therefore what makes K=2 correct.")
+    p.add_argument('--vel_search_radius', type=int, default=None,
+                   help="melstm only: slots may only take velocities with max(|vx|,|vy|) "
+                        "<= this (None = the whole correlation surface). Set it to "
+                        "--data_v_range to search only the digit's own velocities -- on "
+                        "--bg_mode incoherent the digit's peak then competes with 25 cells "
+                        "instead of the whole surface: frame-pair top-1 finds it on 68%% of "
+                        "pairs instead of 31%%. Measured, not a guess.")
+    p.add_argument('--vel_search_at', choices=['bootstrap', 'all'], default='bootstrap',
+                   help="melstm only, with --vel_search_radius: 'bootstrap' windows only the "
+                        "t=1 estimate from the raw pair (x0, x1) -- where each slot is first "
+                        "placed -- and leaves every later step free; 'all' windows every step "
+                        "(tracking included).")
     p.add_argument('--velocity_pool', choices=['attention', 'max', 'mean', 'concat'],
                    default='attention',
                    help="How the velocity axis is reduced before the head. 'max' is the "
