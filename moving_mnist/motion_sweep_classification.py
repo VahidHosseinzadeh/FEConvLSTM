@@ -214,6 +214,7 @@ def make_dataset(cfg, motion_kw, seed, train_split, download=False):
         # A constant background stays constant in every cell: the cells vary the
         # figure's motion law, and with a fixed background that is ALL they vary.
         bg_velocity=(tuple(cfg["bg_velocity"]) if cfg["bg_mode"] == "constant" else None),
+        bg_incoherent=(cfg["bg_mode"] == "incoherent"),
         return_motion=True,
     )
     if motion_kw is None:                      # the training motion itself

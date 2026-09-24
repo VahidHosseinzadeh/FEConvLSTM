@@ -97,6 +97,9 @@ BG_MODE=${BG_MODE:-opposite}
                    # "4 0" is off the digit grid (|v|<=2) by a margin of 2, so the two
                    # never come closer than 2 px/frame by construction. It is also off
                    # felstm's lattice (V_RANGE=2): no felstm copy moves with it.
+                   # incoherent: fresh background noise every frame, no motion at all.
+                   # Nothing for any model to hold still; the digit is the only
+                   # coherent motion.  BG_MODE=incoherent TAG=incoh sbatch ... melstm
 BG_VEL=${BG_VEL:-} # "VX VY", --bg_mode constant only
 MOTION=piecewise   # figure velocity held 3-6 frames, then changes
 CORR_LEN=0.0       # LEAVE AT 0. Above 0 the texture seam marks the digit's outline in

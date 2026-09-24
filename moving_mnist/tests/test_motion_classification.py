@@ -1011,3 +1011,38 @@ def test_training_script_runs_with_a_constant_background(tmp_path):
     assert hist["config"]["bg_velocity"] == [4, 0]
     assert hist["config"]["train_stream_seed"] == hist["config"]["data_seed"]
     assert len(hist["epochs"]) == 2
+
+
+def test_incoherent_background_has_no_motion_and_no_fixed_shortcut():
+    """
+    bg_incoherent: the background is fresh noise every frame, so NO shift of the
+    previous frame reproduces it -- while the figure's pixels are reproduced exactly by
+    its own velocity. The figure is the only coherent motion, on its full grid, with no
+    separation constraint against a background that has no velocity.
+    """
+    ds = _ds(bg_speed_range=None, bg_incoherent=True, corr_len=0.0, return_mask=True)
+    ds.reset_rng()
+    for i in range(6):
+        seq, _, motion, mask = ds[i]
+        F, M = seq[:, 0].numpy(), mask[:, 0].numpy() > 0.5
+        assert (motion[:, 1] == 0).all(), "an incoherent background has no velocity"
+        for t in range(1, F.shape[0]):
+            bg = ~M[t] & ~M[t - 1]
+            for dx in range(-3, 4):
+                for dy in range(-3, 4):
+                    same = F[t] == np.roll(F[t - 1], (dy, dx), (0, 1))
+                    assert same[bg].mean() < 0.05, "background repeated under a shift"
+            vx, vy = motion[t - 1, 0].tolist()
+            fig = M[t] & np.roll(M[t - 1], (vy, vx), (0, 1))
+            assert (F[t] == np.roll(F[t - 1], (vy, vx), (0, 1)))[fig].all(), \
+                "the figure should be reproduced exactly by its own velocity"
+    with pytest.raises(ValueError, match="bg_incoherent"):
+        _ds(bg_speed_range=None, bg_incoherent=True, bg_velocity=(4, 0))
+
+
+def test_training_script_runs_with_an_incoherent_background(tmp_path):
+    from train_classification import main
+    hist = main(["--model", "felstm", "--smoke_test", "--hidden_size", "8",
+                 "--batch_size", "4", "--image_size", "32", "--seq_len", "5",
+                 "--bg_mode", "incoherent", "--root", DATA_ROOT, "--save_dir", str(tmp_path)])
+    assert hist["config"]["bg_mode"] == "incoherent" and len(hist["epochs"]) == 2
