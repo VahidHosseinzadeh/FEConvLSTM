@@ -9,7 +9,6 @@ class PhaseCorrelation(nn.Module):
         periodic_bc=True,
         pad_factor=1,
         eps=1e-8,
-        max_shift=None,
     ):
         super().__init__()
 
@@ -17,22 +16,6 @@ class PhaseCorrelation(nn.Module):
         self.periodic_bc = periodic_bc
         self.pad_factor = pad_factor
         self.eps = eps
-        # Search only displacements with max(|vx|, |vy|) <= max_shift. None = the
-        # whole surface. A plain attribute, so a caller may switch it per call site.
-        self.max_shift = max_shift
-        self._window_cache = {}
-
-    def _window(self, H, W, device):
-        """(H*W,) bool: which surface cells lie within max_shift of zero shift."""
-        key = (H, W, self.max_shift, device)
-        if key not in self._window_cache:
-            y = torch.arange(H, device=device)
-            x = torch.arange(W, device=device)
-            y = torch.where(y > H / 2, y - H, y).abs()
-            x = torch.where(x > W / 2, x - W, x).abs()
-            self._window_cache[key] = (
-                torch.maximum(y[:, None], x[None, :]) <= self.max_shift).reshape(-1)
-        return self._window_cache[key]
 
     def forward(self, frame1, frame2):
         """
@@ -72,8 +55,6 @@ class PhaseCorrelation(nn.Module):
 
         # pop peaks
         corr = corr.reshape(B, -1)
-        if self.max_shift is not None:
-            corr = corr.masked_fill(~self._window(H_pad, W_pad, corr.device), float("-inf"))
         scores, idx = torch.topk(corr, self.n_modes, dim=1)
 
         y = (idx // W_pad).float()

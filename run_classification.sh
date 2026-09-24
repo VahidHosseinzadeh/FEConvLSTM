@@ -81,9 +81,12 @@ POOL=max           # MEASURED, not assumed. With attention, felstm sat at chance
 # ---- data -----------------------------------------------------------------
 DATA_V=2           # figure max speed. felstm needs V_RANGE >= this, and its cost
                    # grows as (2R+1)^2, so raising it is expensive for felstm only.
-BG_MODE=${BG_MODE:-opposite}
-                   # opposite: background stays ON the shared velocity grid and is separated by
-                   # DIRECTION (opposing the digit at t=0) rather than by speed.
+BG_MODE=${BG_MODE:-mirror}
+                   # mirror (default): the background moves at exactly -v_digit at every
+                   # step, on the shared grid; it switches whenever the digit does.
+                   # opposite: opposing DIRECTION at t=0 only -- after that the two layers
+                   # move independently and head the same way on ~8% of steps. It is
+                   # what every run before 2026-09-24 used; BG_MODE=opposite reproduces it.
                    # 'disjoint' would guarantee separation by making the background
                    # faster than any figure -- but that puts it beyond every lattice
                    # copy felstm has, so felstm could not represent the background at
@@ -97,9 +100,6 @@ BG_MODE=${BG_MODE:-opposite}
                    # "4 0" is off the digit grid (|v|<=2) by a margin of 2, so the two
                    # never come closer than 2 px/frame by construction. It is also off
                    # felstm's lattice (V_RANGE=2): no felstm copy moves with it.
-                   # incoherent: fresh background noise every frame, no motion at all.
-                   # Nothing for any model to hold still; the digit is the only
-                   # coherent motion.  BG_MODE=incoherent TAG=incoh sbatch ... melstm
 BG_VEL=${BG_VEL:-} # "VX VY", --bg_mode constant only
 MOTION=piecewise   # figure velocity held 3-6 frames, then changes
 CORR_LEN=0.0       # LEAVE AT 0. Above 0 the texture seam marks the digit's outline in

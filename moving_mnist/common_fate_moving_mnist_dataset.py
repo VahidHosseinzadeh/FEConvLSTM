@@ -155,7 +155,7 @@ def render_sequence(masks, textures, bg_texture, d_fig, d_bg, variant):
 
     masks      : (N, H, W) binary, each figure at its starting position
     textures   : (N, H, W) one texture per figure
-    bg_texture : (H, W), or (T, H, W) for a fresh background texture every frame
+    bg_texture : (H, W)
     d_fig      : (T, N, 2) cumulative displacements, numpy order (dy, dx)
     d_bg       : (T, 2)
     variant    : 'moving_mask' | 'static_mask'
@@ -176,10 +176,8 @@ def render_sequence(masks, textures, bg_texture, d_fig, d_bg, variant):
 
     frames = np.empty((T, H, W), np.float32)
     track = np.empty((T, N, H, W), np.float32)
-    bg_texture = np.asarray(bg_texture)
     for t in range(T):
-        bg = bg_texture[t] if bg_texture.ndim == 3 else bg_texture
-        frame = np.roll(bg, tuple(d_bg[t]), (0, 1))
+        frame = np.roll(bg_texture, tuple(d_bg[t]), (0, 1))
         for i in range(N):
             tex = np.roll(textures[i], tuple(d_fig[t, i]), (0, 1))
             # moving_mask: the aperture travels with its texture, so the figure
@@ -373,6 +371,15 @@ class CommonFateMovingMNISTDataset(TDMovingMNISTDataset):
                     difference in expressive power confounded with the effect
                     being measured. Separating by direction keeps both motions
                     representable by both models.
+    bg_mirror     : the background moves at EXACTLY the negative of the figure's
+                    velocity, v_bg(t) = -v_fig(t), at every step. Only the figure's
+                    trajectory is drawn (under the usual motion law); the
+                    background switches when, and only when, the figure does. On
+                    the shared grid, so felstm represents both, and |v_fig - v_bg|
+                    = 2|v_fig| >= 2, so min_dv <= 2 holds by construction. Note
+                    what it gives away: the background's velocity -- the dominant
+                    phase-correlation peak -- determines the figure's exactly.
+                    One figure only.
     bg_speed_range : (lo, hi) -- give the BACKGROUND its own velocity grid,
                     every integer (vx, vy) with lo <= max(|vx|,|vy|) <= hi.
                     Requires lo > max_speed, which makes the grid disjoint from
@@ -396,17 +403,6 @@ class CommonFateMovingMNISTDataset(TDMovingMNISTDataset):
                     otherwise. Exclusive with bg_speed_range and
                     bg_opposite_at_start. Off felstm's lattice (|v| > v_range) it is
                     a motion felstm cannot represent -- the caveat above applies.
-    bg_incoherent : the background is FRESH noise every frame -- no motion at all,
-                    so there is nothing for any model to hold still or cancel, and
-                    the figure is the only coherent motion in the scene. No frame
-                    contains the figure, and neither does a frame difference (the
-                    figure moves, so its pixels change as much as the background's).
-                    What remains is the figure's own persistence: x_t matches
-                    x_(t-1) shifted by v_fig on the figure and nowhere else, which a
-                    plain ConvLSTM can detect locally when |v_fig| is within its
-                    reach (3 px per frame at kernel 3). The background slot of
-                    `motion` is (0, 0) -- it has no velocity -- and the figure is
-                    not separated from it. Exclusive with the other bg_* options.
     separate_figures : also require that gap pairwise BETWEEN figures. Off by
                     default: two figures sharing a velocity are one motion group
                     but still two shapes, which is fine for classification and
@@ -458,9 +454,9 @@ class CommonFateMovingMNISTDataset(TDMovingMNISTDataset):
         min_dv=2,
         separate_figures=False,
         bg_opposite_at_start=False,
+        bg_mirror=False,
         bg_speed_range=None,
         bg_velocity=None,
-        bg_incoherent=False,
         max_velocity_tries=200,
         normalize="affine",
         clip=3.0,
@@ -507,20 +503,22 @@ class CommonFateMovingMNISTDataset(TDMovingMNISTDataset):
             bg_velocity = tuple(int(c) for c in bg_velocity)
             if len(bg_velocity) != 2:
                 raise ValueError(f"bg_velocity must be (vx, vy), got {bg_velocity!r}")
-            if bg_speed_range is not None or bg_opposite_at_start:
+            if bg_speed_range is not None or bg_opposite_at_start or bg_mirror:
                 raise ValueError(
                     "bg_velocity fixes the background's motion outright; it cannot be "
-                    "combined with bg_speed_range or bg_opposite_at_start.")
-        if bg_incoherent and (bg_velocity is not None or bg_speed_range is not None
-                              or bg_opposite_at_start):
-            raise ValueError(
-                "bg_incoherent gives the background no motion at all; it cannot be "
-                "combined with bg_velocity, bg_speed_range or bg_opposite_at_start.")
+                    "combined with bg_speed_range, bg_opposite_at_start or bg_mirror.")
+        if bg_mirror:
+            if bg_speed_range is not None or bg_opposite_at_start:
+                raise ValueError(
+                    "bg_mirror sets the background to -v_fig at every step; it cannot "
+                    "be combined with bg_speed_range or bg_opposite_at_start.")
+            if num_figures != 1:
+                raise ValueError(f"bg_mirror mirrors ONE figure, got num_figures={num_figures}")
         if stream_seed is not None and int(stream_seed) < 0:
             raise ValueError(f"stream_seed must be >= 0, got {stream_seed}")
         max_gap = (max_speed + max(abs(c) for c in bg_velocity)
                    if bg_velocity is not None else 2 * max_speed)
-        if min_dv > max_gap and bg_speed_range is None and not bg_incoherent:
+        if min_dv > max_gap and bg_speed_range is None:
             raise ValueError(
                 f"min_dv={min_dv} is unsatisfiable with max_speed={max_speed} "
                 f"(the largest possible separation is {max_gap}).")
@@ -585,6 +583,7 @@ class CommonFateMovingMNISTDataset(TDMovingMNISTDataset):
         self.min_dv = min_dv
         self.separate_figures = separate_figures
         self.bg_opposite_at_start = bg_opposite_at_start
+        self.bg_mirror = bg_mirror
         self.bg_speed_range = bg_speed_range
 
         # Background velocities live on their own grid: every integer (vx, vy)
@@ -611,10 +610,9 @@ class CommonFateMovingMNISTDataset(TDMovingMNISTDataset):
         if bg_velocity is not None:
             self.bg_separation_is_structural = (
                 max(abs(c) for c in bg_velocity) - max_speed) >= min_dv
-        # An incoherent background has no velocity for a figure to coincide with.
-        self.bg_incoherent = bool(bg_incoherent)
-        if self.bg_incoherent:
-            self.bg_separation_is_structural = True
+        if bg_mirror:
+            # |v_fig - (-v_fig)| = 2|v_fig| >= 2, since (0, 0) is off the grid.
+            self.bg_separation_is_structural = min_dv <= 2
         self.stream_seed = None if stream_seed is None else int(stream_seed)
         self._sample_rng = None
         self.max_velocity_tries = max_velocity_tries
@@ -672,10 +670,7 @@ class CommonFateMovingMNISTDataset(TDMovingMNISTDataset):
                           for g, (cx, cy) in zip(glyphs, positions)])
         textures = np.stack([band_limited_noise(S, S, self.corr_len, self._rng)
                              for _ in range(N)])
-        bg_texture = (np.stack([band_limited_noise(S, S, self.corr_len, self._rng)
-                                for _ in range(len(disp))])
-                      if self.bg_incoherent
-                      else band_limited_noise(S, S, self.corr_len, self._rng))
+        bg_texture = band_limited_noise(S, S, self.corr_len, self._rng)
 
         frames, track = render_sequence(
             masks, textures, bg_texture,
@@ -846,17 +841,18 @@ class CommonFateMovingMNISTDataset(TDMovingMNISTDataset):
 
     def _generate_split_grid_motion(self):
         """
-        Figures on the figure grid, background on its own grid or fixed at
-        bg_velocity -- concatenated into the usual (T, N+1, 2) layout with the
-        background last.
+        Figures on the figure grid, background on its own grid, fixed at
+        bg_velocity, or mirroring the figure -- concatenated into the usual
+        (T, N+1, 2) layout with the background last.
         """
         N = self.num_figures
         with self._velocity_grid(self.velocity_grid, N):
             fig = self._generate_motion_trajectory()          # (T, N, 2)
-        if self.bg_velocity is not None or self.bg_incoherent:
-            # Fixed, so no draw at all; an incoherent background has no velocity.
-            v = self.bg_velocity if self.bg_velocity is not None else (0, 0)
-            bg = torch.tensor(v, dtype=torch.long).expand(fig.shape[0], 1, 2).clone()
+        if self.bg_mirror:
+            bg = -fig[:, :1]                                  # v_bg = -v_fig, no draw
+        elif self.bg_velocity is not None:
+            bg = torch.tensor(self.bg_velocity, dtype=torch.long).expand(
+                fig.shape[0], 1, 2).clone()                   # no draw at all
         else:
             with self._velocity_grid(self.bg_velocity_grid, 1):
                 bg = self._generate_motion_trajectory()       # (T, 1, 2)
@@ -872,7 +868,7 @@ class CommonFateMovingMNISTDataset(TDMovingMNISTDataset):
         thing a subclass of TDMovingMNISTDataset must not do.
         """
         split = (self.bg_velocity_grid is not None or self.bg_velocity is not None
-                 or self.bg_incoherent)
+                 or self.bg_mirror)
         draw = (self._generate_split_grid_motion if split
                 else self._generate_motion_trajectory)
         motions = None

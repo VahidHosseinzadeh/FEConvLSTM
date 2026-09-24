@@ -1013,94 +1013,34 @@ def test_training_script_runs_with_a_constant_background(tmp_path):
     assert len(hist["epochs"]) == 2
 
 
-def test_incoherent_background_has_no_motion_and_no_fixed_shortcut():
+
+def test_background_mirrors_the_figure():
     """
-    bg_incoherent: the background is fresh noise every frame, so NO shift of the
-    previous frame reproduces it -- while the figure's pixels are reproduced exactly by
-    its own velocity. The figure is the only coherent motion, on its full grid, with no
-    separation constraint against a background that has no velocity.
+    bg_mirror: v_bg = -v_fig at every step -- only the figure is drawn, the
+    background switches exactly when it does, both stay on the shared grid, and the
+    2|v_fig| >= 2 gap makes min_dv=2 hold by construction.
     """
-    ds = _ds(bg_speed_range=None, bg_incoherent=True, corr_len=0.0, return_mask=True)
+    ds = _ds(bg_speed_range=None, bg_mirror=True, min_dv=2, seq_len=15)
     ds.reset_rng()
-    for i in range(6):
-        seq, _, motion, mask = ds[i]
-        F, M = seq[:, 0].numpy(), mask[:, 0].numpy() > 0.5
-        assert (motion[:, 1] == 0).all(), "an incoherent background has no velocity"
-        for t in range(1, F.shape[0]):
-            bg = ~M[t] & ~M[t - 1]
-            for dx in range(-3, 4):
-                for dy in range(-3, 4):
-                    same = F[t] == np.roll(F[t - 1], (dy, dx), (0, 1))
-                    assert same[bg].mean() < 0.05, "background repeated under a shift"
-            vx, vy = motion[t - 1, 0].tolist()
-            fig = M[t] & np.roll(M[t - 1], (vy, vx), (0, 1))
-            assert (F[t] == np.roll(F[t - 1], (vy, vx), (0, 1)))[fig].all(), \
-                "the figure should be reproduced exactly by its own velocity"
-    with pytest.raises(ValueError, match="bg_incoherent"):
-        _ds(bg_speed_range=None, bg_incoherent=True, bg_velocity=(4, 0))
+    assert ds.bg_separation_is_structural
+    fig_grid = set(ds.velocity_grid)
+    switched = 0
+    for i in range(24):
+        _, _, motion = ds[i]
+        assert torch.equal(motion[:, 1], -motion[:, 0]), f"sample {i}: not a mirror"
+        assert all(tuple(v) in fig_grid for v in motion[:, 1].tolist())
+        switched += int((motion[1:, 0] != motion[:-1, 0]).any())
+    assert switched > 0, "piecewise figure motion should switch in some sequences"
+
+    with pytest.raises(ValueError, match="bg_mirror"):
+        _ds(bg_speed_range=None, bg_mirror=True, bg_opposite_at_start=True)
+    with pytest.raises(ValueError, match="ONE figure"):
+        _ds(bg_speed_range=None, bg_mirror=True, num_figures=2)
 
 
-def test_training_script_runs_with_an_incoherent_background(tmp_path):
+def test_training_script_runs_with_a_mirrored_background(tmp_path):
     from train_classification import main
-    hist = main(["--model", "felstm", "--smoke_test", "--hidden_size", "8",
+    hist = main(["--model", "lstm", "--smoke_test", "--hidden_size", "8",
                  "--batch_size", "4", "--image_size", "32", "--seq_len", "5",
-                 "--bg_mode", "incoherent", "--root", DATA_ROOT, "--save_dir", str(tmp_path)])
-    assert hist["config"]["bg_mode"] == "incoherent" and len(hist["epochs"]) == 2
-
-
-# ------------------------------------------------------ the velocity search window
-def test_search_window_finds_a_minority_motion_under_a_dominant_one():
-    """A large region at (5, 0) and a small patch at (1, 1): the whole surface picks
-    the large one, a |v| <= 2 window the patch -- and max_shift=None is untouched."""
-    from velocity_predictor_model import PhaseCorrelation
-    g = torch.Generator().manual_seed(0)
-    x0 = torch.randn(1, 1, 32, 32, generator=g)
-    x1 = torch.roll(x0, shifts=(0, 5), dims=(2, 3))
-    patch = torch.roll(x0, shifts=(1, 1), dims=(2, 3))
-    x1[..., 8:20, 8:20] = patch[..., 8:20, 8:20]
-    assert PhaseCorrelation(n_modes=1)(x0, x1)[0][0, 0].tolist() == [5.0, 0.0]
-    assert PhaseCorrelation(n_modes=1, max_shift=2)(x0, x1)[0][0, 0].tolist() == [1.0, 1.0]
-
-
-@pytest.mark.parametrize("scope", ["bootstrap", "all"])
-def test_search_window_scope(scope):
-    """'bootstrap' windows only the t=1 estimate, 'all' every step -- for the backbone's
-    own tracker and for the frame-pair sources alike."""
-    net = MotionDigitClassifier(model="melstm", hidden_channels=4, n_slots=1,
-                                velocity_source="tracked", vel_search_radius=2,
-                                vel_search_at=scope)
-    assert net.backbone.phase_corr_bootstrap.max_shift == 2
-    assert net.backbone.phase_corr_track.max_shift == (2 if scope == "all" else None)
-
-    torch.manual_seed(0)
-    fp = MotionDigitClassifier(model="melstm", hidden_channels=4, n_slots=1,
-                               velocity_source="frame_pair", vel_search_radius=2,
-                               vel_search_at=scope).eval()
-    with torch.no_grad():
-        v = fp.encode(torch.rand(8, 6, 1, 32, 32))[1]           # (B, T-1, K, 2), noise
-    speed = v.abs().amax(-1)
-    assert (speed[:, 0] <= 2).all(), "t=1 left the window"
-    if scope == "all":
-        assert (speed <= 2).all(), "a later step left the window"
-    else:
-        assert (speed[:, 1:] > 2).any(), "later steps should search the whole surface"
-
-
-def test_search_window_keeps_checkpoints_compatible():
-    """PhaseCorrelation has no parameters, so a window must not change the state dict."""
-    a = MotionDigitClassifier(model="melstm", hidden_channels=4, n_slots=1)
-    b = MotionDigitClassifier(model="melstm", hidden_channels=4, n_slots=1,
-                              vel_search_radius=2, vel_search_at="all")
-    assert list(a.state_dict()) == list(b.state_dict())
-
-
-def test_training_script_runs_single_slot_tracked_with_a_window(tmp_path):
-    from train_classification import main
-    hist = main(["--model", "melstm", "--smoke_test", "--hidden_size", "8",
-                 "--batch_size", "4", "--image_size", "32", "--seq_len", "5",
-                 "--velocity_source", "tracked", "--num_vel_modes", "1",
-                 "--vel_search_radius", "2", "--bg_mode", "incoherent",
-                 "--root", DATA_ROOT, "--save_dir", str(tmp_path)])
-    assert hist["config"]["vel_search_radius"] == 2
-    assert hist["config"]["vel_search_at"] == "bootstrap"
-    assert hist["parameters"]["n_velocities"] == 1
+                 "--bg_mode", "mirror", "--root", DATA_ROOT, "--save_dir", str(tmp_path)])
+    assert hist["config"]["bg_mode"] == "mirror" and len(hist["epochs"]) == 2

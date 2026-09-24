@@ -105,18 +105,6 @@ def get_args(argv=None):
                         "'bootstrap' (default) explains the dominant motion away first and "
                         "re-correlates the residual, which is what makes the MINORITY "
                         "motion reliably findable -- and therefore what makes K=2 correct.")
-    p.add_argument('--vel_search_radius', type=int, default=None,
-                   help="melstm only: slots may only take velocities with max(|vx|,|vy|) "
-                        "<= this (None = the whole correlation surface). Set it to "
-                        "--data_v_range to search only the digit's own velocities -- on "
-                        "--bg_mode incoherent the digit's peak then competes with 25 cells "
-                        "instead of the whole surface: frame-pair top-1 finds it on 68%% of "
-                        "pairs instead of 31%%. Measured, not a guess.")
-    p.add_argument('--vel_search_at', choices=['bootstrap', 'all'], default='bootstrap',
-                   help="melstm only, with --vel_search_radius: 'bootstrap' windows only the "
-                        "t=1 estimate from the raw pair (x0, x1) -- where each slot is first "
-                        "placed -- and leaves every later step free; 'all' windows every step "
-                        "(tracking included).")
     p.add_argument('--velocity_pool', choices=['attention', 'max', 'mean', 'concat'],
                    default='attention',
                    help="How the velocity axis is reduced before the head. 'max' is the "
@@ -165,13 +153,16 @@ def get_args(argv=None):
                         'already do most of the job, and lstm reaching high accuracy meant '
                         'the dataset was leaking, not that it had learned motion.')
     p.add_argument('--data_v_range', type=int, default=2, help="Figure max speed")
-    p.add_argument('--bg_mode', choices=['opposite', 'disjoint', 'constant', 'incoherent'],
+    p.add_argument('--bg_mode', choices=['opposite', 'mirror', 'disjoint', 'constant'],
                    default='opposite',
                    help="How the background moves. In 'opposite' and 'disjoint' it follows "
                         "the SAME motion law as the figure (--motion_mode etc.), drawn "
                         "independently. 'opposite' (default) keeps it on the SHARED velocity "
-                        "grid and requires it to travel in an opposing direction at t=0 "
-                        "only. 'disjoint' "
+                        "grid and requires it to travel in an opposing direction (negative "
+                        "dot product) at t=0 only -- after that the two may move the same "
+                        "way (7.6%% of steps, measured). 'mirror' sets it to exactly -v_fig "
+                        "at every step: only the figure's motion is drawn, and the background "
+                        "switches whenever the figure does. 'disjoint' "
                         "gives it a faster grid of its own (--bg_speed_min/max), which "
                         "guarantees they never coincide but puts the background BEYOND "
                         "every lattice copy felstm has -- a motion felstm structurally "
@@ -181,9 +172,7 @@ def get_args(argv=None):
                         "background at --bg_velocity for every frame of every sequence, so "
                         "the motion law (and any motion sweep) applies to the figure alone; "
                         "the same felstm caveat holds when --bg_velocity is outside its "
-                        "lattice (max(|vx|,|vy|) > --v_range). 'incoherent' draws FRESH "
-                        "background noise every frame: no background motion for any model "
-                        "to hold still, so the figure is the only coherent motion.")
+                        "lattice (max(|vx|,|vy|) > --v_range).")
     p.add_argument('--bg_velocity', type=int, nargs=2, default=None, metavar=('VX', 'VY'),
                    help="--bg_mode constant only: the background's velocity in px/frame. "
                         "Separated from every figure velocity by construction when "
@@ -340,10 +329,10 @@ def build_datasets(args):
         digit_scale=args.digit_scale, normalize=args.normalize,
         max_speed=args.data_v_range,
         bg_opposite_at_start=(args.bg_mode == "opposite"),
+        bg_mirror=(args.bg_mode == "mirror"),
         bg_speed_range=((args.bg_speed_min, args.bg_speed_max)
                         if args.bg_mode == "disjoint" else None),
         bg_velocity=(tuple(args.bg_velocity) if args.bg_mode == "constant" else None),
-        bg_incoherent=(args.bg_mode == "incoherent"),
         motion_mode=args.motion_mode, transition_mode=args.transition_mode,
         min_segment=args.min_segment, max_segment=args.max_segment,
         return_motion=True, return_mask=want_mask, download=True,
@@ -901,10 +890,10 @@ def main(argv=None):
     print(model.describe())
     print()
     bg_desc = {"opposite": "on the shared grid, opposing direction at t=0",
+               "mirror": "exactly -v_fig at every step (mirror)",
                "disjoint": f"|v| in [{args.bg_speed_min}, {args.bg_speed_max}] "
                            f"(disjoint grid)",
-               "constant": f"fixed at v={tuple(args.bg_velocity or ())}",
-               "incoherent": "fresh noise every frame (no motion)"}[args.bg_mode]
+               "constant": f"fixed at v={tuple(args.bg_velocity or ())}"}[args.bg_mode]
     print(f"data         : figure |v|<={args.data_v_range} ({args.motion_mode}), "
           f"background {bg_desc}, corr_len={args.corr_len}, T={args.seq_len}")
     print(f"seeds        : model {args.model_seed} (init + order), "

@@ -209,12 +209,12 @@ def make_dataset(cfg, motion_kw, seed, train_split, download=False):
         digit_scale=cfg["digit_scale"], normalize=cfg["normalize"],
         max_speed=cfg["data_v_range"],
         bg_opposite_at_start=(cfg["bg_mode"] == "opposite"),
+        bg_mirror=(cfg["bg_mode"] == "mirror"),
         bg_speed_range=((cfg["bg_speed_min"], cfg["bg_speed_max"])
                         if cfg["bg_mode"] == "disjoint" else None),
         # A constant background stays constant in every cell: the cells vary the
         # figure's motion law, and with a fixed background that is ALL they vary.
         bg_velocity=(tuple(cfg["bg_velocity"]) if cfg["bg_mode"] == "constant" else None),
-        bg_incoherent=(cfg["bg_mode"] == "incoherent"),
         return_motion=True,
     )
     if motion_kw is None:                      # the training motion itself
