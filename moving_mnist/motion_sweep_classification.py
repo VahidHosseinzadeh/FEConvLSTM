@@ -209,12 +209,8 @@ def make_dataset(cfg, motion_kw, seed, train_split, download=False):
         digit_scale=cfg["digit_scale"], normalize=cfg["normalize"],
         max_speed=cfg["data_v_range"],
         bg_opposite_at_start=(cfg["bg_mode"] == "opposite"),
-        bg_mirror=(cfg["bg_mode"] == "mirror"),
         bg_speed_range=((cfg["bg_speed_min"], cfg["bg_speed_max"])
                         if cfg["bg_mode"] == "disjoint" else None),
-        # A constant background stays constant in every cell: the cells vary the
-        # figure's motion law, and with a fixed background that is ALL they vary.
-        bg_velocity=(tuple(cfg["bg_velocity"]) if cfg["bg_mode"] == "constant" else None),
         return_motion=True,
     )
     if motion_kw is None:                      # the training motion itself
@@ -450,10 +446,9 @@ def main():
     # say, a seq_len=10 lstm beside a seq_len=15 felstm would otherwise be evaluated
     # silently on the wrong sequences.
     for key in ("seq_len", "image_size", "num_figures", "variant", "corr_len",
-                "digit_scale", "normalize", "data_v_range", "bg_mode", "bg_velocity",
-                "motion_mode", "transition_mode", "min_segment", "max_segment"):
-        # .get: bg_velocity is absent from configs that predate --bg_mode constant.
-        seen = {m: cfg.get(key) for m, (cfg, _, _) in runs.items()}
+                "digit_scale", "normalize", "data_v_range", "bg_mode", "motion_mode",
+                "transition_mode", "min_segment", "max_segment"):
+        seen = {m: cfg[key] for m, (cfg, _, _) in runs.items()}
         if len(set(map(str, seen.values()))) > 1:
             raise SystemExit(
                 f"the selected runs disagree on {key!r}: {seen}\n"

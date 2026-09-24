@@ -390,14 +390,12 @@ def test_state_visualisation_uses_identical_sequences_every_epoch():
         "val is not reproducible after reset_rng; its epoch-to-epoch curve would be " \
         "mostly resampling noise"
 
-    # the train split, by contrast, must keep resampling -- that is the augmentation.
-    # It resamples per EPOCH: a glyph's sequence is keyed on (stream seed, epoch,
-    # index), so it is fresh every epoch and identical under every model seed.
-    c = train_ds[(0, 0)][0].clone()
-    d = train_ds[(1, 0)][0]
+    # the train split, by contrast, must keep resampling -- that is the augmentation
+    c = train_ds[0][0].clone()
+    d = train_ds[0][0]
     assert not torch.equal(c, d), \
         "the train split stopped resampling motion/texture; each glyph should be " \
-        "re-rendered with fresh velocities every epoch"
+        "re-rendered with fresh velocities every access"
 
     # the mask must be present, since it is the answer key beside the states
     assert len(next(iter(state_loader))) > 3, \
@@ -910,137 +908,3 @@ def test_recording_the_curve_does_not_reset_the_training_iterator():
     assert n_batches == 10, (
         f"training loop ran {n_batches} batches over a 10-batch epoch -- the "
         f"recorder reset the training iterator, so the epoch never ends")
-
-
-# ---------------------------------- the training stream and a fixed background
-def test_stream_seed_makes_a_sample_a_function_of_its_key():
-    """
-    With stream_seed, a random=True sample depends on (stream_seed, epoch, index)
-    and nothing else -- not the global np.random, which DataLoader seeds per worker
-    from the MODEL seed, and not the order samples are requested in. That is what
-    lets a model_seed sweep train every seed on the identical sequences.
-    """
-    kw = dict(train=True, random=True, bg_speed_range=None, bg_opposite_at_start=True,
-              stream_seed=11, digit_indices=list(range(50)))
-    a, b = _ds(**kw), _ds(**kw)
-    np.random.seed(0)
-    first = [a[(0, 3)], a[(1, 3)], a[(0, 4)]]
-    np.random.seed(999)                                   # another "model seed"
-    np.random.rand(17)
-    second = [b[(0, 4)], b[(1, 3)], b[(0, 3)]][::-1]      # and another order
-    for x, y in zip(first, second):
-        assert all(torch.equal(torch.as_tensor(p), torch.as_tensor(q))
-                   for p, q in zip(x, y)), "same key, different sample"
-    # a new epoch is a new sequence of the SAME glyph
-    assert not torch.equal(first[0][0], first[1][0])
-    assert first[0][1] == first[1][1]
-    # a plain index is epoch 0
-    assert torch.equal(a[3][0], first[0][0])
-
-
-def test_training_sequences_do_not_depend_on_the_model_seed():
-    """
-    End to end through make_loaders, at num_workers > 0 with persistent workers --
-    the configuration in which the old stream came from the worker seeds. Two model
-    seeds must visit the SAME sequences in an epoch, in different orders, and the
-    next epoch must bring new ones: set_epoch has to reach workers that each hold
-    their own copy of the dataset.
-    """
-    from train_classification import build_datasets, get_args, make_loaders
-
-    def epoch_sequences(model_seed, epoch):
-        args = get_args(["--root", DATA_ROOT, "--seq_len", "4", "--image_size", "32",
-                         "--batch_size", "4", "--num_workers", "2",
-                         "--max_train_samples", "8", "--val_size", "4",
-                         "--test_size", "4"])
-        torch.manual_seed(model_seed)
-        train_ds, val_ds, test_ds = build_datasets(args)
-        loader = make_loaders(args, train_ds, val_ds, test_ds)[0]
-        assert loader.persistent_workers
-        loader.sampler.set_epoch(epoch)
-        seqs = torch.cat([b[0] for b in loader])
-        del loader
-        return seqs
-
-    def as_set(s):
-        return sorted(x.numpy().tobytes() for x in s)
-
-    s1, s2 = epoch_sequences(1, 0), epoch_sequences(2, 0)
-    assert as_set(s1) == as_set(s2), "two model seeds trained on different sequences"
-    assert not torch.equal(s1, s2), "...and should have visited them in different orders"
-    assert as_set(epoch_sequences(1, 1)) != as_set(s1), "a new epoch must bring new sequences"
-
-
-@pytest.mark.parametrize("v", [(4, 0), (3, 0), (0, -3)])
-def test_constant_background_is_exactly_fixed(v):
-    """
-    bg_velocity: the background moves at v on every step of every sequence, the
-    figure stays on its own grid, and the two stay min_dv apart -- by construction
-    when v is at least min_dv off the figure grid, by rejection when it is closer.
-    """
-    ds = _ds(bg_speed_range=None, bg_velocity=v, min_dv=2)
-    ds.reset_rng()
-    assert ds.bg_separation_is_structural == (max(map(abs, v)) - 2 >= 2)
-    fig_grid = set(ds.velocity_grid)
-    for i in range(12):
-        _, _, motion = ds[i]
-        assert (motion[:, 1] == torch.tensor(v)).all(), "background left bg_velocity"
-        assert all(tuple(m.tolist()) in fig_grid for m in motion[:, 0])
-        gap = (motion[:, 0] - motion[:, 1]).abs().amax(dim=1).min()
-        assert int(gap) >= 2, "figure and background came within min_dv"
-
-
-def test_constant_background_refuses_conflicting_options(tmp_path):
-    with pytest.raises(ValueError, match="bg_velocity"):
-        _ds(bg_velocity=(4, 0))                   # _ds defaults to a bg_speed_range
-    with pytest.raises(ValueError, match="bg_velocity"):
-        _ds(bg_speed_range=None, bg_opposite_at_start=True, bg_velocity=(4, 0))
-    from train_classification import main
-    with pytest.raises(SystemExit, match="bg_velocity"):
-        main(["--model", "lstm", "--smoke_test", "--bg_mode", "constant",
-              "--root", DATA_ROOT, "--save_dir", str(tmp_path)])
-
-
-def test_training_script_runs_with_a_constant_background(tmp_path):
-    """The history must record what the run actually trained on."""
-    from train_classification import main
-    hist = main(["--model", "melstm", "--smoke_test", "--hidden_size", "8",
-                 "--batch_size", "4", "--image_size", "32", "--seq_len", "5",
-                 "--bg_mode", "constant", "--bg_velocity", "4", "0",
-                 "--root", DATA_ROOT, "--save_dir", str(tmp_path)])
-    assert hist["config"]["bg_velocity"] == [4, 0]
-    assert hist["config"]["train_stream_seed"] == hist["config"]["data_seed"]
-    assert len(hist["epochs"]) == 2
-
-
-
-def test_background_mirrors_the_figure():
-    """
-    bg_mirror: v_bg = -v_fig at every step -- only the figure is drawn, the
-    background switches exactly when it does, both stay on the shared grid, and the
-    2|v_fig| >= 2 gap makes min_dv=2 hold by construction.
-    """
-    ds = _ds(bg_speed_range=None, bg_mirror=True, min_dv=2, seq_len=15)
-    ds.reset_rng()
-    assert ds.bg_separation_is_structural
-    fig_grid = set(ds.velocity_grid)
-    switched = 0
-    for i in range(24):
-        _, _, motion = ds[i]
-        assert torch.equal(motion[:, 1], -motion[:, 0]), f"sample {i}: not a mirror"
-        assert all(tuple(v) in fig_grid for v in motion[:, 1].tolist())
-        switched += int((motion[1:, 0] != motion[:-1, 0]).any())
-    assert switched > 0, "piecewise figure motion should switch in some sequences"
-
-    with pytest.raises(ValueError, match="bg_mirror"):
-        _ds(bg_speed_range=None, bg_mirror=True, bg_opposite_at_start=True)
-    with pytest.raises(ValueError, match="ONE figure"):
-        _ds(bg_speed_range=None, bg_mirror=True, num_figures=2)
-
-
-def test_training_script_runs_with_a_mirrored_background(tmp_path):
-    from train_classification import main
-    hist = main(["--model", "lstm", "--smoke_test", "--hidden_size", "8",
-                 "--batch_size", "4", "--image_size", "32", "--seq_len", "5",
-                 "--bg_mode", "mirror", "--root", DATA_ROOT, "--save_dir", str(tmp_path)])
-    assert hist["config"]["bg_mode"] == "mirror" and len(hist["epochs"]) == 2
