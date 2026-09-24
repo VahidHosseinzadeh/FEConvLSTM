@@ -153,16 +153,28 @@ def get_args(argv=None):
                         'already do most of the job, and lstm reaching high accuracy meant '
                         'the dataset was leaking, not that it had learned motion.')
     p.add_argument('--data_v_range', type=int, default=2, help="Figure max speed")
-    p.add_argument('--bg_mode', choices=['opposite', 'disjoint'], default='opposite',
-                   help="How the background is kept distinguishable from the figure. "
-                        "'opposite' (default) keeps it on the SHARED velocity grid and "
-                        "requires it to travel in an opposing direction at t=0. 'disjoint' "
+    p.add_argument('--bg_mode', choices=['opposite', 'disjoint', 'constant'],
+                   default='opposite',
+                   help="How the background moves. In 'opposite' and 'disjoint' it follows "
+                        "the SAME motion law as the figure (--motion_mode etc.), drawn "
+                        "independently. 'opposite' (default) keeps it on the SHARED velocity "
+                        "grid and requires it to travel in an opposing direction at t=0 "
+                        "only. 'disjoint' "
                         "gives it a faster grid of its own (--bg_speed_min/max), which "
                         "guarantees they never coincide but puts the background BEYOND "
                         "every lattice copy felstm has -- a motion felstm structurally "
                         "cannot represent while melstm's tracked slots can, which confounds "
                         "expressive power with the effect being measured. Use 'disjoint' "
-                        "only when felstm is not in the comparison.")
+                        "only when felstm is not in the comparison. 'constant' fixes the "
+                        "background at --bg_velocity for every frame of every sequence, so "
+                        "the motion law (and any motion sweep) applies to the figure alone; "
+                        "the same felstm caveat holds when --bg_velocity is outside its "
+                        "lattice (max(|vx|,|vy|) > --v_range).")
+    p.add_argument('--bg_velocity', type=int, nargs=2, default=None, metavar=('VX', 'VY'),
+                   help="--bg_mode constant only: the background's velocity in px/frame. "
+                        "Separated from every figure velocity by construction when "
+                        "max(|VX|,|VY|) >= --data_v_range + 2, e.g. '4 0'; closer than that, "
+                        "figure trajectories that come within 1 px/frame of it are redrawn.")
     p.add_argument('--bg_speed_min', type=int, default=4,
                    help='--bg_mode disjoint only: background min speed, must exceed '
                         '--data_v_range.')
@@ -247,10 +259,20 @@ def get_args(argv=None):
                         'are not comparable to each other.')
     p.add_argument('--model_seed', type=int, default=None,
                    help='Governs the RUN and is what to vary across a seed sweep: weight '
-                        'initialisation and the order training data is visited. None = '
+                        'initialisation and the order training data is visited -- and '
+                        'nothing else, as long as --train_stream_seed is held fixed. None = '
                         'follow --data_seed. Vary this alone and every run is scored on '
                         'the identical val set, so the spread you measure is run-to-run '
                         'variance rather than a different benchmark each time.')
+    p.add_argument('--train_stream_seed', type=int, default=None,
+                   help='Governs the TRAINING SEQUENCES: every training sample (motion of '
+                        'both layers, textures, placement) is a function of (this seed, '
+                        'epoch, glyph index) only. None = follow --data_seed, so a model_seed '
+                        'sweep trains every seed on the identical sequences, only visited in '
+                        'a different order. Vary this with model_seed held fixed to measure '
+                        'the data stream\'s share of the seed-to-seed spread. (Before it '
+                        'existed the samples came from np.random seeded per DataLoader worker '
+                        'from the model seed, so every model_seed also saw different data.)')
     p.add_argument('--run_name', type=str, default=None)
     p.add_argument('--save_dir', type=str, default='./experiments_classification/')
     p.add_argument('--resume', type=str, default=None)
@@ -306,6 +328,7 @@ def build_datasets(args):
         bg_opposite_at_start=(args.bg_mode == "opposite"),
         bg_speed_range=((args.bg_speed_min, args.bg_speed_max)
                         if args.bg_mode == "disjoint" else None),
+        bg_velocity=(tuple(args.bg_velocity) if args.bg_mode == "constant" else None),
         motion_mode=args.motion_mode, transition_mode=args.transition_mode,
         min_segment=args.min_segment, max_segment=args.max_segment,
         return_motion=True, return_mask=want_mask, download=True,
@@ -324,7 +347,12 @@ def build_datasets(args):
     val_idx = perm[:n_val].tolist()
     train_idx = perm[n_val:].tolist()
 
+    # Keyed per (stream seed, epoch, glyph index), so the training sequences do not
+    # depend on --model_seed; make_loaders' sampler supplies the epoch.
+    stream_seed = (args.data_seed if getattr(args, "train_stream_seed", None) is None
+                   else args.train_stream_seed)
     train = CommonFateMovingMNISTDataset(train=True, random=True, seed=args.data_seed,
+                                         stream_seed=stream_seed,
                                          digit_indices=train_idx, **common)
     # Val and test are both FIXED benchmarks: seeded and stateful, so reset_rng()
     # before every pass and never use persistent workers (they would carry
@@ -337,16 +365,48 @@ def build_datasets(args):
     return train, val, test
 
 
+class EpochShuffleSampler(torch.utils.data.Sampler):
+    """
+    Shuffled (epoch, index) pairs for a dataset keyed on stream_seed.
+
+    The epoch travels WITH each index so the dataset can key every sample on
+    (stream_seed, epoch, index): a fresh sequence per glyph per epoch, and the same
+    one under every model seed. It cannot be set on the dataset instead -- with
+    persistent workers each worker holds its own copy of the dataset, and an
+    attribute set in the main process never reaches it. The sampler lives in the
+    main process, so set_epoch() does.
+
+    The ORDER is drawn from the global torch RNG, i.e. from --model_seed, exactly as
+    shuffle=True drew it before.
+    """
+
+    def __init__(self, indices):
+        self.indices = list(indices)
+        self.epoch = 0
+
+    def set_epoch(self, epoch):
+        self.epoch = int(epoch)
+
+    def __iter__(self):
+        perm = torch.randperm(len(self.indices)).tolist()
+        return iter([(self.epoch, self.indices[j]) for j in perm])
+
+    def __len__(self):
+        return len(self.indices)
+
+
 def make_loaders(args, train_ds, val_ds, test_ds):
     # The datasets already hold disjoint glyph pools; these only cap how many of
-    # them an epoch visits.
-    tr, va = train_ds, val_ds
-    if args.max_train_samples and args.max_train_samples < len(tr):
-        tr = Subset(tr, list(range(args.max_train_samples)))
+    # them an epoch visits. The training cap goes into the sampler rather than a
+    # Subset, because the sampler hands the dataset (epoch, index) pairs.
+    n_train = len(train_ds)
+    va = val_ds
+    if args.max_train_samples and args.max_train_samples < n_train:
+        n_train = args.max_train_samples
     if args.val_size and args.val_size < len(va):
         va = Subset(va, list(range(args.val_size)))
     if args.smoke_test:
-        tr = Subset(tr, list(range(2 * args.batch_size)))
+        n_train = min(n_train, 2 * args.batch_size)
         va = Subset(va, list(range(args.batch_size)))
 
     te = test_ds
@@ -376,7 +436,8 @@ def make_loaders(args, train_ds, val_ds, test_ds):
     st = Subset(test_ds, state_idx)
 
     kw = dict(num_workers=args.num_workers, pin_memory=torch.cuda.is_available())
-    return (DataLoader(tr, batch_size=args.batch_size, shuffle=True,
+    return (DataLoader(train_ds, batch_size=args.batch_size,
+                       sampler=EpochShuffleSampler(range(n_train)),
                        persistent_workers=args.num_workers > 0, **kw),
             DataLoader(va, batch_size=args.batch_size, persistent_workers=False, **kw),
             DataLoader(te, batch_size=args.batch_size, persistent_workers=False, **kw),
@@ -766,6 +827,19 @@ def main(argv=None):
             "That is a difference in expressive power confounded with the effect being "
             "measured. Prefer --bg_mode opposite for a three-way comparison.",
             UserWarning)
+    if (args.bg_mode == "constant") != (args.bg_velocity is not None):
+        raise SystemExit("--bg_velocity VX VY is required with --bg_mode constant, "
+                         "and only meaningful with it.")
+    if (args.bg_mode == "constant" and args.model == "felstm"
+            and max(abs(c) for c in args.bg_velocity) > args.v_range):
+        warnings.warn(
+            f"--bg_velocity {args.bg_velocity} is outside felstm's lattice "
+            f"(|v| <= {args.v_range}), so no felstm copy moves with the background "
+            f"while melstm's slots can. Compare the models knowing that, or raise "
+            f"--v_range (cost grows as (2R+1)^2).", UserWarning)
+    # Resolved here, so the history json records the stream a run actually trained on.
+    if args.train_stream_seed is None:
+        args.train_stream_seed = args.data_seed
     if args.model == "felstm" and args.v_range < args.data_v_range:
         raise SystemExit(
             f"--v_range ({args.v_range}) < --data_v_range ({args.data_v_range}): "
@@ -811,16 +885,20 @@ def main(argv=None):
     print(f"pool         : {args.velocity_pool}")
     print(model.describe())
     print()
-    bg_desc = ("on the shared grid, opposing direction at t=0"
-               if args.bg_mode == "opposite"
-               else f"|v| in [{args.bg_speed_min}, {args.bg_speed_max}] (disjoint grid)")
+    bg_desc = {"opposite": "on the shared grid, opposing direction at t=0",
+               "disjoint": f"|v| in [{args.bg_speed_min}, {args.bg_speed_max}] "
+                           f"(disjoint grid)",
+               "constant": f"fixed at v={tuple(args.bg_velocity or ())}"}[args.bg_mode]
     print(f"data         : figure |v|<={args.data_v_range} ({args.motion_mode}), "
           f"background {bg_desc}, corr_len={args.corr_len}, T={args.seq_len}")
+    print(f"seeds        : model {args.model_seed} (init + order), "
+          f"train stream {args.train_stream_seed} (the sequences), data {args.data_seed} "
+          f"(glyph split)")
     test_curve_batches = (math.ceil(args.test_curve_size / args.batch_size)
                           if args.test_curve_size else None)
     print(f"batches      : train {len(train_loader)}, val {len(val_loader)}, "
           f"test {len(test_loader)}  (chance accuracy = 10%)")
-    print(f"glyphs       : train {len(train_loader.dataset)}, "
+    print(f"glyphs       : train {len(train_loader.sampler)}, "
           f"val {len(val_loader.dataset)}, test {len(test_loader.dataset)} "
           f"(disjoint pools; test is MNIST's own split)")
 
@@ -859,7 +937,8 @@ def main(argv=None):
         # series differ only in size and cadence.
         curve = ValCurveRecorder(val_ds, args.val_curve_size,
                                  args.val_curve_interval, device, args.batch_size,
-                                 bn_dataset=train_loader.dataset,
+                                 bn_dataset=Subset(train_loader.dataset,
+                                                   train_loader.sampler.indices),
                                  bn_batches=args.val_curve_bn_batches)
 
     if args.resume and Path(args.resume).exists():
@@ -873,6 +952,7 @@ def main(argv=None):
 
     for epoch in range(start_epoch, args.epochs):
         t0 = time.time()
+        train_loader.sampler.set_epoch(epoch)     # fresh sequences, same for every model seed
         tr = run_epoch(model, train_loader, device, args.num_figures, criterion,
                        optimizer, args.grad_clip, curve=curve, global_step=global_step,
                        curve_log_fn=curve_log_fn)

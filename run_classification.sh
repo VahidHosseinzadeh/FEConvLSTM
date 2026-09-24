@@ -22,14 +22,19 @@
 # Early stopping is OFF (--early_stop_patience 0): every model runs the full
 # EPOCHS so the three curves are directly comparable end to end.
 #
-# SEEDS. Two of them, and they do different jobs:
+# SEEDS. Three of them, and they do different jobs:
 #
 #   --data_seed  (fixed at 42 below) governs the DATA: the 54000/6000 train/val
 #                glyph split and the seeded val/test benchmarks. Hold it fixed,
 #                or each run is scored against a different benchmark and the
 #                numbers stop being comparable.
-#   SEED         governs the RUN: weight init and the order data is visited.
-#                This is the one to vary.
+#   SEED         governs the RUN: weight init and the order data is visited --
+#                nothing else. This is the one to vary.
+#   STREAM_SEED  governs the TRAINING SEQUENCES (every layer's motion, textures,
+#                placement). Empty = follow --data_seed, so every SEED trains on
+#                the identical sequences in a different order. Vary it with SEED
+#                fixed to measure how much of the seed-to-seed spread is the data.
+#                (Runs before 2026-09-23 drew their sequences from the model seed.)
 #
 #   SEED=0 bash run_classification.sh melstm
 #   for s in 0 1 2; do SEED=$s sbatch --job-name=cf_melstm_s$s \
@@ -39,6 +44,7 @@
 set -e
 MODEL=${1:?usage: bash run_classification.sh lstm|felstm|melstm}
 SEED=${SEED:-0}
+STREAM_SEED=${STREAM_SEED:-}
 
 # ---- shared ---------------------------------------------------------------
 HIDDEN=32
@@ -75,13 +81,23 @@ POOL=max           # MEASURED, not assumed. With attention, felstm sat at chance
 # ---- data -----------------------------------------------------------------
 DATA_V=2           # figure max speed. felstm needs V_RANGE >= this, and its cost
                    # grows as (2R+1)^2, so raising it is expensive for felstm only.
-BG_MODE=opposite   # background stays ON the shared velocity grid and is separated by
+BG_MODE=${BG_MODE:-opposite}
+                   # opposite: background stays ON the shared velocity grid and is separated by
                    # DIRECTION (opposing the digit at t=0) rather than by speed.
                    # 'disjoint' would guarantee separation by making the background
                    # faster than any figure -- but that puts it beyond every lattice
                    # copy felstm has, so felstm could not represent the background at
                    # all while melstm's tracked slots could: expressive power
                    # confounded with the effect being measured.
+                   # Both 'opposite' and 'disjoint' move the background under the SAME
+                   # motion law as the digit (piecewise here), so it switches too.
+                   # constant: the background moves at BG_VEL on every frame of every
+                   # sequence and only the digit's motion is random, e.g.
+                   #   BG_MODE=constant BG_VEL="4 0" TAG=bg40 sbatch ... melstm
+                   # "4 0" is off the digit grid (|v|<=2) by a margin of 2, so the two
+                   # never come closer than 2 px/frame by construction. It is also off
+                   # felstm's lattice (V_RANGE=2): no felstm copy moves with it.
+BG_VEL=${BG_VEL:-} # "VX VY", --bg_mode constant only
 MOTION=piecewise   # figure velocity held 3-6 frames, then changes
 CORR_LEN=0.0       # LEAVE AT 0. Above 0 the texture seam marks the digit's outline in
                    # every single frame: a single-frame CNN with no temporal information
@@ -126,7 +142,7 @@ python moving_mnist/train_classification.py \
   --velocity_pool $POOL --v_range $V_RANGE --num_vel_modes $N_SLOTS \
   --velocity_source $VEL_SRC \
   --seq_len $SEQ_LEN --image_size $IMAGE \
-  --data_v_range $DATA_V --bg_mode $BG_MODE \
+  --data_v_range $DATA_V --bg_mode $BG_MODE ${BG_VEL:+--bg_velocity $BG_VEL} \
   --motion_mode $MOTION --corr_len $CORR_LEN \
   --batch_size $BATCH --epochs $EPOCHS --lr $LR \
   ${TRAIN_SAMPLES:+--max_train_samples $TRAIN_SAMPLES} \
@@ -135,6 +151,6 @@ python moving_mnist/train_classification.py \
   --use_lr_scheduler --early_stop_patience 0 \
   --val_curve_interval $CURVE_EVERY --val_curve_size $CURVE_SIZE \
   --save_dir $SAVE_DIR \
-  --data_seed 42 --model_seed $SEED \
+  --data_seed 42 --model_seed $SEED ${STREAM_SEED:+--train_stream_seed $STREAM_SEED} \
   --run_name "cf_cls_${MODEL}_s${SEED}" \
   "${@:2}"

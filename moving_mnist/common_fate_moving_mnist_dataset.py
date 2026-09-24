@@ -263,7 +263,7 @@ class _ParentRNG:
         self._ds = ds
 
     def _src(self):
-        return np.random if self._ds.random else self._ds.rng
+        return self._ds._src_rng()
 
     def standard_normal(self, size=None):
         return self._src().standard_normal(size)
@@ -382,6 +382,18 @@ class CommonFateMovingMNISTDataset(TDMovingMNISTDataset):
                     figures -- only its alphabet of velocities differs.
                     None (default) draws the background from the figure grid and
                     enforces separation by rejection instead.
+    bg_velocity   : (vx, vy) -- the background moves at exactly this velocity at
+                    every step of every sequence; only the figures' motion is
+                    drawn. Any integer velocity, on or off the figure grid. The
+                    motion law (motion_mode, p_change, ...) then applies to the
+                    figures alone, so a motion sweep varies the figure and nothing
+                    else -- by default the background is drawn under the SAME law
+                    as the figures and every sweep axis moves both layers.
+                    Separation is structural when max(|vx|,|vy|) - max_speed >=
+                    min_dv, and by whole-trajectory rejection of the figure
+                    otherwise. Exclusive with bg_speed_range and
+                    bg_opposite_at_start. Off felstm's lattice (|v| > v_range) it is
+                    a motion felstm cannot represent -- the caveat above applies.
     separate_figures : also require that gap pairwise BETWEEN figures. Off by
                     default: two figures sharing a velocity are one motion group
                     but still two shapes, which is fine for classification and
@@ -400,6 +412,17 @@ class CommonFateMovingMNISTDataset(TDMovingMNISTDataset):
                     rescales per sequence, making contrast sequence-dependent
                     and letting the extremes leak information; 'none' hands back
                     raw sigma units.
+    stream_seed   : when set, every sample draws ALL its randomness (placement,
+                    both layers' motion, every texture, extra glyphs) from its own
+                    RNG keyed on (stream_seed, epoch, index). Index the dataset
+                    with (epoch, index) to get a fresh sample per epoch; a plain
+                    index means epoch 0. A sample is then a function of those three
+                    numbers alone -- not of the worker that renders it, the order
+                    it is requested in, or the global RNG. That is what makes a
+                    random=True training stream identical across model seeds:
+                    without it, draws come from the global np.random, which
+                    DataLoader seeds per worker from the torch RNG, i.e. from the
+                    model seed. None (default) keeps the parent's contract.
     motion_mode   : defaults to 'constant' here rather than the parent's
                     'piecewise', because a constant velocity is what the
                     co-moving-transport analysis assumes. Pass any of the
@@ -423,6 +446,7 @@ class CommonFateMovingMNISTDataset(TDMovingMNISTDataset):
         separate_figures=False,
         bg_opposite_at_start=False,
         bg_speed_range=None,
+        bg_velocity=None,
         max_velocity_tries=200,
         normalize="affine",
         clip=3.0,
@@ -454,6 +478,7 @@ class CommonFateMovingMNISTDataset(TDMovingMNISTDataset):
         download=True,
         random=True,
         seed=42,
+        stream_seed=None,
         max_tries=200,
     ):
         if variant not in ("moving_mask", "static_mask"):
@@ -464,10 +489,22 @@ class CommonFateMovingMNISTDataset(TDMovingMNISTDataset):
                 f"normalize must be 'affine', 'minmax' or 'none', got {normalize!r}")
         if num_figures < 1:
             raise ValueError(f"num_figures must be >= 1, got {num_figures}")
-        if min_dv > 2 * max_speed and bg_speed_range is None:
+        if bg_velocity is not None:
+            bg_velocity = tuple(int(c) for c in bg_velocity)
+            if len(bg_velocity) != 2:
+                raise ValueError(f"bg_velocity must be (vx, vy), got {bg_velocity!r}")
+            if bg_speed_range is not None or bg_opposite_at_start:
+                raise ValueError(
+                    "bg_velocity fixes the background's motion outright; it cannot be "
+                    "combined with bg_speed_range or bg_opposite_at_start.")
+        if stream_seed is not None and int(stream_seed) < 0:
+            raise ValueError(f"stream_seed must be >= 0, got {stream_seed}")
+        max_gap = (max_speed + max(abs(c) for c in bg_velocity)
+                   if bg_velocity is not None else 2 * max_speed)
+        if min_dv > max_gap and bg_speed_range is None:
             raise ValueError(
                 f"min_dv={min_dv} is unsatisfiable with max_speed={max_speed} "
-                f"(the largest possible separation is {2 * max_speed}).")
+                f"(the largest possible separation is {max_gap}).")
 
         if bg_speed_range is not None:
             lo, hi = bg_speed_range
@@ -551,6 +588,12 @@ class CommonFateMovingMNISTDataset(TDMovingMNISTDataset):
             # covers min_dv the constraint is a theorem, not a sample-time
             # check, and the rejection loop can skip it entirely.
             self.bg_separation_is_structural = (lo - max_speed) >= min_dv
+        self.bg_velocity = bg_velocity
+        if bg_velocity is not None:
+            self.bg_separation_is_structural = (
+                max(abs(c) for c in bg_velocity) - max_speed) >= min_dv
+        self.stream_seed = None if stream_seed is None else int(stream_seed)
+        self._sample_rng = None
         self.max_velocity_tries = max_velocity_tries
         self.normalize = normalize
         self.clip = float(clip)
@@ -570,6 +613,19 @@ class CommonFateMovingMNISTDataset(TDMovingMNISTDataset):
         return len(self.mnist) if self.digit_indices is None else len(self.digit_indices)
 
     def __getitem__(self, index):
+        epoch = 0
+        if isinstance(index, tuple):          # (epoch, index), see stream_seed
+            epoch, index = index
+        if self.stream_seed is None:
+            return self._render(index)
+        self._sample_rng = np.random.RandomState(np.random.MT19937(
+            np.random.SeedSequence([self.stream_seed, int(epoch), int(index)])))
+        try:
+            return self._render(index)
+        finally:
+            self._sample_rng = None
+
+    def _render(self, index):
         S, N = self.image_size, self.num_figures
 
         glyphs, labels = self._sample_glyphs(index)
@@ -615,6 +671,28 @@ class CommonFateMovingMNISTDataset(TDMovingMNISTDataset):
         if self.return_mask:
             out.append(torch.from_numpy(track))                        # (T, N, H, W)
         return tuple(out)
+
+    # ------------------------------------------------------------------
+    # RNG: the parent's three draw helpers, routed through the per-sample
+    # stream when one is active. Otherwise identical to the parent's, draw for
+    # draw, so fixed benchmarks generated before stream_seed existed reproduce.
+    # ------------------------------------------------------------------
+
+    def _src_rng(self):
+        # getattr: the parent's __init__ runs before this class sets the attribute.
+        rng = getattr(self, "_sample_rng", None)
+        if rng is not None:
+            return rng
+        return np.random if self.random else self.rng
+
+    def _randint(self, low, high):
+        return int(self._src_rng().randint(low, high))
+
+    def _choice(self, values):
+        return values[self._src_rng().randint(len(values))]
+
+    def _random(self):
+        return self._src_rng().rand()
 
     # ------------------------------------------------------------------
     # Sampling helpers
@@ -742,14 +820,19 @@ class CommonFateMovingMNISTDataset(TDMovingMNISTDataset):
 
     def _generate_split_grid_motion(self):
         """
-        Figures on the figure grid, background on its own -- concatenated into
-        the usual (T, N+1, 2) layout with the background last.
+        Figures on the figure grid, background on its own grid or fixed at
+        bg_velocity -- concatenated into the usual (T, N+1, 2) layout with the
+        background last.
         """
         N = self.num_figures
         with self._velocity_grid(self.velocity_grid, N):
             fig = self._generate_motion_trajectory()          # (T, N, 2)
-        with self._velocity_grid(self.bg_velocity_grid, 1):
-            bg = self._generate_motion_trajectory()           # (T, 1, 2)
+        if self.bg_velocity is not None:
+            bg = torch.tensor(self.bg_velocity, dtype=torch.long).expand(
+                fig.shape[0], 1, 2).clone()                   # no draw at all
+        else:
+            with self._velocity_grid(self.bg_velocity_grid, 1):
+                bg = self._generate_motion_trajectory()       # (T, 1, 2)
         return torch.cat([fig, bg], dim=1)                    # (T, N+1, 2)
 
     def _sample_separated_motion(self):
@@ -761,7 +844,8 @@ class CommonFateMovingMNISTDataset(TDMovingMNISTDataset):
         change the velocity statistics this class inherits -- which is the one
         thing a subclass of TDMovingMNISTDataset must not do.
         """
-        draw = (self._generate_split_grid_motion if self.bg_velocity_grid is not None
+        split = self.bg_velocity_grid is not None or self.bg_velocity is not None
+        draw = (self._generate_split_grid_motion if split
                 else self._generate_motion_trajectory)
         motions = None
         for _ in range(self.max_velocity_tries):
