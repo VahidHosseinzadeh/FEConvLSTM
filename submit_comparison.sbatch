@@ -6,6 +6,7 @@
   # sbatch --job-name=melstm submit_comparison.sbatch melstm
   # sbatch --job-name=felstm submit_comparison.sbatch felstm
   # sbatch --job-name=lstm   submit_comparison.sbatch lstm
+  # sbatch --job-name=felstm_ms3 submit_comparison.sbatch felstm 3   # model seed 3
 #
 # Monitor:
 #   squeue -u $USER
@@ -43,8 +44,11 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --output=slurm_%x_%j.log
 
-MODEL=${1:?usage: sbatch submit_comparison.sbatch lstm|felstm|melstm}
-SAVE_DIR=./experiments   # must match run_comparison.sh's SAVE_DIR
+MODEL=${1:?usage: sbatch submit_comparison.sbatch lstm|felstm|melstm [model_seed]}
+MODEL_SEED=${2:-42}
+# must match run_comparison.sh's SAVE_DIR (one directory per model seed)
+if [ "$MODEL_SEED" = "42" ]; then SAVE_DIR=./experiments
+else SAVE_DIR=./experiments_ms${MODEL_SEED}; fi
 RUN_STATE_DIR="${SAVE_DIR}/run_state"
 
 TIME_LIMIT_SEC=$((24 * 3600))
@@ -55,7 +59,7 @@ RESUBMIT_COUNT_FILE="${RUN_STATE_DIR}/.resubmit_count_${MODEL}"
 RESUBMIT_COUNT=$(cat "$RESUBMIT_COUNT_FILE" 2>/dev/null || echo 0)
 
 START_TS=$(date +%s)
-bash run_comparison.sh "$MODEL"
+bash run_comparison.sh "$MODEL" "$MODEL_SEED"
 ELAPSED=$(( $(date +%s) - START_TS ))
 
 if ls ${RUN_STATE_DIR}/DONE_${MODEL}_*.flag >/dev/null 2>&1; then
@@ -65,7 +69,7 @@ if ls ${RUN_STATE_DIR}/DONE_${MODEL}_*.flag >/dev/null 2>&1; then
 elif [ "$ELAPSED" -ge "$NEAR_LIMIT_SEC" ] && [ "$RESUBMIT_COUNT" -lt "$MAX_RESUBMITS" ]; then
   echo ">>> Ran ${ELAPSED}s (near the ${TIME_LIMIT_SEC}s limit) without finishing — resubmitting (attempt $((RESUBMIT_COUNT + 1))/$MAX_RESUBMITS)."
   echo $((RESUBMIT_COUNT + 1)) > "$RESUBMIT_COUNT_FILE"
-  sbatch --job-name="$SLURM_JOB_NAME" "$0" "$MODEL"
+  sbatch --job-name="$SLURM_JOB_NAME" "$0" "$MODEL" "$MODEL_SEED"
 
 elif [ "$RESUBMIT_COUNT" -ge "$MAX_RESUBMITS" ]; then
   echo ">>> Hit the $MAX_RESUBMITS-resubmission cap without finishing — stopping. Check this model's wandb run (or slurm_${SLURM_JOB_NAME}_*.log) for why it's stuck (not just slow)."

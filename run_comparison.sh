@@ -2,9 +2,15 @@
 # Three-model comparison launcher. Run from the repo root (FEConvLSTM/):
 #
 #   tmux new -s melstm
-#   bash run_comparison.sh melstm
+#   bash run_comparison.sh melstm            # the original run (model seed 42)
+#   bash run_comparison.sh melstm 3          # same experiment, model seed 3
 #
 # One model per invocation (one tmux session each): lstm | felstm | melstm.
+# The optional second argument is the MODEL seed. The data seed stays 42, so the
+# MNIST train/val split is the same in every run; the model seed sets the weight
+# init, the shuffle order and the on-the-fly training sequences (the DataLoader
+# workers' RNGs are drawn from the torch RNG after it is reseeded with it). The
+# test and len-gen sets are fixed (seeds 123 / 42 in train.py) and unaffected.
 # Auto-resumes from the newest matching checkpoint_*.pth if a previous
 # attempt crashed. If you CHANGE any setting below, delete the stale
 # checkpoints first (rm experiments/run_state/checkpoint_<model>_*.pth) so
@@ -16,7 +22,8 @@
 #   run_state/  internal recovery machinery (checkpoints, DONE flags)
 
 set -e
-MODEL=${1:?usage: bash run_comparison.sh lstm|felstm|melstm}
+MODEL=${1:?usage: bash run_comparison.sh lstm|felstm|melstm [model_seed]}
+MODEL_SEED=${2:-42}
 
 # ---- shared settings: MUST be identical across the three runs -------------
 HIDDEN=32          # cheap: felstm's cost scales ~quadratically in hidden on top of its
@@ -51,8 +58,17 @@ EPOCHS=50          # generous shared ceiling; early stopping (below) ends lstm/m
 MIN_EPOCHS=40      # no early stop before this many epochs (gives the LR scheduler,
                    # patience=5, room to cut LR at least once first)
 EARLY_STOP_PATIENCE=0   # ~2-3 LR reductions' worth of chances before giving up
-SEED=42
-SAVE_DIR=./experiments
+SEED=42            # DATA seed -- fixed; vary the model seed (2nd argument) instead
+# One save dir per model seed: auto-resume below takes the newest
+# checkpoint_<model>_*.pth in run_state/ whatever its seed, and the DONE flags and
+# resubmit counters are per model, so seeds sharing a directory would resume and
+# stop each other. Seed 42 keeps the original ./experiments.
+# (submit_comparison.sbatch computes the same path -- keep the two in step.)
+if [ "$MODEL_SEED" = "$SEED" ]; then SAVE_DIR=./experiments
+else SAVE_DIR=./experiments_ms${MODEL_SEED}; fi
+# Seed 42 keeps its original wandb name; the others say both seeds.
+if [ "$MODEL_SEED" = "$SEED" ]; then NAME_SUFFIX="s${SEED}"
+else NAME_SUFFIX="s${SEED}_ms${MODEL_SEED}"; fi
 
 # Bash array, not a backslash-continued string: a single stray trailing
 # space after a "\" silently breaks string continuation (bash starts
@@ -68,7 +84,7 @@ COMMON=(
   --batch_size "$BATCH"
   --grad_clip 1.0
   --data_seed "$SEED"
-  --model_seed "$SEED"
+  --model_seed "$MODEL_SEED"
   --image_size "$IMAGE"
   --seq_len "$SEQ_LEN"
   --input_frames "$INPUT_FRAMES"
@@ -92,15 +108,15 @@ COMMON=(
 
 case $MODEL in
   lstm)
-    EXTRA=(--model lstm --v_range 0 --wandb_name "lstm_h${HIDDEN}_s${SEED}") ;;
+    EXTRA=(--model lstm --v_range 0 --wandb_name "lstm_h${HIDDEN}_${NAME_SUFFIX}") ;;
   felstm)
     # --show_h_state: FELSTM's counterpart to melstm's --check_velocity_predictor
     # report — logs the per-(vx,vy) candidate h-slot maps to wandb.
-    EXTRA=(--model felstm --v_range 2 --show_h_state --wandb_name "felstm_h${HIDDEN}_s${SEED}") ;;
+    EXTRA=(--model felstm --v_range 2 --show_h_state --wandb_name "felstm_h${HIDDEN}_${NAME_SUFFIX}") ;;
   melstm)
     # eval_velocity_mode both: honest val drives selection, oracle val logged
     # alongside (velocity-vs-rendering decomposition). MELSTM-only effect.
-    EXTRA=(--model melstm --num_vel_modes 2 --eval_velocity_mode both --wandb_name "melstm_h${HIDDEN}_s${SEED}") ;;
+    EXTRA=(--model melstm --num_vel_modes 2 --eval_velocity_mode both --wandb_name "melstm_h${HIDDEN}_${NAME_SUFFIX}") ;;
   *)
     echo "unknown model: $MODEL"; exit 1 ;;
 esac
@@ -123,5 +139,8 @@ fi
 # expandable_segments: reduces allocator fragmentation on long runs (the
 # "reserved but unallocated" growth in the OOM report)
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+# wandb recorded no git info for the original runs, so say it in the log.
+echo ">>> commit $(git rev-parse --short HEAD 2>/dev/null)  model=$MODEL  data_seed=$SEED  model_seed=$MODEL_SEED  save_dir=$SAVE_DIR"
 
 python moving_mnist/train.py "${COMMON[@]}" "${EXTRA[@]}" "${RESUME[@]}"
