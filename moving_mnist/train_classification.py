@@ -183,6 +183,10 @@ def get_args(argv=None):
     p.add_argument('--weight_decay', type=float, default=0.0)
     p.add_argument('--grad_clip', type=float, default=1.0)
     p.add_argument('--num_workers', type=int, default=4)
+    p.add_argument('--distinct_worker_streams', action='store_true',
+                   help='Give every DataLoader worker its own reproducible RNG stream (fixed val/test sets '
+                        'otherwise share textures, positions and motions across workers). Off by default '
+                        'because it changes the benchmark sets. See worker_seeding.py.')
     p.add_argument('--max_train_samples', type=int, default=None,
                    help='Cap on training glyphs per epoch (None = all of them, 54000 at '
                         'the default --val_fraction). Each glyph is re-rendered with fresh '
@@ -376,6 +380,9 @@ def make_loaders(args, train_ds, val_ds, test_ds):
     st = Subset(test_ds, state_idx)
 
     kw = dict(num_workers=args.num_workers, pin_memory=torch.cuda.is_available())
+    if getattr(args, 'distinct_worker_streams', False) and args.num_workers > 0:
+        from worker_seeding import worker_init_fn
+        kw['worker_init_fn'] = worker_init_fn
     return (DataLoader(tr, batch_size=args.batch_size, shuffle=True,
                        persistent_workers=args.num_workers > 0, **kw),
             DataLoader(va, batch_size=args.batch_size, persistent_workers=False, **kw),

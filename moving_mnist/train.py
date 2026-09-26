@@ -119,6 +119,11 @@ def main():
     parser.add_argument('--gen_input_frames', type=int, default=15, help='Encoder input frame count used **only** for the length-generalization experiment (separate from --input_frames, which is used for train/val/test)')
     parser.add_argument('--batch_size', type=int, default=128)
     parser.add_argument('--num_workers', type=int, default=4, help='DataLoader worker processes (0 = load on the main process, no parallelism)')
+    parser.add_argument('--distinct_worker_streams', action='store_true',
+                        help='Give every DataLoader worker its own (reproducible) RNG stream. Without it the fixed '
+                             'benchmark sets (test / len-gen, random=False) are duplicated num_workers times, which '
+                             'leaves means unbiased but error bars too small. Off by default: it changes which '
+                             'sequences those sets contain. See worker_seeding.py.')
     parser.add_argument('--epochs', type=int, default=50)
     parser.add_argument('--min_epochs', type=int, default=50, help='Minimum number of epochs before early stopping can trigger (no effect unless --early_stop_patience > 0)')
     parser.add_argument('--early_stop_patience', type=int, default=0,
@@ -412,6 +417,11 @@ def main():
         pin_memory=(device.type == 'cuda'),
         persistent_workers=(args.num_workers > 0),
     )
+    worker_kw = {}
+    if args.distinct_worker_streams and args.num_workers > 0:
+        from worker_seeding import worker_init_fn
+        worker_kw = dict(worker_init_fn=worker_init_fn)
+        loader_kwargs.update(worker_kw)
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, **loader_kwargs)
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, **loader_kwargs)
     # persistent_workers=False on purpose for the two fixed benchmark sets:
@@ -424,6 +434,7 @@ def main():
         num_workers=args.num_workers,
         pin_memory=(device.type == 'cuda'),
         persistent_workers=False,
+        **worker_kw,
     )
     test_loader = DataLoader(test_dataset, batch_size=args.batch_size, **fixed_loader_kwargs)
     gen_test_loader = DataLoader(gen_test_dataset,
