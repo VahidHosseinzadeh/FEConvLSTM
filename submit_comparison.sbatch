@@ -7,6 +7,7 @@
   # sbatch --job-name=felstm submit_comparison.sbatch felstm
   # sbatch --job-name=lstm   submit_comparison.sbatch lstm
   # sbatch --job-name=felstm_ms3 submit_comparison.sbatch felstm 3   # model seed 3
+  # sbatch --job-name=melstm_xp_ms3 submit_comparison.sbatch melstm 3 propose   # track mode
 #
 # Monitor:
 #   squeue -u $USER
@@ -46,9 +47,11 @@
 
 MODEL=${1:?usage: sbatch submit_comparison.sbatch lstm|felstm|melstm [model_seed]}
 MODEL_SEED=${2:-42}
-# must match run_comparison.sh's SAVE_DIR (one directory per model seed)
-if [ "$MODEL_SEED" = "42" ]; then SAVE_DIR=./experiments
-else SAVE_DIR=./experiments_ms${MODEL_SEED}; fi
+TRACK_MODE=${3:-h}
+# must match run_comparison.sh's SAVE_DIR (one directory per model seed and track mode)
+if [ "$TRACK_MODE" = h ]; then VARIANT=""; else VARIANT="_x${TRACK_MODE}"; fi
+if [ "$MODEL_SEED" = "42" ]; then SAVE_DIR=./experiments${VARIANT}
+else SAVE_DIR=./experiments_ms${MODEL_SEED}${VARIANT}; fi
 RUN_STATE_DIR="${SAVE_DIR}/run_state"
 
 TIME_LIMIT_SEC=$((24 * 3600))
@@ -59,7 +62,7 @@ RESUBMIT_COUNT_FILE="${RUN_STATE_DIR}/.resubmit_count_${MODEL}"
 RESUBMIT_COUNT=$(cat "$RESUBMIT_COUNT_FILE" 2>/dev/null || echo 0)
 
 START_TS=$(date +%s)
-bash run_comparison.sh "$MODEL" "$MODEL_SEED"
+bash run_comparison.sh "$MODEL" "$MODEL_SEED" "$TRACK_MODE"
 ELAPSED=$(( $(date +%s) - START_TS ))
 
 if ls ${RUN_STATE_DIR}/DONE_${MODEL}_*.flag >/dev/null 2>&1; then
@@ -69,7 +72,7 @@ if ls ${RUN_STATE_DIR}/DONE_${MODEL}_*.flag >/dev/null 2>&1; then
 elif [ "$ELAPSED" -ge "$NEAR_LIMIT_SEC" ] && [ "$RESUBMIT_COUNT" -lt "$MAX_RESUBMITS" ]; then
   echo ">>> Ran ${ELAPSED}s (near the ${TIME_LIMIT_SEC}s limit) without finishing — resubmitting (attempt $((RESUBMIT_COUNT + 1))/$MAX_RESUBMITS)."
   echo $((RESUBMIT_COUNT + 1)) > "$RESUBMIT_COUNT_FILE"
-  sbatch --job-name="$SLURM_JOB_NAME" "$0" "$MODEL" "$MODEL_SEED"
+  sbatch --job-name="$SLURM_JOB_NAME" "$0" "$MODEL" "$MODEL_SEED" "$TRACK_MODE"
 
 elif [ "$RESUBMIT_COUNT" -ge "$MAX_RESUBMITS" ]; then
   echo ">>> Hit the $MAX_RESUBMITS-resubmission cap without finishing — stopping. Check this model's wandb run (or slurm_${SLURM_JOB_NAME}_*.log) for why it's stuck (not just slow)."

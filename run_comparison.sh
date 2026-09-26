@@ -4,6 +4,7 @@
 #   tmux new -s melstm
 #   bash run_comparison.sh melstm            # the original run (model seed 42)
 #   bash run_comparison.sh melstm 3          # same experiment, model seed 3
+#   bash run_comparison.sh melstm 3 propose  # MELSTM track mode (h | propose | prior)
 #
 # One model per invocation (one tmux session each): lstm | felstm | melstm.
 # The optional second argument is the MODEL seed. The data seed stays 42, so the
@@ -24,6 +25,11 @@
 set -e
 MODEL=${1:?usage: bash run_comparison.sh lstm|felstm|melstm [model_seed]}
 MODEL_SEED=${2:-42}
+TRACK_MODE=${3:-h}   # MELSTM velocity tracking (train.py --track_mode); h = the original
+TRACK_PRIOR_WEIGHT=0.5
+if [ "$TRACK_MODE" != h ] && [ "$MODEL" != melstm ]; then
+  echo "track mode $TRACK_MODE is MELSTM-only"; exit 1
+fi
 
 # ---- shared settings: MUST be identical across the three runs -------------
 HIDDEN=32          # cheap: felstm's cost scales ~quadratically in hidden on top of its
@@ -58,17 +64,19 @@ EPOCHS=50          # generous shared ceiling; early stopping (below) ends lstm/m
 MIN_EPOCHS=40      # no early stop before this many epochs (gives the LR scheduler,
                    # patience=5, room to cut LR at least once first)
 EARLY_STOP_PATIENCE=0   # ~2-3 LR reductions' worth of chances before giving up
+# Non-default track modes get their own save dir and wandb name.
+if [ "$TRACK_MODE" = h ]; then VARIANT=""; else VARIANT="_x${TRACK_MODE}"; fi
 SEED=42            # DATA seed -- fixed; vary the model seed (2nd argument) instead
 # One save dir per model seed: auto-resume below takes the newest
 # checkpoint_<model>_*.pth in run_state/ whatever its seed, and the DONE flags and
 # resubmit counters are per model, so seeds sharing a directory would resume and
 # stop each other. Seed 42 keeps the original ./experiments.
 # (submit_comparison.sbatch computes the same path -- keep the two in step.)
-if [ "$MODEL_SEED" = "$SEED" ]; then SAVE_DIR=./experiments
-else SAVE_DIR=./experiments_ms${MODEL_SEED}; fi
+if [ "$MODEL_SEED" = "$SEED" ]; then SAVE_DIR=./experiments${VARIANT}
+else SAVE_DIR=./experiments_ms${MODEL_SEED}${VARIANT}; fi
 # Seed 42 keeps its original wandb name; the others say both seeds.
-if [ "$MODEL_SEED" = "$SEED" ]; then NAME_SUFFIX="s${SEED}"
-else NAME_SUFFIX="s${SEED}_ms${MODEL_SEED}"; fi
+if [ "$MODEL_SEED" = "$SEED" ]; then NAME_SUFFIX="s${SEED}${VARIANT}"
+else NAME_SUFFIX="s${SEED}_ms${MODEL_SEED}${VARIANT}"; fi
 
 # Bash array, not a backslash-continued string: a single stray trailing
 # space after a "\" silently breaks string continuation (bash starts
@@ -116,7 +124,10 @@ case $MODEL in
   melstm)
     # eval_velocity_mode both: honest val drives selection, oracle val logged
     # alongside (velocity-vs-rendering decomposition). MELSTM-only effect.
-    EXTRA=(--model melstm --num_vel_modes 2 --eval_velocity_mode both --wandb_name "melstm_h${HIDDEN}_${NAME_SUFFIX}") ;;
+    EXTRA=(--model melstm --num_vel_modes 2 --eval_velocity_mode both --wandb_name "melstm_h${HIDDEN}_${NAME_SUFFIX}")
+    # passed only when not the original, so the h command line stays byte-identical
+    if [ "$TRACK_MODE" != h ]; then EXTRA+=(--track_mode "$TRACK_MODE"); fi
+    if [ "$TRACK_MODE" = prior ]; then EXTRA+=(--track_prior_weight "$TRACK_PRIOR_WEIGHT"); fi ;;
   *)
     echo "unknown model: $MODEL"; exit 1 ;;
 esac
@@ -141,6 +152,6 @@ fi
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 # wandb recorded no git info for the original runs, so say it in the log.
-echo ">>> commit $(git rev-parse --short HEAD 2>/dev/null)  model=$MODEL  data_seed=$SEED  model_seed=$MODEL_SEED  save_dir=$SAVE_DIR"
+echo ">>> commit $(git rev-parse --short HEAD 2>/dev/null)  model=$MODEL  data_seed=$SEED  model_seed=$MODEL_SEED  track_mode=$TRACK_MODE  save_dir=$SAVE_DIR"
 
 python moving_mnist/train.py "${COMMON[@]}" "${EXTRA[@]}" "${RESUME[@]}"

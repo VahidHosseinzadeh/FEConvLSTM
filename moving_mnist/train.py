@@ -145,6 +145,13 @@ def main():
     parser.add_argument('--image_size', type=int, default=28)
     parser.add_argument('--v_range', type=int, default=2)
     parser.add_argument('--num_vel_modes', type=int, default=2, help='Number of velocity modes for MEConvLSTM')
+    parser.add_argument('--track_mode', choices=['h', 'propose', 'prior'], default='h',
+                        help="MELSTM velocity tracking: 'h' = peak of PC(h_k, x_t) (original); "
+                             "'propose' = top --n_proposals peaks of the raw pair PC(x_{t-1}, x_t) are "
+                             "candidates and each slot picks the one PC(h_k, x_t) scores highest; "
+                             "'prior' = peak of PC(h_k,x_t)/max + --track_prior_weight * PC(x_{t-1},x_t)/max")
+    parser.add_argument('--track_prior_weight', type=float, default=0.5, help="--track_mode prior only")
+    parser.add_argument('--n_proposals', type=int, default=None, help="--track_mode propose only; default = --num_vel_modes")
     parser.add_argument('--data_v_range', type=int, default=2)
     parser.add_argument('--motion_mode', choices=['constant', 'piecewise', 'stochastic'], default='piecewise',
                         help="How digit velocity evolves over time: 'constant' = fixed for the whole "
@@ -485,7 +492,10 @@ def main():
                 kernel_size=args.kernel_size,
                 n_slots= args.num_vel_modes,
                 slot_reduce = 'max',
-                decoder_layers = args.decoder_conv_layers
+                decoder_layers = args.decoder_conv_layers,
+                track_mode=args.track_mode,
+                track_prior_weight=args.track_prior_weight,
+                n_proposals=args.n_proposals
             ).to(device)
 
     # Parameter count: printed per top-level submodule and stored in the

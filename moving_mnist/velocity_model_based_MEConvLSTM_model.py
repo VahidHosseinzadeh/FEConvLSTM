@@ -143,8 +143,31 @@ class Seq2SeqMEConvLSTM(nn.Module):
                  decoder_channels=None,
                  bias=True,
                  batch_first=True,
-                 phase_corr_kwargs=None):
+                 phase_corr_kwargs=None,
+                 track_mode="h",
+                 track_prior_weight=0.5,
+                 n_proposals=None):
+        """
+        track_mode -- how a slot's velocity is read at every tracking step (encoder
+            t >= 2, and decoder steps in tracked mode):
+              "h"       : peak of PC(h_k, x_t) over the whole plane (the original).
+              "propose" : the raw frame pair proposes, the slot chooses. The top
+                          n_proposals peaks of PC(x_{t-1}, x_t) are the candidates;
+                          each slot independently takes the candidate its own
+                          surface PC(h_k, x_t) scores highest. No slot-to-candidate
+                          assignment step, and no shift the frames do not support.
+              "prior"   : the raw pair as a soft prior. Each slot takes the peak of
+                          PC(h_k, x_t)/max + track_prior_weight * PC(x_{t-1}, x_t)/max.
+            All three use the same normalized phase correlation. The bootstrap at
+            t = 1 is unchanged.
+        n_proposals -- "propose" only; defaults to n_slots.
+        """
         super().__init__()
+        if track_mode not in ("h", "propose", "prior"):
+            raise ValueError(f"track_mode {track_mode!r}: expected 'h', 'propose' or 'prior'")
+        self.track_mode         = track_mode
+        self.track_prior_weight = track_prior_weight
+        self.n_proposals        = n_proposals or n_slots
 
         self.batch_first     = batch_first
         self.n_slots         = n_slots
@@ -187,15 +210,40 @@ class Seq2SeqMEConvLSTM(nn.Module):
         v, _ = self.phase_corr_bootstrap(x0, x1)
         return v   # (B, K, 2)
 
-    def track_velocities(self, h, frame):
+    def _pc_surface(self, a, b):
+        """
+        Normalized phase-correlation surface of a against b, (..., H, W): the map
+        PhaseCorrelation takes its peaks from (pad_factor 1, periodic). Entry (y, x)
+        scores velocity (-x', -y'), x' and y' wrapped to [-W/2, W/2] -- see
+        _index_to_velocity.
+        """
+        H, W = a.shape[-2:]
+        R = torch.fft.rfft2(a) * torch.conj(torch.fft.rfft2(b))
+        R = R / (R.abs() + self.phase_corr_track.eps)
+        return torch.fft.irfft2(R, s=(H, W))
+
+    @staticmethod
+    def _index_to_velocity(idx, H, W, dtype):
+        """Flat surface index -> (vx, vy), exactly as PhaseCorrelation converts it."""
+        y = torch.div(idx, W, rounding_mode="floor").to(dtype)
+        x = (idx % W).to(dtype)
+        x = torch.where(x > W / 2, x - W, x)
+        y = torch.where(y > H / 2, y - H, y)
+        return torch.stack((-x, -y), dim=-1)
+
+    def track_velocities(self, h, frame, prev_frame=None):
         """
         Per-slot self-tracking: correlate each slot's h against frame.
         All B*K pairs in one batched call.
 
-        h     : (B, K, Ch, H, W)
-        frame : (B, C,  H,  W)
-        ->      (B, K, 2)
+        h          : (B, K, Ch, H, W)
+        frame      : (B, C,  H,  W)
+        prev_frame : (B, C,  H,  W), the frame before `frame`. Used by the
+                     "propose" / "prior" track modes; ignored by "h".
+        ->           (B, K, 2)
         """
+        if self.track_mode != "h" and prev_frame is not None:
+            return self._track_with_frames(h, frame, prev_frame)
         B, K, Ch, H, W = h.shape
         _, C, _, _     = frame.shape
 
@@ -207,6 +255,25 @@ class Seq2SeqMEConvLSTM(nn.Module):
         with torch.no_grad():
             v_flat, _ = self.phase_corr_track(h_tmpl, f_rep)
         return v_flat.squeeze(1).reshape(B, K, 2)
+
+    def _track_with_frames(self, h, frame, prev_frame):
+        """track_mode "propose" / "prior": see __init__."""
+        B, K, Ch, H, W = h.shape
+        with torch.no_grad():
+            f   = frame.mean(dim=1)                                   # (B, H, W)
+            tm  = h.mean(dim=2)                                       # (B, K, H, W)
+            s_h = self._pc_surface(tm, f.unsqueeze(1).expand_as(tm)).reshape(B, K, H * W)
+            s_x = self._pc_surface(prev_frame.mean(dim=1), f).reshape(B, H * W)
+            if self.track_mode == "propose":
+                cand  = s_x.topk(self.n_proposals, dim=-1).indices      # (B, M)
+                cand  = cand.unsqueeze(1).expand(B, K, -1)              # (B, K, M)
+                score = torch.gather(s_h, 2, cand)                      # slot k's score of each
+                idx   = torch.gather(cand, 2, score.argmax(-1, keepdim=True)).squeeze(-1)
+            else:                                                       # "prior"
+                nh  = s_h / s_h.amax(-1, keepdim=True).clamp_min(1e-8)
+                nx  = s_x / s_x.amax(-1, keepdim=True).clamp_min(1e-8)
+                idx = (nh + self.track_prior_weight * nx.unsqueeze(1)).argmax(-1)   # (B, K)
+            return self._index_to_velocity(idx, H, W, h.dtype)
 
     def pool_slots(self, h):
         """h : (B, K, Ch, H, W) -> (B, Ch, H, W)"""
@@ -267,7 +334,8 @@ class Seq2SeqMEConvLSTM(nn.Module):
 
             else:
                 # Slot self-tracking. X_t consumed exactly once.
-                v = self.track_velocities(h, input_seq[:, t])
+                v = self.track_velocities(h, input_seq[:, t],
+                                          prev_frame=input_seq[:, t - 1])
 
             h, c   = self.cell(input_seq[:, t], h, c, v)
 
@@ -285,7 +353,10 @@ class Seq2SeqMEConvLSTM(nn.Module):
             current_frame = prev_frame.detach()
 
             if target_seq is not None and track_decoder_velocity:
-                v = self.track_velocities(h, target_seq[:, t])
+                # the true frame before target_seq[:, t] (tracked mode already
+                # reads the true frames; "h" mode ignores it)
+                true_prev = input_seq[:, -1] if t == 0 else target_seq[:, t - 1]
+                v = self.track_velocities(h, target_seq[:, t], prev_frame=true_prev)
                 estimated_velocities.append(v.clone().detach())
             # else: v keeps the last encoder estimate (frozen rollout)
 
