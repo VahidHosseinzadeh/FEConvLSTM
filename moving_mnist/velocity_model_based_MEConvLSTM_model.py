@@ -282,7 +282,9 @@ class Seq2SeqMEConvLSTM(nn.Module):
         outputs    = []
 
         for t in range(pred_len):
-            current_frame = prev_frame.detach()
+            # No detach: gradients also flow back through each predicted frame
+            # fed in as the next input (the pred_melstm_nodetach experiment).
+            current_frame = prev_frame
 
             if target_seq is not None and track_decoder_velocity:
                 v = self.track_velocities(h, target_seq[:, t])

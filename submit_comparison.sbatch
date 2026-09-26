@@ -47,8 +47,9 @@
 MODEL=${1:?usage: sbatch submit_comparison.sbatch lstm|felstm|melstm [model_seed]}
 MODEL_SEED=${2:-42}
 # must match run_comparison.sh's SAVE_DIR (one directory per model seed)
-if [ "$MODEL_SEED" = "42" ]; then SAVE_DIR=./experiments
-else SAVE_DIR=./experiments_ms${MODEL_SEED}; fi
+VARIANT=_nodetach   # must match run_comparison.sh
+if [ "$MODEL_SEED" = "42" ]; then SAVE_DIR=./experiments${VARIANT}
+else SAVE_DIR=./experiments_ms${MODEL_SEED}${VARIANT}; fi
 RUN_STATE_DIR="${SAVE_DIR}/run_state"
 
 TIME_LIMIT_SEC=$((24 * 3600))

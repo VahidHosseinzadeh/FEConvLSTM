@@ -58,17 +58,18 @@ EPOCHS=50          # generous shared ceiling; early stopping (below) ends lstm/m
 MIN_EPOCHS=40      # no early stop before this many epochs (gives the LR scheduler,
                    # patience=5, room to cut LR at least once first)
 EARLY_STOP_PATIENCE=0   # ~2-3 LR reductions' worth of chances before giving up
+VARIANT=_nodetach  # this branch: MELSTM decoder feeds back prev_frame without .detach()
 SEED=42            # DATA seed -- fixed; vary the model seed (2nd argument) instead
 # One save dir per model seed: auto-resume below takes the newest
 # checkpoint_<model>_*.pth in run_state/ whatever its seed, and the DONE flags and
 # resubmit counters are per model, so seeds sharing a directory would resume and
 # stop each other. Seed 42 keeps the original ./experiments.
 # (submit_comparison.sbatch computes the same path -- keep the two in step.)
-if [ "$MODEL_SEED" = "$SEED" ]; then SAVE_DIR=./experiments
-else SAVE_DIR=./experiments_ms${MODEL_SEED}; fi
+if [ "$MODEL_SEED" = "$SEED" ]; then SAVE_DIR=./experiments${VARIANT}
+else SAVE_DIR=./experiments_ms${MODEL_SEED}${VARIANT}; fi
 # Seed 42 keeps its original wandb name; the others say both seeds.
-if [ "$MODEL_SEED" = "$SEED" ]; then NAME_SUFFIX="s${SEED}"
-else NAME_SUFFIX="s${SEED}_ms${MODEL_SEED}"; fi
+if [ "$MODEL_SEED" = "$SEED" ]; then NAME_SUFFIX="s${SEED}${VARIANT}"
+else NAME_SUFFIX="s${SEED}_ms${MODEL_SEED}${VARIANT}"; fi
 
 # Bash array, not a backslash-continued string: a single stray trailing
 # space after a "\" silently breaks string continuation (bash starts
