@@ -38,6 +38,7 @@ ARM=${3:-base}
 COS0=(--lr_schedule cosine --warmup_epochs 0 --final_lr 1e-5)
 NEW=(--no_detach --len_gen_at_end)
 XCUR=(--x_curriculum_epochs 25 --x_curriculum_start 15)
+XSTO=(--x_curriculum_epochs 25 --x_curriculum_mode stochastic)
 case $ARM in
   # the original protocol: Adam 1e-3 + ReduceLROnPlateau on the (honest) val loss, the
   # fed-back prediction detached, a length-gen rollout at every new best and every 2nd epoch
@@ -60,10 +61,21 @@ case $ARM in
                                         --frozen_ramp_epochs 10) ;;
   # xcur with a LeakyReLU decoder
   xcurleaky) SCHED=("${COS0[@]}"); OPT=("${NEW[@]}" "${XCUR[@]}" --decoder_act leaky) ;;
-  *) echo "unknown arm: $ARM (base|cos|cosleaky|xcur|xcurfrz|xcurleaky)"; exit 1 ;;
+  # MELSTM: the stochastic handover (training only). Each encoder step t >= 2 of each
+  # sequence takes the raw-pair velocity with probability p(t, epoch), its own
+  # h-tracked one otherwise; p = 1 everywhere at epoch 1 and 0 everywhere from epoch
+  # 25 on (evaluation is always pure h-tracking). Same x budget per epoch as xcur.
+  #   xsto    : p(epoch) only, linear 1 -> 0
+  #   xstocos : p(epoch) only, cosine 1 -> 0 (more x early, more h late)
+  #   xstot6  : p(t, epoch), a ramp 6 steps wide in t whose centre slides from
+  #             t = 17 to t = -1 (early steps keep x longest, like xcur's T_x -> 2)
+  xsto)      SCHED=("${COS0[@]}"); OPT=("${NEW[@]}" "${XSTO[@]}") ;;
+  xstocos)   SCHED=("${COS0[@]}"); OPT=("${NEW[@]}" "${XSTO[@]}" --x_curriculum_shape cosine) ;;
+  xstot6)    SCHED=("${COS0[@]}"); OPT=("${NEW[@]}" "${XSTO[@]}" --x_curriculum_width 6) ;;
+  *) echo "unknown arm: $ARM (base|cos|cosleaky|xcur|xcurfrz|xcurleaky|xsto|xstocos|xstot6)"; exit 1 ;;
 esac
 case $ARM in
-  xcur*) if [ "$MODEL" != melstm ]; then echo "arm $ARM is MELSTM-only"; exit 1; fi ;;
+  xcur*|xsto*) if [ "$MODEL" != melstm ]; then echo "arm $ARM is MELSTM-only"; exit 1; fi ;;
 esac
 
 # ---- shared settings: MUST be identical across the three runs -------------

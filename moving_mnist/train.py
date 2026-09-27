@@ -177,6 +177,18 @@ def main():
                              "frame pair (continuity-assigned); T_x falls linearly from --x_curriculum_start at epoch 1 "
                              "to 2 (pure h-tracking) at this epoch and stays there. 0 = off")
     parser.add_argument('--x_curriculum_start', type=int, default=15, help="T_x at epoch 1 (15 = the whole context)")
+    parser.add_argument('--x_curriculum_mode', choices=['cutoff', 'stochastic'], default='cutoff',
+                        help="cutoff = the deterministic T_x above. stochastic = the stochastic handover: each "
+                             "encoder step t >= 2 of each sequence takes the raw-pair velocity with probability "
+                             "p(t, epoch), else its h-tracked one. p(t, e) = clip((c(e) - t)/W + 1/2, 0, 1) with "
+                             "W = --x_curriculum_width; the centre c(e) slides so that p = 1 at every step at epoch 1 "
+                             "and p = 0 at every step from epoch --x_curriculum_epochs on (progress shape "
+                             "--x_curriculum_shape). W = inf makes p independent of t, and the mean of p over the "
+                             "steps roughly follows the progress for every W (exactly for W = inf)")
+    parser.add_argument('--x_curriculum_width', type=float, default=float('inf'),
+                        help="--x_curriculum_mode stochastic: width W (in steps) of the ramp in t; inf = p(epoch) only")
+    parser.add_argument('--x_curriculum_shape', choices=['linear', 'cosine'], default='linear',
+                        help="--x_curriculum_mode stochastic: how the progress s(epoch) falls from 1 to 0")
     parser.add_argument('--frozen_prob_max', type=float, default=0.0,
                         help="MELSTM: scheduled sampling of the decoder velocity mode in training -- the fraction "
                              "of sequences decoded with the encoder's final velocity frozen (the inference "
@@ -290,6 +302,9 @@ def main():
 
     assert args.input_frames < args.seq_len, "input_frames must be less than seq_len"
     assert args.gen_input_frames < args.gen_seq_len, "gen_input_frames must be less than gen_seq_len"
+    if args.x_curriculum_mode == 'stochastic':
+        assert args.x_curriculum_epochs >= 2, "--x_curriculum_mode stochastic needs --x_curriculum_epochs >= 2"
+        assert args.x_curriculum_width > 0, "--x_curriculum_width must be > 0 (a hard cut-off is --x_curriculum_mode cutoff)"
     pred_frames = args.seq_len - args.input_frames
     gen_pred_frames = args.gen_seq_len - args.gen_input_frames
 
@@ -704,6 +719,22 @@ def main():
         frac = (epoch - 1) / max(1, E - 1)
         return int(round(args.x_curriculum_start - (args.x_curriculum_start - 2) * frac))
 
+    def x_track_probs_at(epoch):
+        """Stochastic handover: p(t, epoch) for encoder steps t = 0 .. input_frames-1 (the
+        entries for t = 0, 1 -- zero velocity and bootstrap -- are unused). The progress s
+        falls from 1 at epoch 1 to 0 at epoch E; the ramp's centre c slides from
+        t_last + W/2 (p = 1 at every step) to 2 - W/2 (p = 0 at every step)."""
+        import math
+        E, W, T = args.x_curriculum_epochs, args.x_curriculum_width, args.input_frames
+        if epoch >= E:
+            return [0.0] * T
+        frac = (epoch - 1) / (E - 1)
+        s = 1.0 - frac if args.x_curriculum_shape == 'linear' else 0.5 * (1.0 + math.cos(math.pi * frac))
+        if math.isinf(W):
+            return [0.0, 0.0] + [s] * (T - 2)
+        c = 2 - W / 2 + s * (T - 1 - 2 + W)
+        return [0.0, 0.0] + [min(1.0, max(0.0, (c - t) / W + 0.5)) for t in range(2, T)]
+
     def frozen_prob_at(epoch):
         """Scheduled freezing: 0 before --frozen_start_epoch, then a linear ramp."""
         if args.frozen_prob_max <= 0 or epoch < args.frozen_start_epoch:
@@ -716,8 +747,14 @@ def main():
             model.frozen_prob = frozen_prob_at(epoch)
             print(f"  scheduled freezing: {100 * model.frozen_prob:.0f}% of training sequences decode with the frozen velocity")
         if args.x_curriculum_epochs > 0 and hasattr(model, "x_track_until"):
-            model.x_track_until = x_track_until_at(epoch)
-            print(f"  x-tracking curriculum: encoder steps t < {model.x_track_until} use the raw frame pair")
+            if args.x_curriculum_mode == 'stochastic':
+                model.x_track_p = x_track_probs_at(epoch)
+                ps = model.x_track_p[2:]
+                print(f"  stochastic handover: P(raw-pair velocity) at steps 2..{args.input_frames - 1} = "
+                      + " ".join(f"{p:.2f}" for p in ps) + f"  (mean {sum(ps) / len(ps):.2f})")
+            else:
+                model.x_track_until = x_track_until_at(epoch)
+                print(f"  x-tracking curriculum: encoder steps t < {model.x_track_until} use the raw frame pair")
         train_loss = train_fn(model, train_loader, optimizer, criterion, device, args.input_frames, args.grad_clip,
                               curve_recorder=curve_recorder, show_h_state=args.show_h_state,
                               lr_fn=lr_fn, step_offset=(epoch - 1) * steps_per_epoch,
@@ -760,7 +797,11 @@ def main():
             "epoch": epoch
         }
         if args.x_curriculum_epochs > 0:
-            log_payload["x_track_until"] = x_track_until_at(epoch)
+            if args.x_curriculum_mode == 'stochastic':
+                ps = x_track_probs_at(epoch)[2:]
+                log_payload["x_track_p_mean"] = sum(ps) / len(ps)
+            else:
+                log_payload["x_track_until"] = x_track_until_at(epoch)
         if args.frozen_prob_max > 0:
             log_payload["frozen_prob"] = frozen_prob_at(epoch)
         if val_tracked_loss is not None:

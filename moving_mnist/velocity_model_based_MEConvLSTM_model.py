@@ -204,6 +204,13 @@ class Seq2SeqMEConvLSTM(nn.Module):
             from the raw pair PC(x_{t-1}, x_t) (top n_slots peaks), assigned to slots
             by continuity with each slot's previous velocity, instead of from h.
             A curriculum lowers it to 2 (= pure h-tracking); evaluation is always h.
+        x_track_p (attribute, default None = off; set by the training loop, used in
+            training only): the stochastic handover. A sequence of per-step
+            probabilities indexed by encoder step t; at every step t >= 2 each sequence
+            independently takes the raw-pair velocity (continuity-assigned, as for
+            x_track_until) with probability x_track_p[t], and its own h-tracked
+            velocity otherwise. All ones is x-tracking everywhere, all zeros is pure
+            h-tracking; evaluation is always h.
         """
         super().__init__()
         if track_mode not in ("h", "propose", "prior", "window", "tie", "propose_distinct"):
@@ -216,6 +223,7 @@ class Seq2SeqMEConvLSTM(nn.Module):
         self.track_window       = track_window
         self.detach_feedback    = detach_feedback
         self.x_track_until      = 0
+        self.x_track_p          = None
         self.frozen_prob        = 0.0
 
         self.batch_first     = batch_first
@@ -442,6 +450,19 @@ class Seq2SeqMEConvLSTM(nn.Module):
             elif self.training and t < self.x_track_until:
                 # x-tracking curriculum (training only): raw pair + continuity.
                 v = self._track_x_continuity(input_seq[:, t - 1], input_seq[:, t], v)
+
+            elif self.training and self.x_track_p is not None and self.x_track_p[t] > 0:
+                # stochastic handover (training only): per sequence, the raw-pair
+                # velocity with probability p_t, the slot's own h-tracking otherwise
+                p_t = float(self.x_track_p[t])
+                v_x = self._track_x_continuity(input_seq[:, t - 1], input_seq[:, t], v)
+                if p_t >= 1:
+                    v = v_x
+                else:
+                    v_h = self.track_velocities(h, input_seq[:, t],
+                                                prev_frame=input_seq[:, t - 1])
+                    use_x = torch.rand(B, device=input_seq.device) < p_t
+                    v = torch.where(use_x.view(B, 1, 1), v_x, v_h)
 
             else:
                 # Slot self-tracking. X_t consumed exactly once.
