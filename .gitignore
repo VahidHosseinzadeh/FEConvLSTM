@@ -90,3 +90,11 @@ EXPERIMENT_REPORT.md
 motion_difficulty_prompt.md
 motion_factors_prompt.md
 velocity_model_prompt.md
+# local docs and outputs (kept out of git like EXPERIMENT_REPORT.md)
+PREDICTION_EXPERIMENTS.md
+COMMON_FATE_CLASSIFICATION.md
+COMMON_FATE_CLASSIFICATION_SWEEP.md
+experiments_classification/
+# per-(model seed, arm) save dirs of run_comparison.sh, and its SMOKE=1 runs
+experiments_*/
+smoke/

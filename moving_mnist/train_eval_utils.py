@@ -31,21 +31,35 @@ def build_model(cfg):
     dec_layers = get("decoder_conv_layers", 1)
     # None/absent means "decoder width follows the cell width"
     dec_channels = get("decoder_hidden_size") or hidden
+    # Training options that change the model. Absent or None (configs written before
+    # they existed) means the original behaviour.
+    detach_feedback = not get("no_detach")
+    decoder_act = get("decoder_act") or "relu"
 
     if name in ("felstm", "lstm"):
         v_range = get("v_range", 0) if name == "felstm" else 0
         if name == "lstm":
             assert get("v_range", 0) == 0, "v_range must be 0 for lstm"
+        if get("decoder_skip"):
+            raise ValueError("--decoder_skip exists for melstm only")
         return Seq2SeqFEConvLSTM(
             input_channels=1, hidden_channels=hidden, kernel_size=kernel,
             v_range=v_range, pool_type="max",
-            decoder_conv_layers=dec_layers, decoder_channels=dec_channels)
+            decoder_conv_layers=dec_layers, decoder_channels=dec_channels,
+            detach_feedback=detach_feedback, decoder_act=decoder_act)
 
     if name == "melstm":
+        prior_w = get("track_prior_weight")
         return Seq2SeqMEConvLSTM(
             input_channels=1, hidden_channels=hidden, kernel_size=kernel,
             n_slots=get("num_vel_modes", 2), slot_reduce="max",
-            decoder_layers=dec_layers, decoder_channels=dec_channels)
+            decoder_layers=dec_layers, decoder_channels=dec_channels,
+            track_mode=get("track_mode") or "h",
+            track_prior_weight=0.5 if prior_w is None else prior_w,
+            n_proposals=get("n_proposals"),
+            track_window=get("track_window") or 2,
+            detach_feedback=detach_feedback, decoder_act=decoder_act,
+            decoder_skip=bool(get("decoder_skip")))
 
     raise ValueError(f"unknown model {name!r}")
 
@@ -225,9 +239,28 @@ class ValCurveRecorder:
 
 
 def train_epoch(model, dataloader, optimizer, criterion, device, input_frames, grad_clip=None,
-                curve_recorder=None, show_h_state=False):
+                curve_recorder=None, show_h_state=False, lr_fn=None, step_offset=0, diag_every=0):
+    """
+    lr_fn       : optional f(global_step) -> learning rate, set before every optimizer
+                  step (per-batch schedules such as warmup + cosine). None leaves the
+                  optimizer's LR alone (the plateau scheduler steps per epoch instead).
+    step_offset : global step of this epoch's first batch (so schedules resume correctly).
+    diag_every  : every N steps, log to wandb the pre-clip gradient norm (mean and max
+                  over the last N steps), the fraction of ReLU outputs > 0 on that
+                  batch (a dead decoder shows up as 0), and the LR. 0 = off.
+                  Read-only: nothing here changes the update.
+    """
     model.train()
     running_loss = 0.0
+    relus = ([mod for mod in model.modules() if isinstance(mod, (torch.nn.ReLU, torch.nn.LeakyReLU))]
+             if diag_every else [])
+    relu_frac = []
+    def _relu_hook(mod, inp, out):
+        if relu_frac is not None and diag_on[0]:
+            relu_frac.append((out > 0).float().mean().item())
+    diag_on = [False]
+    hooks = [mod.register_forward_hook(_relu_hook) for mod in relus]
+    gnorms = []
     velocity_metrics = VelocityMetrics()
     has_velocity_data = False
 
@@ -241,6 +274,12 @@ def train_epoch(model, dataloader, optimizer, criterion, device, input_frames, g
         want_velocity, want_states = _velocity_flags(model, gt_motion, show_h_state)
         want_states = want_states and i == 0
 
+        step = step_offset + i
+        if lr_fn is not None:
+            for group in optimizer.param_groups:
+                group["lr"] = lr_fn(step)
+        diag_on[0] = bool(diag_every) and (step + 1) % diag_every == 0
+
         optimizer.zero_grad()
         output_seq, pred_motion, states = _run_model(
             model, input_seq, pred_len, target_seq, want_velocity, want_states
@@ -249,9 +288,21 @@ def train_epoch(model, dataloader, optimizer, criterion, device, input_frames, g
         loss.backward()
 
         if grad_clip is not None:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            gnorm = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            if diag_every:
+                gnorms.append(float(gnorm))
 
         optimizer.step()
+
+        if diag_on[0]:
+            payload = {"lr_step": optimizer.param_groups[0]["lr"], "global_batch": step + 1}
+            if gnorms:
+                payload.update(grad_norm_mean=sum(gnorms) / len(gnorms), grad_norm_max=max(gnorms))
+            if relu_frac:
+                payload["relu_active_frac"] = min(relu_frac)   # the most-dead ReLU layer
+            wandb.log(payload)
+            gnorms.clear(); relu_frac.clear()
+            diag_on[0] = False      # the val-curve pass below must not feed the hook
 
         if want_velocity:
             velocity_metrics.update(pred_motion, gt_motion)
@@ -275,6 +326,9 @@ def train_epoch(model, dataloader, optimizer, criterion, device, input_frames, g
                     motion=gt_motion,
                     v_list=model.cell.v_list if isinstance(model, Seq2SeqFEConvLSTM) else None,
                 )
+
+    for h in hooks:
+        h.remove()
 
     if has_velocity_data:
         velocity_metrics.report("Training Velocity")
