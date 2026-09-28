@@ -43,6 +43,9 @@ case $ARM in
   # the original protocol: Adam 1e-3 + ReduceLROnPlateau on the (honest) val loss, the
   # fed-back prediction detached, a length-gen rollout at every new best and every 2nd epoch
   base)      SCHED=(--use_lr_scheduler); OPT=() ;;
+  # base with the gradient kept through the fed-back prediction: the configuration of
+  # the Sep 26 no-detach runs (seed 1 test 0.0031, seed 2 test 0.0009)
+  basend)    SCHED=(--use_lr_scheduler); OPT=(--no_detach) ;;
   # the shared new protocol, any model: cosine 1e-3 -> 1e-5 per batch without warmup,
   # gradient kept through the fed-back prediction, one length-gen rollout after training
   # (on the best model)
@@ -72,7 +75,7 @@ case $ARM in
   xsto)      SCHED=("${COS0[@]}"); OPT=("${NEW[@]}" "${XSTO[@]}") ;;
   xstocos)   SCHED=("${COS0[@]}"); OPT=("${NEW[@]}" "${XSTO[@]}" --x_curriculum_shape cosine) ;;
   xstot6)    SCHED=("${COS0[@]}"); OPT=("${NEW[@]}" "${XSTO[@]}" --x_curriculum_width 6) ;;
-  *) echo "unknown arm: $ARM (base|cos|cosleaky|xcur|xcurfrz|xcurleaky|xsto|xstocos|xstot6)"; exit 1 ;;
+  *) echo "unknown arm: $ARM (base|basend|cos|cosleaky|xcur|xcurfrz|xcurleaky|xsto|xstocos|xstot6)"; exit 1 ;;
 esac
 case $ARM in
   xcur*|xsto*) if [ "$MODEL" != melstm ]; then echo "arm $ARM is MELSTM-only"; exit 1; fi ;;
