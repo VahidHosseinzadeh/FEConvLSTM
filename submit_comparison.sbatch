@@ -49,7 +49,7 @@ MODEL=${1:?usage: sbatch submit_comparison.sbatch lstm|felstm|melstm [model_seed
 MODEL_SEED=${2:-42}
 OPT_ARM=${3:-base}
 # must match run_comparison.sh's SAVE_DIR (one directory per model seed and arm)
-SAVE_DIR=./experiments_ms${MODEL_SEED}_${OPT_ARM}
+SAVE_DIR=./experiments_ms${MODEL_SEED}_${OPT_ARM}${INIT_SEED:+_init${INIT_SEED}}   # INIT_SEED: see run_comparison.sh
 RUN_STATE_DIR="${SAVE_DIR}/run_state"
 
 TIME_LIMIT_SEC=$((24 * 3600))

@@ -111,6 +111,30 @@ def save_vel_gen_results(path, vx, vy, err, args):
     print(f"Saved velocity-generalization results to {path}")
 
 
+def build_model_seeded(args):
+    """build_model, called right after the generators are seeded with --model_seed.
+
+    Without --init_seed this is plain build_model. With it, the weights are the ones
+    a --model_seed=<init_seed> run starts from, while every random draw after them --
+    the training stream, the val draws, the CUDA generator -- is exactly the
+    --model_seed run's: the model is first built with model_seed, so the generators
+    advance as in a normal run, that state is kept, the real model is built from
+    init_seed, and the state is restored. build_model runs on the CPU and only draws
+    from torch's generator (numpy and random are untouched).
+    """
+    if args.init_seed is None:
+        return build_model(args)
+    build_model(args)
+    cpu_state = torch.get_rng_state()
+    cuda_state = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+    torch.manual_seed(args.init_seed)
+    model = build_model(args)
+    torch.set_rng_state(cpu_state)
+    if cuda_state is not None:
+        torch.cuda.set_rng_state_all(cuda_state)
+    return model
+
+
 def main():
     parser = argparse.ArgumentParser(description="Train & evaluate RNN models on Moving MNIST")
     parser.add_argument('--root', type=str, default='./data')
@@ -218,6 +242,10 @@ def main():
     parser.add_argument('--gen_seq_len', type=int, default=40, help='Sequence length used **only** for length‑generalization evaluation (must be > seq_len)')
     parser.add_argument('--data_seed', type=int, default=42, help='Random seed for dataset splitting')
     parser.add_argument('--model_seed', type=int, default=None, help='Random seed for model initialization (default: random)')
+    parser.add_argument('--init_seed', type=int, default=None,
+                        help='Seed for the initial weights only (default: --model_seed). The weights are those a '
+                             '--model_seed=<init_seed> run starts from; everything after them (the on-the-fly '
+                             'training stream, the val draws) is exactly the --model_seed run\'s')
     parser.add_argument('--run_name', type=str, default=None, help='Name of the run')
     parser.add_argument('--model_save_dir', type=str, default='./fernn/movmnist/', help='Directory to save model checkpoints')
     parser.add_argument('--load_model', type=str, default=None, help='Path to a saved model checkpoint to load for evaluation')
@@ -523,7 +551,7 @@ def main():
     
     # Single construction path shared with motion_generalization.py, so an
     # offline evaluation cannot rebuild a different architecture than was trained.
-    model = build_model(args).to(device)
+    model = build_model_seeded(args).to(device)
 
     # Parameter count: printed per top-level submodule and stored in the
     # wandb config so runs of different models are directly comparable.

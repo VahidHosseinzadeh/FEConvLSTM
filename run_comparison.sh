@@ -14,6 +14,10 @@
 # len-gen sets are fixed (seeds 123 / 42 in train.py) and unaffected.
 # 3rd argument: the training arm (default base; see the case block below). Every
 # (model seed, arm) pair gets its own save dir and wandb name.
+# INIT_SEED=<s> (environment): the initial weights come from seed s, everything else
+# (the training stream, the val draws) from the model seed -- to tell whether a seed's
+# outcome lives in its initialization or in its data. Adds _init<s> to the save dir
+# and the wandb name.
 # Auto-resumes from the newest matching checkpoint_*.pth if a previous
 # attempt crashed. If you CHANGE any setting below, delete the stale
 # checkpoints first (rm experiments/run_state/checkpoint_<model>_*.pth) so
@@ -119,7 +123,9 @@ SEED=42            # DATA seed -- fixed; vary the model seed (2nd argument) inst
 # checkpoint_<model>_*.pth in run_state/ whatever its seed, and the DONE flags and
 # resubmit counters are per model, so runs sharing a directory would resume and stop
 # each other. (submit_comparison.sbatch computes the same path -- keep the two in step.)
-SAVE_DIR=./experiments_ms${MODEL_SEED}_${ARM}
+INIT_SEED=${INIT_SEED:-}
+INIT_TAG=${INIT_SEED:+_init${INIT_SEED}}
+SAVE_DIR=./experiments_ms${MODEL_SEED}_${ARM}${INIT_TAG}
 # SMOKE=1 bash run_comparison.sh ...: 2 epochs on 256 training sequences, wandb
 # offline, under ./smoke/ -- checks that an arm starts, trains and finishes without
 # leaving anything a real run would resume from. SMOKE_EXTRA is appended to train.py's
@@ -228,6 +234,9 @@ COMMON=(
   --wandb_project FEConvLSTM
   "${OPT[@]}"
 )
+if [ -n "$INIT_SEED" ]; then
+  COMMON+=(--init_seed "$INIT_SEED")
+fi
 if [ -n "$SMOKE" ]; then
   # unquoted on purpose: SMOKE_EXTRA is a list of arguments
   COMMON+=(--max_train_samples 256 ${SMOKE_EXTRA:-})
@@ -238,7 +247,7 @@ fi
 # COMMON+=(--run_velocity_generalization --gen_vel_min -3 --gen_vel_max 3)
 
 # motion is in the name so a sweep gives distinguishable wandb runs
-RUN_TAG="h${HIDDEN}_${MOTION_TAG}_s${SEED}_ms${MODEL_SEED}_${ARM}"
+RUN_TAG="h${HIDDEN}_${MOTION_TAG}_s${SEED}_ms${MODEL_SEED}_${ARM}${INIT_TAG}"
 case $MODEL in
   lstm)
     EXTRA=(--model lstm --v_range 0 --wandb_name "lstm_${RUN_TAG}") ;;
@@ -299,6 +308,6 @@ fi
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 # wandb records no git info from inside the jobs, so say it in the log.
-echo ">>> commit $(git rev-parse --short HEAD 2>/dev/null)  model=$MODEL  data_seed=$SEED  model_seed=$MODEL_SEED  arm=$ARM  save_dir=$SAVE_DIR"
+echo ">>> commit $(git rev-parse --short HEAD 2>/dev/null)  model=$MODEL  data_seed=$SEED  model_seed=$MODEL_SEED  init_seed=${INIT_SEED:-$MODEL_SEED}  arm=$ARM  save_dir=$SAVE_DIR"
 
 python moving_mnist/train.py "${COMMON[@]}" "${EXTRA[@]}" "${RESUME[@]}"
