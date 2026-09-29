@@ -116,6 +116,11 @@ def get_args(argv=None):
     p.add_argument('--head_blocks', type=int, default=3)
     p.add_argument('--head_mlp_hidden', type=int, default=128)
     p.add_argument('--head_dropout', type=float, default=0.0)
+    p.add_argument('--head_mlp_act', choices=['relu', 'leaky'], default='relu',
+                   help="Activation of the head MLP's hidden layer. With 'relu' all of "
+                        "its units can die (every chance-level run so far: constant "
+                        "logits, train loss flat at 2.3011, no gradient to the backbone); "
+                        "'leaky' (LeakyReLU 0.01) cannot. Same initial weights either way.")
     p.add_argument('--precise_bn_batches', type=int, default=50,
                    help="Batches used to RE-ESTIMATE BatchNorm statistics before each "
                         "evaluation (0 = off, use the running EMA). BatchNorm's EMA is "

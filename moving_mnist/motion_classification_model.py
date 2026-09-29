@@ -154,13 +154,25 @@ class ConvClassifierHead(nn.Module):
     chance and 0.94 across epochs while training accuracy rose smoothly. The fix
     is not to abandon BatchNorm but to RECOMPUTE its statistics before each
     evaluation -- see `recompute_bn_stats`.
+
+    The MLP's hidden ReLU has no normalisation in front of it, and it can DIE: every
+    run of the h16m32xs arm that stayed at chance (and, by the same train-loss
+    signature, every chance-level run in the project's history) ended with all of its
+    hidden units negative for every input. The logits are then one constant (the
+    class prior, loss 2.3011), no gradient reaches the conv blocks or the backbone,
+    and the run can never recover -- LSTM s13 was learning at epoch 5 and dead at 6.
+    The conv blocks' ReLUs, which sit behind BatchNorm, never died. mlp_act="leaky"
+    (LeakyReLU 0.01) removes that absorbing state; it has no parameters, so a seed
+    initialises bit-identically under either activation.
     """
 
     def __init__(self, in_channels, n_classes=10, channels=64, n_blocks=3,
-                 mlp_hidden=128, dropout=0.0, norm="batch", groups=8):
+                 mlp_hidden=128, dropout=0.0, norm="batch", groups=8, mlp_act="relu"):
         super().__init__()
         if norm not in ("group", "batch", "none"):
             raise ValueError(f"unknown head norm {norm!r}")
+        if mlp_act not in ("relu", "leaky"):
+            raise ValueError(f"unknown head mlp_act {mlp_act!r}")
         self.norm = norm
 
         def make_norm(c):
@@ -182,7 +194,7 @@ class ConvClassifierHead(nn.Module):
         self.conv = nn.Sequential(*layers)
         self.mlp = nn.Sequential(
             nn.Linear(2 * channels, mlp_hidden),
-            nn.ReLU(inplace=True),
+            nn.LeakyReLU(0.01, inplace=True) if mlp_act == "leaky" else nn.ReLU(inplace=True),
             nn.Dropout(dropout) if dropout > 0 else nn.Identity(),
             nn.Linear(mlp_hidden, n_classes),
         )
@@ -209,7 +221,8 @@ class MotionDigitClassifier(nn.Module):
                  velocity_pool="attention", pool_temperature=1.0,
                  velocity_source="bootstrap",
                  head_channels=64, head_blocks=3, head_mlp_hidden=128,
-                 head_dropout=0.0, head_norm="batch", input_channels=1):
+                 head_dropout=0.0, head_norm="batch", input_channels=1,
+                 head_mlp_act="relu"):
         super().__init__()
         self.model = model
         self.hidden_channels = hidden_channels
@@ -260,7 +273,7 @@ class MotionDigitClassifier(nn.Module):
         self.head = ConvClassifierHead(
             head_in, n_classes=n_classes, channels=head_channels,
             n_blocks=head_blocks, mlp_hidden=head_mlp_hidden, dropout=head_dropout,
-            norm=head_norm)
+            norm=head_norm, mlp_act=head_mlp_act)
         self.pool = VelocityPool(velocity_pool, self.n_velocities,
                                  hidden_channels, temperature=pool_temperature)
 
@@ -618,4 +631,5 @@ def build_classifier(cfg):
         head_mlp_hidden=get("head_mlp_hidden", 128),
         head_dropout=get("head_dropout", 0.0),
         head_norm=get("head_norm", "batch"),
+        head_mlp_act=get("head_mlp_act", "relu"),
     )
