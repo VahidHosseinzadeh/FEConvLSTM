@@ -858,7 +858,6 @@ def main(argv=None):
     # resumed run lands on the same curve
     lr_fn = None
     if args.lr_schedule == "cosine":
-        import math
         total = args.epochs * len(train_loader)
         warm = max(1, int(round(args.warmup_epochs * len(train_loader))))
 
@@ -878,7 +877,6 @@ def main(argv=None):
         frac = epoch / (E - 1)
         if args.x_curriculum_shape == "linear":
             return 1.0 - frac
-        import math
         return 0.5 * (1.0 + math.cos(math.pi * frac))
     criterion = nn.CrossEntropyLoss()
 
