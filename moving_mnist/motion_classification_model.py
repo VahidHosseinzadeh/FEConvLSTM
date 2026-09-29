@@ -214,6 +214,10 @@ class MotionDigitClassifier(nn.Module):
         self.model = model
         self.hidden_channels = hidden_channels
         self.velocity_source = velocity_source
+        # Stochastic handover (melstm, velocity_source "tracked", training only): the
+        # probability that a step takes the frame-pair velocity instead of the slots'
+        # own h-tracked one. Set per epoch by the training loop; 0 = off.
+        self.x_track_p = 0.0
 
         if model in ("lstm", "felstm"):
             if model == "lstm":
@@ -394,6 +398,50 @@ class MotionDigitClassifier(nn.Module):
 
         return h, c, vels, states
 
+    def _encode_melstm_mixed(self, seq, p, return_states=False):
+        """
+        The stochastic handover of the x-tracking curriculum (training only). Every
+        step t >= 2 of every sequence takes the frame-pair velocity (the raw pair's
+        top-K peaks, matched to the slots' previous velocities, as `frame_pair` does)
+        with probability p, and the slots' own h-tracked velocity (as `tracked` does)
+        otherwise. Step 1 is the raw-pair bootstrap both sources share. p = 1 gives
+        the frame_pair encoder and p = 0 the tracked one, exactly: no random draw is
+        made at either end.
+        """
+        cell = self.backbone.cell
+        B, T, C, H, W = seq.shape
+        K = self.n_velocities
+
+        h, c = cell.init_hidden(B, K, H, W, seq.device, seq.dtype)
+        v = torch.zeros(B, K, 2, device=seq.device, dtype=seq.dtype)
+        vels = []
+        states = [] if return_states else None
+
+        for t in range(T):
+            if t == 1:
+                v = self.backbone.bootstrap_velocities(seq[:, 0], seq[:, 1])
+            elif t >= 2:
+                if p > 0:
+                    with torch.no_grad():
+                        cand = self._frame_pair_pc(seq[:, t - 1], seq[:, t])[0]
+                    v_x = self._match_to_slots(cand.to(seq.dtype), v)
+                if p >= 1:
+                    v = v_x
+                else:
+                    v_h = self.backbone.track_velocities(h, seq[:, t])
+                    if p <= 0:
+                        v = v_h
+                    else:
+                        use_x = torch.rand(B, device=seq.device) < p
+                        v = torch.where(use_x.view(B, 1, 1), v_x, v_h)
+            h, c = cell(seq[:, t], h, c, v)
+            if t > 0:
+                vels.append(v.detach())
+            if return_states:
+                states.append(h.mean(dim=2).detach())
+
+        return h, c, vels, states
+
     def encode(self, seq, return_states=False):
         """
         seq (B, T, C, H, W) -> h_T (B, V, Ch, H, W), velocities, states.
@@ -408,7 +456,11 @@ class MotionDigitClassifier(nn.Module):
             # Both frame-pair sources share the encoder; they differ only in how
             # _candidate_velocities picks the peaks. Only "tracked" uses the
             # backbone's own hidden-state tracking.
-            if self.velocity_source in ("frame_pair", "bootstrap"):
+            if (self.training and self.x_track_p > 0
+                    and self.velocity_source == "tracked"):
+                h, _, vels, states = self._encode_melstm_mixed(
+                    seq, self.x_track_p, return_states=return_states)
+            elif self.velocity_source in ("frame_pair", "bootstrap"):
                 h, _, vels, states = self._encode_melstm_frame_pair(
                     seq, return_states=return_states)
             else:

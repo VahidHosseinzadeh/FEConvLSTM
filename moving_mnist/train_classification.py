@@ -235,6 +235,24 @@ def get_args(argv=None):
                         'that default because it runs every --val_curve_interval steps: 8 '
                         'batches is already ~500 sequences of statistics per channel.')
     p.add_argument('--use_lr_scheduler', action='store_true')
+    p.add_argument('--lr_schedule', choices=['plateau', 'cosine'], default='plateau',
+                   help="plateau = ReduceLROnPlateau on val accuracy when --use_lr_scheduler "
+                        "(the original). cosine = linear warmup over --warmup_epochs, then "
+                        "cosine decay to --final_lr, per batch and fixed in advance; it "
+                        "ignores --use_lr_scheduler. A fixed schedule cannot cut the LR while "
+                        "a run is still at chance (the plateau scheduler's first cut came at "
+                        "epochs 6-12 in every run that never left chance).")
+    p.add_argument('--warmup_epochs', type=float, default=1.0, help='--lr_schedule cosine only')
+    p.add_argument('--final_lr', type=float, default=1e-5, help='--lr_schedule cosine only')
+    p.add_argument('--x_curriculum_epochs', type=int, default=0,
+                   help="melstm with --velocity_source tracked: the stochastic handover of the "
+                        "x-tracking curriculum. In training, every step t >= 2 of every sequence "
+                        "takes the frame-pair velocity with probability p(epoch) and its own "
+                        "h-tracked one otherwise; p falls from 1 at the first epoch to 0 at this "
+                        "many epochs in (--x_curriculum_shape), and evaluation is always "
+                        "h-tracking. 0 = off")
+    p.add_argument('--x_curriculum_shape', choices=['linear', 'cosine'], default='cosine',
+                   help='how p falls from 1 to 0 over --x_curriculum_epochs')
     p.add_argument('--lr_patience', type=int, default=4)
     p.add_argument('--lr_factor', type=float, default=0.5)
 
@@ -691,7 +709,7 @@ class ValCurveRecorder:
 # -------------------------------------------------------------------- epochs
 def run_epoch(model, loader, device, n_figures, criterion, optimizer=None,
               grad_clip=1.0, max_batches=None, collect_preds=False,
-              curve=None, global_step=0, curve_log_fn=None):
+              curve=None, global_step=0, curve_log_fn=None, lr_fn=None):
     train = optimizer is not None
     model.train(train)
     tot_loss = tot_correct = tot_n = 0
@@ -715,6 +733,9 @@ def run_epoch(model, loader, device, n_figures, criterion, optimizer=None,
             loss.backward()
             if grad_clip:
                 torch.nn.utils.clip_grad_norm_(model.trainable_parameters(), grad_clip)
+            if lr_fn is not None:
+                for g in optimizer.param_groups:
+                    g["lr"] = lr_fn(global_step)
             optimizer.step()
             global_step += 1
             if curve is not None:
@@ -749,6 +770,10 @@ def run_epoch(model, loader, device, n_figures, criterion, optimizer=None,
 # ---------------------------------------------------------------------- main
 def main(argv=None):
     args = get_args(argv)
+    if args.x_curriculum_epochs:
+        assert args.model == "melstm" and args.velocity_source == "tracked", \
+            "--x_curriculum_epochs needs --model melstm --velocity_source tracked"
+        assert args.x_curriculum_epochs >= 2, "--x_curriculum_epochs must be >= 2"
 
     if args.smoke_test:
         args.epochs, args.num_workers, args.use_wandb = 2, 0, False
@@ -828,7 +853,33 @@ def main(argv=None):
                                  weight_decay=args.weight_decay)
     scheduler = (torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode="max", factor=args.lr_factor, patience=args.lr_patience)
-        if args.use_lr_scheduler else None)
+        if args.use_lr_scheduler and args.lr_schedule == "plateau" else None)
+    # --lr_schedule cosine: per batch, a function of the global step only, so a
+    # resumed run lands on the same curve
+    lr_fn = None
+    if args.lr_schedule == "cosine":
+        import math
+        total = args.epochs * len(train_loader)
+        warm = max(1, int(round(args.warmup_epochs * len(train_loader))))
+
+        def lr_fn(step):
+            if step < warm:
+                return args.lr * (step + 1) / warm
+            q = min(1.0, (step - warm) / max(1, total - warm))
+            return args.final_lr + 0.5 * (args.lr - args.final_lr) * (1 + math.cos(math.pi * q))
+        print(f"LR schedule  : warmup {warm} steps to {args.lr:g}, cosine to "
+              f"{args.final_lr:g} at step {total} (plateau scheduler off)")
+
+    def x_track_p_at(epoch):
+        """Stochastic handover: P(frame-pair velocity) at this (0-based) epoch."""
+        E = args.x_curriculum_epochs
+        if E <= 0 or epoch >= E - 1:
+            return 0.0
+        frac = epoch / (E - 1)
+        if args.x_curriculum_shape == "linear":
+            return 1.0 - frac
+        import math
+        return 0.5 * (1.0 + math.cos(math.pi * frac))
     criterion = nn.CrossEntropyLoss()
 
     wandb = None
@@ -873,9 +924,12 @@ def main(argv=None):
 
     for epoch in range(start_epoch, args.epochs):
         t0 = time.time()
+        if args.x_curriculum_epochs:
+            model.x_track_p = x_track_p_at(epoch)
+            print(f"  stochastic handover: P(frame-pair velocity) = {model.x_track_p:.3f}")
         tr = run_epoch(model, train_loader, device, args.num_figures, criterion,
                        optimizer, args.grad_clip, curve=curve, global_step=global_step,
-                       curve_log_fn=curve_log_fn)
+                       curve_log_fn=curve_log_fn, lr_fn=lr_fn)
         # BatchNorm's EMA lags the weights badly here, so re-estimate it from the
         # TRAINING distribution before measuring. Without this the val number
         # reflects statistics the model was never trained under.
@@ -903,6 +957,7 @@ def main(argv=None):
         va.pop("_global_step", None)
         row = {"epoch": epoch, "time": time.time() - t0,
                "lr": optimizer.param_groups[0]["lr"],
+               **({"x_track_p": model.x_track_p} if args.x_curriculum_epochs else {}),
                **{f"train_{k}": v for k, v in tr.items()},
                **{f"val_{k}": v for k, v in va.items()},
                **te_row}
