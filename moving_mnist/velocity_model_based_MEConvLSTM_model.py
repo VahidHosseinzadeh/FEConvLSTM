@@ -9,6 +9,13 @@ from velocity_predictor_model import PhaseCorrelation
 
 class MEConvLSTMCell(nn.Module):
 
+    # Every velocity this model produces is a whole pixel: phase-correlation argmax
+    # peaks, whether tracked, bootstrapped, taken from the raw frame pair or frozen.
+    # Whole-pixel shifts land exactly on source pixels, so warp() needs no padding.
+    # Set False only if sub-pixel velocities are ever introduced; then the 1-px
+    # circular pad is required (see warp()).
+    integer_shift = True
+
     def __init__(self, input_dim, hidden_dim, kernel_size=3, bias=True):
         super().__init__()
 
@@ -62,19 +69,27 @@ class MEConvLSTMCell(nn.Module):
         yy = yy.unsqueeze(0).expand(B * K, -1, -1)
         xx = xx.unsqueeze(0).expand(B * K, -1, -1)
 
-        # remainder() puts the source coordinate in [0, H), but align_corners
-        # normalisation only reaches pixel H-1 at +1. A fractional residual in
-        # (H-1, H) -- the band straddling the wrap -- would normalise above 1
-        # and get clamped to the last row instead of interpolating against row
-        # 0. Sampling from a 1-px circular pad makes that band a real interior
-        # interpolation: source p in [0, H) sits at padded coordinate p+1,
-        # normalised over the padded extent H+2 (align_corners -> divide by
-        # H+1). Integer velocities are unaffected (they land on grid points
-        # either way); this is what makes sub-pixel velocities safe.
-        x = F.pad(x, (1, 1, 1, 1), mode="circular")
+        if self.integer_shift:
+            # Whole-pixel shifts: the source coordinate is an integer in [0, H),
+            # an exact grid point, so no pad is needed. The pad below is ~170
+            # extra tiny ops per call (forward + backward) and 50 calls per
+            # training step -- on the GPU, kernel-launch bound at 36x36, that was
+            # ~43 s per epoch (MELSTM 198 s vs 155 s) for no change in output.
+            yy = 2 * torch.remainder(yy - dy, H) / (H - 1) - 1
+            xx = 2 * torch.remainder(xx - dx, W) / (W - 1) - 1
+        else:
+            # remainder() puts the source coordinate in [0, H), but align_corners
+            # normalisation only reaches pixel H-1 at +1. A fractional residual in
+            # (H-1, H) -- the band straddling the wrap -- would normalise above 1
+            # and get clamped to the last row instead of interpolating against row
+            # 0. Sampling from a 1-px circular pad makes that band a real interior
+            # interpolation: source p in [0, H) sits at padded coordinate p+1,
+            # normalised over the padded extent H+2 (align_corners -> divide by
+            # H+1). This is what makes sub-pixel velocities safe.
+            x = F.pad(x, (1, 1, 1, 1), mode="circular")
 
-        yy = 2 * (torch.remainder(yy - dy, H) + 1) / (H + 1) - 1
-        xx = 2 * (torch.remainder(xx - dx, W) + 1) / (W + 1) - 1
+            yy = 2 * (torch.remainder(yy - dy, H) + 1) / (H + 1) - 1
+            xx = 2 * (torch.remainder(xx - dx, W) + 1) / (W + 1) - 1
 
         grid = torch.stack([xx, yy], dim=-1)
         x = F.grid_sample(x, grid, mode="bilinear",
