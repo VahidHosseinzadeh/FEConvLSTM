@@ -20,6 +20,8 @@
 # and the wandb name.
 # INIT_SCHEME=delta (environment): the centre tap of the input -> candidate kernel
 # starts at +1 (train.py --init_scheme). Adds _delta to the save dir and the wandb name.
+# EXTRA_ARGS="..." (environment): appended to train.py's arguments as they are, for a
+# one-off flag that does not change the save dir or name (e.g. --len_gen_at_end).
 # Auto-resumes from the newest matching checkpoint_*.pth if a previous
 # attempt crashed. If you CHANGE any setting below, delete the stale
 # checkpoints first (rm experiments/run_state/checkpoint_<model>_*.pth) so
@@ -242,6 +244,10 @@ if [ -n "$INIT_SEED" ]; then
 fi
 if [ -n "$INIT_SCHEME" ]; then
   COMMON+=(--init_scheme "$INIT_SCHEME")
+fi
+if [ -n "$EXTRA_ARGS" ]; then
+  # unquoted on purpose: EXTRA_ARGS is a list of arguments
+  COMMON+=(${EXTRA_ARGS})
 fi
 if [ -n "$SMOKE" ]; then
   # unquoted on purpose: SMOKE_EXTRA is a list of arguments
