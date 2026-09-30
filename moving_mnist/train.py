@@ -135,6 +135,23 @@ def build_model_seeded(args):
     return model
 
 
+def apply_init_scheme(model, scheme):
+    """--init_scheme delta: after the default initialization, set the centre tap of the
+    input -> candidate (g) kernel to +1 for every hidden channel, so each cell starts by
+    writing a copy of the frame into its state (in the spirit of identity inits for
+    RNNs). Measured on the untrained MELSTM, pure h-tracking, on seeds 1-6 and 42: the
+    slots then hit a real digit velocity on every seed, against 1-81% with the default.
+    No random draws, so the rest of the run's stream is the default run's."""
+    if scheme == "default":
+        return model
+    cell = model.cell
+    ch = getattr(cell, "hidden_dim", None) or cell.hidden_channels
+    k = cell.conv.weight.shape[-1] // 2
+    with torch.no_grad():
+        cell.conv.weight[3 * ch:4 * ch, 0, k, k] = 1.0     # gates are i, f, o, g; input is channel 0
+    return model
+
+
 def main():
     parser = argparse.ArgumentParser(description="Train & evaluate RNN models on Moving MNIST")
     parser.add_argument('--root', type=str, default='./data')
@@ -246,6 +263,10 @@ def main():
                         help='Seed for the initial weights only (default: --model_seed). The weights are those a '
                              '--model_seed=<init_seed> run starts from; everything after them (the on-the-fly '
                              'training stream, the val draws) is exactly the --model_seed run\'s')
+    parser.add_argument('--init_scheme', choices=['default', 'delta'], default='default',
+                        help="'delta': after the default init, set the centre tap of the input -> "
+                             "candidate kernel to +1 (the cell starts by copying the frame into its "
+                             "state). Untrained MELSTM then tracks a real digit on every seed tried.")
     parser.add_argument('--run_name', type=str, default=None, help='Name of the run')
     parser.add_argument('--model_save_dir', type=str, default='./fernn/movmnist/', help='Directory to save model checkpoints')
     parser.add_argument('--load_model', type=str, default=None, help='Path to a saved model checkpoint to load for evaluation')
@@ -551,7 +572,7 @@ def main():
     
     # Single construction path shared with motion_generalization.py, so an
     # offline evaluation cannot rebuild a different architecture than was trained.
-    model = build_model_seeded(args).to(device)
+    model = apply_init_scheme(build_model_seeded(args), args.init_scheme).to(device)
 
     # Parameter count: printed per top-level submodule and stored in the
     # wandb config so runs of different models are directly comparable.

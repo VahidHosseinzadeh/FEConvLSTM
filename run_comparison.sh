@@ -18,6 +18,8 @@
 # (the training stream, the val draws) from the model seed -- to tell whether a seed's
 # outcome lives in its initialization or in its data. Adds _init<s> to the save dir
 # and the wandb name.
+# INIT_SCHEME=delta (environment): the centre tap of the input -> candidate kernel
+# starts at +1 (train.py --init_scheme). Adds _delta to the save dir and the wandb name.
 # Auto-resumes from the newest matching checkpoint_*.pth if a previous
 # attempt crashed. If you CHANGE any setting below, delete the stale
 # checkpoints first (rm experiments/run_state/checkpoint_<model>_*.pth) so
@@ -124,7 +126,8 @@ SEED=42            # DATA seed -- fixed; vary the model seed (2nd argument) inst
 # resubmit counters are per model, so runs sharing a directory would resume and stop
 # each other. (submit_comparison.sbatch computes the same path -- keep the two in step.)
 INIT_SEED=${INIT_SEED:-}
-INIT_TAG=${INIT_SEED:+_init${INIT_SEED}}
+INIT_SCHEME=${INIT_SCHEME:-}
+INIT_TAG=${INIT_SEED:+_init${INIT_SEED}}${INIT_SCHEME:+_${INIT_SCHEME}}
 SAVE_DIR=./experiments_ms${MODEL_SEED}_${ARM}${INIT_TAG}
 # SMOKE=1 bash run_comparison.sh ...: 2 epochs on 256 training sequences, wandb
 # offline, under ./smoke/ -- checks that an arm starts, trains and finishes without
@@ -237,6 +240,9 @@ COMMON=(
 if [ -n "$INIT_SEED" ]; then
   COMMON+=(--init_seed "$INIT_SEED")
 fi
+if [ -n "$INIT_SCHEME" ]; then
+  COMMON+=(--init_scheme "$INIT_SCHEME")
+fi
 if [ -n "$SMOKE" ]; then
   # unquoted on purpose: SMOKE_EXTRA is a list of arguments
   COMMON+=(--max_train_samples 256 ${SMOKE_EXTRA:-})
@@ -308,6 +314,6 @@ fi
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 # wandb records no git info from inside the jobs, so say it in the log.
-echo ">>> commit $(git rev-parse --short HEAD 2>/dev/null)  model=$MODEL  data_seed=$SEED  model_seed=$MODEL_SEED  init_seed=${INIT_SEED:-$MODEL_SEED}  arm=$ARM  save_dir=$SAVE_DIR"
+echo ">>> commit $(git rev-parse --short HEAD 2>/dev/null)  model=$MODEL  data_seed=$SEED  model_seed=$MODEL_SEED  init_seed=${INIT_SEED:-$MODEL_SEED}  init_scheme=${INIT_SCHEME:-default}  arm=$ARM  save_dir=$SAVE_DIR"
 
 python moving_mnist/train.py "${COMMON[@]}" "${EXTRA[@]}" "${RESUME[@]}"
