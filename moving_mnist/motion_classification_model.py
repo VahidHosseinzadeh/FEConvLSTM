@@ -154,13 +154,25 @@ class ConvClassifierHead(nn.Module):
     chance and 0.94 across epochs while training accuracy rose smoothly. The fix
     is not to abandon BatchNorm but to RECOMPUTE its statistics before each
     evaluation -- see `recompute_bn_stats`.
+
+    The MLP's hidden ReLU has no normalisation in front of it, and it can DIE: every
+    run of the h16m32xs arm that stayed at chance (and, by the same train-loss
+    signature, every chance-level run in the project's history) ended with all of its
+    hidden units negative for every input. The logits are then one constant (the
+    class prior, loss 2.3011), no gradient reaches the conv blocks or the backbone,
+    and the run can never recover -- LSTM s13 was learning at epoch 5 and dead at 6.
+    The conv blocks' ReLUs, which sit behind BatchNorm, never died. mlp_act="leaky"
+    (LeakyReLU 0.01) removes that absorbing state; it has no parameters, so a seed
+    initialises bit-identically under either activation.
     """
 
     def __init__(self, in_channels, n_classes=10, channels=64, n_blocks=3,
-                 mlp_hidden=128, dropout=0.0, norm="batch", groups=8):
+                 mlp_hidden=128, dropout=0.0, norm="batch", groups=8, mlp_act="relu"):
         super().__init__()
         if norm not in ("group", "batch", "none"):
             raise ValueError(f"unknown head norm {norm!r}")
+        if mlp_act not in ("relu", "leaky"):
+            raise ValueError(f"unknown head mlp_act {mlp_act!r}")
         self.norm = norm
 
         def make_norm(c):
@@ -182,7 +194,7 @@ class ConvClassifierHead(nn.Module):
         self.conv = nn.Sequential(*layers)
         self.mlp = nn.Sequential(
             nn.Linear(2 * channels, mlp_hidden),
-            nn.ReLU(inplace=True),
+            nn.LeakyReLU(0.01, inplace=True) if mlp_act == "leaky" else nn.ReLU(inplace=True),
             nn.Dropout(dropout) if dropout > 0 else nn.Identity(),
             nn.Linear(mlp_hidden, n_classes),
         )
@@ -209,11 +221,16 @@ class MotionDigitClassifier(nn.Module):
                  velocity_pool="attention", pool_temperature=1.0,
                  velocity_source="bootstrap",
                  head_channels=64, head_blocks=3, head_mlp_hidden=128,
-                 head_dropout=0.0, head_norm="batch", input_channels=1):
+                 head_dropout=0.0, head_norm="batch", input_channels=1,
+                 head_mlp_act="relu"):
         super().__init__()
         self.model = model
         self.hidden_channels = hidden_channels
         self.velocity_source = velocity_source
+        # Stochastic handover (melstm, velocity_source "tracked", training only): the
+        # probability that a step takes the frame-pair velocity instead of the slots'
+        # own h-tracked one. Set per epoch by the training loop; 0 = off.
+        self.x_track_p = 0.0
 
         if model in ("lstm", "felstm"):
             if model == "lstm":
@@ -256,7 +273,7 @@ class MotionDigitClassifier(nn.Module):
         self.head = ConvClassifierHead(
             head_in, n_classes=n_classes, channels=head_channels,
             n_blocks=head_blocks, mlp_hidden=head_mlp_hidden, dropout=head_dropout,
-            norm=head_norm)
+            norm=head_norm, mlp_act=head_mlp_act)
         self.pool = VelocityPool(velocity_pool, self.n_velocities,
                                  hidden_channels, temperature=pool_temperature)
 
@@ -394,6 +411,50 @@ class MotionDigitClassifier(nn.Module):
 
         return h, c, vels, states
 
+    def _encode_melstm_mixed(self, seq, p, return_states=False):
+        """
+        The stochastic handover of the x-tracking curriculum (training only). Every
+        step t >= 2 of every sequence takes the frame-pair velocity (the raw pair's
+        top-K peaks, matched to the slots' previous velocities, as `frame_pair` does)
+        with probability p, and the slots' own h-tracked velocity (as `tracked` does)
+        otherwise. Step 1 is the raw-pair bootstrap both sources share. p = 1 gives
+        the frame_pair encoder and p = 0 the tracked one, exactly: no random draw is
+        made at either end.
+        """
+        cell = self.backbone.cell
+        B, T, C, H, W = seq.shape
+        K = self.n_velocities
+
+        h, c = cell.init_hidden(B, K, H, W, seq.device, seq.dtype)
+        v = torch.zeros(B, K, 2, device=seq.device, dtype=seq.dtype)
+        vels = []
+        states = [] if return_states else None
+
+        for t in range(T):
+            if t == 1:
+                v = self.backbone.bootstrap_velocities(seq[:, 0], seq[:, 1])
+            elif t >= 2:
+                if p > 0:
+                    with torch.no_grad():
+                        cand = self._frame_pair_pc(seq[:, t - 1], seq[:, t])[0]
+                    v_x = self._match_to_slots(cand.to(seq.dtype), v)
+                if p >= 1:
+                    v = v_x
+                else:
+                    v_h = self.backbone.track_velocities(h, seq[:, t])
+                    if p <= 0:
+                        v = v_h
+                    else:
+                        use_x = torch.rand(B, device=seq.device) < p
+                        v = torch.where(use_x.view(B, 1, 1), v_x, v_h)
+            h, c = cell(seq[:, t], h, c, v)
+            if t > 0:
+                vels.append(v.detach())
+            if return_states:
+                states.append(h.mean(dim=2).detach())
+
+        return h, c, vels, states
+
     def encode(self, seq, return_states=False):
         """
         seq (B, T, C, H, W) -> h_T (B, V, Ch, H, W), velocities, states.
@@ -408,7 +469,11 @@ class MotionDigitClassifier(nn.Module):
             # Both frame-pair sources share the encoder; they differ only in how
             # _candidate_velocities picks the peaks. Only "tracked" uses the
             # backbone's own hidden-state tracking.
-            if self.velocity_source in ("frame_pair", "bootstrap"):
+            if (self.training and self.x_track_p > 0
+                    and self.velocity_source == "tracked"):
+                h, _, vels, states = self._encode_melstm_mixed(
+                    seq, self.x_track_p, return_states=return_states)
+            elif self.velocity_source in ("frame_pair", "bootstrap"):
                 h, _, vels, states = self._encode_melstm_frame_pair(
                     seq, return_states=return_states)
             else:
@@ -566,4 +631,5 @@ def build_classifier(cfg):
         head_mlp_hidden=get("head_mlp_hidden", 128),
         head_dropout=get("head_dropout", 0.0),
         head_norm=get("head_norm", "batch"),
+        head_mlp_act=get("head_mlp_act", "relu"),
     )
