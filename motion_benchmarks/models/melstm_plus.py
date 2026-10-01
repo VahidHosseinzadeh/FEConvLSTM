@@ -127,6 +127,10 @@ class MEConvLSTMPlus(Seq2SeqMEConvLSTM):
                          n_slots=n_slots, kernel_size=kernel_size, slot_reduce=slot_reduce,
                          decoder_layers=decoder_layers, decoder_channels=decoder_channels,
                          bias=bias, batch_first=True, phase_corr_kwargs=phase_corr_kwargs)
+        # Velocities here can be sub-pixel (parabolic PC peaks, the oracle, mean flow), so the
+        # warp must use its exact path with the 1-px circular pad, not Moving MNIST's
+        # whole-pixel fast path (MEConvLSTMCell.integer_shift).
+        self.cell.integer_shift = False
         if velocity_source not in VELOCITY_SOURCES:
             raise ValueError(f"velocity_source must be one of {VELOCITY_SOURCES}")
         if residual not in RESIDUALS:

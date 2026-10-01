@@ -45,11 +45,22 @@ def test_matches_moving_mnist_warp_convention():
     """The package's bilinear shift == MEConvLSTMCell.warp (the model's transport)."""
     from velocity_model_based_MEConvLSTM_model import MEConvLSTMCell
     cell = MEConvLSTMCell(1, 4)
+    cell.integer_shift = False                 # sub-pixel shifts need the exact (padded) warp
     x = torch.randn(3, 1, 4, 20, 24)
     u = torch.tensor([[[1.3, -0.4]], [[-2.0, 1.0]], [[0.25, 0.75]]])
     w = cell.warp(x, u)[:, 0]
     s = bilinear_shift_torch(x[:, 0], u[:, 0])
     assert torch.allclose(w, s, atol=1e-5)
+    # Moving MNIST's whole-pixel fast path agrees on whole-pixel shifts
+    cell.integer_shift = True
+    ui = torch.tensor([[[1.0, -3.0]], [[-2.0, 1.0]], [[0.0, 5.0]]])
+    assert torch.allclose(cell.warp(x, ui)[:, 0], bilinear_shift_torch(x[:, 0], ui[:, 0]), atol=1e-5)
+
+
+def test_motion_benchmark_models_use_the_exact_warp():
+    """Sub-pixel velocities: every MEConvLSTM built here must take the padded warp."""
+    from motion_benchmarks.models.melstm_plus import MEConvLSTMPlus
+    assert MEConvLSTMPlus(1, 4, n_slots=2).cell.integer_shift is False
 
 
 def test_cumulative_displacement_convention():

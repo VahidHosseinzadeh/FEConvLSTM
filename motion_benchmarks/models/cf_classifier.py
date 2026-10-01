@@ -40,6 +40,9 @@ class MotionVideoClassifier(MotionDigitClassifier):
                 self.backbone.phase_corr_bootstrap = PhaseCorrelation(
                     n_modes=self.backbone.n_slots, **pc)
                 self.backbone.phase_corr_track = PhaseCorrelation(n_modes=1, **pc)
+        if hasattr(self.backbone.cell, "integer_shift"):
+            # sub-pixel velocities need the exact warp (see MEConvLSTMCell.integer_shift)
+            self.backbone.cell.integer_shift = False
         set_forget_bias(self.backbone.cell.conv, self.hidden_channels, short=forget_bias,
                         long=forget_bias_long, long_fraction=long_fraction)
         self.readout_steps = int(readout_steps)

@@ -38,10 +38,16 @@ def test_melstm_plus_default_is_parent():
     for pa, pb in zip(a.parameters(), b.parameters()):
         assert torch.equal(pa, pb)
     inp, tgt = x[:, :4], x[:, 4:]
-    for track in (True, False):
-        ya, va = a(inp, 3, target_seq=tgt, track_decoder_velocity=track, return_velocity=True)
-        yb, vb = b(inp, 3, target_seq=tgt, track_decoder_velocity=track, return_velocity=True)
-        assert torch.equal(ya, yb) and torch.equal(va, vb)
+    # MEConvLSTMPlus always takes the exact (padded) warp; the parent's whole-pixel fast
+    # path agrees to float rounding, so compare bit for bit on the same warp, and to 1e-5
+    # against the parent's own default
+    for exact in (True, False):
+        a.cell.integer_shift = not exact
+        for track in (True, False):
+            ya, va = a(inp, 3, target_seq=tgt, track_decoder_velocity=track, return_velocity=True)
+            yb, vb = b(inp, 3, target_seq=tgt, track_decoder_velocity=track, return_velocity=True)
+            assert torch.equal(va, vb)
+            assert torch.equal(ya, yb) if exact else torch.allclose(ya, yb, atol=1e-5)
 
 
 def test_felstm_plus_default_is_parent():
