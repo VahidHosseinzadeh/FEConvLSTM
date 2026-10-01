@@ -37,6 +37,7 @@ import torch.nn as nn  # noqa: E402
 from torch.utils.data import DataLoader  # noqa: E402
 
 from motion_benchmarks import _repo  # noqa: E402,F401
+from motion_benchmarks.common.deadline import Deadline, add_deadline_args  # noqa: E402
 from motion_benchmarks.datasets.common_fate_video import (WEIZMANN_ACTIONS,  # noqa: E402
                                                           DeformingCommonFateMNIST,
                                                           WeizmannCommonFate,
@@ -109,6 +110,7 @@ def get_args(argv=None):
     p.add_argument("--save_dir", type=str, default="./experiments/motion_benchmarks_cf")
     p.add_argument("--run_name", type=str, default=None)
     p.add_argument("--smoke_test", action="store_true")
+    add_deadline_args(p)
     a = p.parse_args(argv)
     if a.smoke_test:
         a.train_size, a.val_size, a.test_size = 16, 8, 8
@@ -216,7 +218,15 @@ def main(argv=None):
     opt = torch.optim.Adam(params, lr=a.lr, weight_decay=a.weight_decay)
     crit = nn.CrossEntropyLoss()
     history, best = [], -1.0
+    deadline, stopped_at, final_eval_s = Deadline(a.stop_at, a.eval_reserve_min), None, 0.0
+    if deadline.active and deadline.remaining() < deadline.reserve:
+        raise SystemExit(f"[train_cf_video] --stop_at {a.stop_at}: no time left to train")
+    eval_units = a.test_size * (2 if "test_shuffled" in loaders else 1) / max(a.val_size, 1)
     for epoch in range(a.epochs):
+        if epoch > 0 and not deadline.room_for_epoch(final_eval_s):
+            stopped_at = epoch
+            print(f"[train_cf_video] --stop_at {a.stop_at}: stopping before epoch {epoch}")
+            break
         model.train()
         tl, tc, tn, t0 = 0.0, 0, 0, time.time()
         for b, (seq, y, _) in enumerate(loaders["train"]):
@@ -235,10 +245,13 @@ def main(argv=None):
             tn += len(y)
         with torch.no_grad():
             recompute_bn_stats(model, loaders["train"], device, a.precise_bn_batches)
+        t_val = time.time()
         val = evaluate(model, loaders["val"], device, n_classes)
+        final_eval_s = 1.3 * (time.time() - t_val) * eval_units + 120.0
         row = dict(epoch=epoch, train_loss=tl / max(tn, 1), train_acc=tc / max(tn, 1),
                    val_acc=val["accuracy"], time=time.time() - t0)
         history.append(row)
+        deadline.epoch_done(time.time() - t0)
         print(f"[epoch {epoch:3d}] loss {row['train_loss']:.4f} train {row['train_acc']:.3f} "
               f"val {row['val_acc']:.3f} ({row['time']:.0f}s)")
         if val["accuracy"] > best:
@@ -248,6 +261,7 @@ def main(argv=None):
     with torch.no_grad():
         recompute_bn_stats(model, loaders["train"], device, a.precise_bn_batches)
     res = dict(args=vars(a), info=info, history=history, best_val=best,
+               stopped_by_deadline_at=stopped_at,
                test=evaluate(model, loaders["test"], device, n_classes))
     if "test_shuffled" in loaders:
         res["test_shuffled"] = evaluate(model, loaders["test_shuffled"], device, n_classes)

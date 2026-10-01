@@ -44,6 +44,7 @@ from torch.utils.data import DataLoader  # noqa: E402
 from motion_benchmarks import _repo  # noqa: E402,F401
 from motion_benchmarks.common.metrics import (FSS, Categorical, PerLeadError,  # noqa: E402
                                               ke_spectrum, log_spectral_distance, nusselt_volume)
+from motion_benchmarks.common.deadline import Deadline, add_deadline_args  # noqa: E402
 from motion_benchmarks.datasets.registry import REGISTRY  # noqa: E402
 from motion_benchmarks.models.factory import (NEEDS_MOTION, TRAINABLE,  # noqa: E402
                                               add_model_args, build_model, count_parameters,
@@ -96,6 +97,7 @@ def get_args(argv=None):
     t.add_argument("--device", type=str, default=None)
     t.add_argument("--no_baselines", action="store_true",
                    help="skip evaluating the persistence baselines on the test sets")
+    add_deadline_args(t)
 
     o = p.add_argument_group("output")
     o.add_argument("--save_dir", type=str, default="./experiments/motion_benchmarks")
@@ -396,12 +398,32 @@ def main(argv=None):
 
     select_track = args.eval_velocity_mode == "tracked"
     bad_epochs = 0
+    # --stop_at: the final evaluation, in units of one validation pass (val_size sequences),
+    # for the estimate of how long it takes
+    deadline, stopped_at = Deadline(args.stop_at, args.eval_reserve_min), None
+    n_modes = 2 if args.eval_velocity_mode == "both" and isinstance(model, Seq2SeqMEConvLSTM) else 1
+    eval_units = (args.test_size
+                  + (args.gen_test_size * max(1.0, args.gen_pred_frames / args.pred_frames)
+                     if gen_loader is not None else 0)
+                  + args.extra_test_size * len(extra_loaders)) / max(args.val_size, 1)
+    eval_units *= n_modes + (0 if args.no_baselines else 2)
+    if trainable and deadline.active and deadline.remaining() < deadline.reserve:
+        raise SystemExit(f"[train_motion] --stop_at {args.stop_at}: no time left to train")
+    final_eval_s = 0.0
     if trainable:
         for epoch in range(start_epoch, args.epochs):
+            if epoch > start_epoch and not deadline.room_for_epoch(final_eval_s):
+                stopped_at = epoch
+                print(f"[train_motion] --stop_at {args.stop_at}: stopping before epoch {epoch} "
+                      f"(epoch {deadline.longest_epoch:.0f}s, final evaluation ~{final_eval_s:.0f}s)")
+                break
+            t_epoch = time.time()
             tr_loss, tr_time = train_epoch(model, train_loader, optimizer, criterion, args,
                                            device, epoch)
+            t_val = time.time()
             val = evaluate(model, val_loader, args, meta, device, criterion, track=select_track,
                            full=False)
+            final_eval_s = 1.3 * (time.time() - t_val) * eval_units + 120.0
             row = dict(epoch=epoch, train_loss=tr_loss, val_loss=val["loss"],
                        val_mse=val.get("mse_mean"), lr=optimizer.param_groups[0]["lr"],
                        train_time=tr_time)
@@ -412,6 +434,7 @@ def main(argv=None):
             print(f"[epoch {epoch:3d}] train {tr_loss:.5f}  val {val['loss']:.5f}"
                   + (f"  val_tracked {row['val_tracked_loss']:.5f}" if "val_tracked_loss" in row else "")
                   + f"  lr {row['lr']:.2e}  ({tr_time:.0f}s)")
+            deadline.epoch_done(time.time() - t_epoch)
             if wb is not None:
                 wb.log(row, step=epoch)
             if scheduler is not None:
@@ -437,7 +460,7 @@ def main(argv=None):
 
     # -------------------------------------------------------------- final evaluation
     results = dict(args=vars(args), meta=meta, params=n_params, history=history,
-                   best_epoch=best_epoch, best_val=best_val)
+                   best_epoch=best_epoch, best_val=best_val, stopped_by_deadline_at=stopped_at)
     track_modes = {"frozen": [False], "tracked": [True], "both": [False, True]}[args.eval_velocity_mode]
     if not isinstance(model, Seq2SeqMEConvLSTM):
         track_modes = [False]
