@@ -184,11 +184,22 @@ class Seq2SeqFEConvLSTM(nn.Module):
                  v_range=0,
                  pool_type='max',
                  decoder_conv_layers=1,
-                 decoder_channels=None):
+                 decoder_channels=None,
+                 detach_feedback=True,
+                 decoder_act="relu"):
+        """
+        detach_feedback -- the decoder feeds its prediction back as the next input;
+            True cuts the gradient through that path (the original), False keeps it.
+        decoder_act -- decoder hidden activation: "relu" (the original) or "leaky"
+            (LeakyReLU 0.01, cannot die). Same options as Seq2SeqMEConvLSTM.
+        """
 
         super().__init__()
+        if decoder_act not in ("relu", "leaky"):
+            raise ValueError(f"decoder_act {decoder_act!r}: expected 'relu' or 'leaky'")
 
         self.pool_type = pool_type
+        self.detach_feedback = detach_feedback
 
         self.output_channels = (
             output_channels
@@ -233,7 +244,7 @@ class Seq2SeqFEConvLSTM(nn.Module):
                     padding_mode='circular',
                     bias=True
                 ),
-                nn.ReLU()
+                nn.LeakyReLU(0.01) if decoder_act == "leaky" else nn.ReLU()
             ]
             in_ch = decoder_channels
 
@@ -305,7 +316,7 @@ class Seq2SeqFEConvLSTM(nn.Module):
         # Decoder
         for t in range(pred_len):
 
-            frame = prev.detach()
+            frame = prev.detach() if self.detach_feedback else prev
 
             h, c = self.cell(
                 frame,

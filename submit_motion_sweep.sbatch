@@ -43,14 +43,25 @@ set -e
 N_SEQ=${1:-2000}           # sequences per cell
 SWEEP=${2:-all}            # all | a (difficulty axis) | b (named regimes)
 REGIMES=("${@:3}")         # optional: only these named regimes (implies SWEEP=b)
-SAVE_DIR=./experiments     # must match run_comparison.sh's SAVE_DIR
+SAVE_DIR=${SAVE_DIR:-./experiments}   # one run directory (environment override), e.g.
+                                      # SAVE_DIR=./experiments_ms1_xstocos MODELS=melstm sbatch ...
+MODELS=${MODELS:-"lstm felstm melstm"} # the models in SAVE_DIR to evaluate (environment override)
 BATCH=100                  # rollout batch; lower if the GPU OOMs
+
+# Refuse to evaluate a model whose training has not finished: its best checkpoint can
+# still change, and the sweep would silently score an intermediate model.
+for m in $MODELS; do
+  if ! ls "$SAVE_DIR"/run_state/DONE_${m}_*.flag >/dev/null 2>&1; then
+    echo "!!! $m has not finished training in $SAVE_DIR (no DONE flag) -- not evaluating"
+    exit 1
+  fi
+done
 
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 CMD=(python moving_mnist/motion_difficulty_sweep.py
      --model_save_dir "$SAVE_DIR"
-     --models lstm felstm melstm
+     --models $MODELS
      --sweep "$SWEEP"
      --n_sequences "$N_SEQ"
      --batch_size "$BATCH"

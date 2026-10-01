@@ -111,6 +111,47 @@ def save_vel_gen_results(path, vx, vy, err, args):
     print(f"Saved velocity-generalization results to {path}")
 
 
+def build_model_seeded(args):
+    """build_model, called right after the generators are seeded with --model_seed.
+
+    Without --init_seed this is plain build_model. With it, the weights are the ones
+    a --model_seed=<init_seed> run starts from, while every random draw after them --
+    the training stream, the val draws, the CUDA generator -- is exactly the
+    --model_seed run's: the model is first built with model_seed, so the generators
+    advance as in a normal run, that state is kept, the real model is built from
+    init_seed, and the state is restored. build_model runs on the CPU and only draws
+    from torch's generator (numpy and random are untouched).
+    """
+    if args.init_seed is None:
+        return build_model(args)
+    build_model(args)
+    cpu_state = torch.get_rng_state()
+    cuda_state = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+    torch.manual_seed(args.init_seed)
+    model = build_model(args)
+    torch.set_rng_state(cpu_state)
+    if cuda_state is not None:
+        torch.cuda.set_rng_state_all(cuda_state)
+    return model
+
+
+def apply_init_scheme(model, scheme):
+    """--init_scheme delta: after the default initialization, set the centre tap of the
+    input -> candidate (g) kernel to +1 for every hidden channel, so each cell starts by
+    writing a copy of the frame into its state (in the spirit of identity inits for
+    RNNs). Measured on the untrained MELSTM, pure h-tracking, on seeds 1-6 and 42: the
+    slots then hit a real digit velocity on every seed, against 1-81% with the default.
+    No random draws, so the rest of the run's stream is the default run's."""
+    if scheme == "default":
+        return model
+    cell = model.cell
+    ch = getattr(cell, "hidden_dim", None) or cell.hidden_channels
+    k = cell.conv.weight.shape[-1] // 2
+    with torch.no_grad():
+        cell.conv.weight[3 * ch:4 * ch, 0, k, k] = 1.0     # gates are i, f, o, g; input is channel 0
+    return model
+
+
 def main():
     parser = argparse.ArgumentParser(description="Train & evaluate RNN models on Moving MNIST")
     parser.add_argument('--root', type=str, default='./data')
@@ -133,6 +174,18 @@ def main():
                              'instead of everyone sharing one epoch count sized for the cheapest model.')
     parser.add_argument('--lr', type=float, default=1e-3)
     parser.add_argument('--use_lr_scheduler', action='store_true', help='Enable ReduceLROnPlateau: cuts LR when val_loss stops improving')
+    parser.add_argument('--optimizer', choices=['adam', 'adamw', 'amsgrad'], default='adam',
+                        help="adam (original); adamw = decoupled weight decay (--weight_decay); "
+                             "amsgrad = Adam keeping the running max of the second moment")
+    parser.add_argument('--weight_decay', type=float, default=0.0, help='--optimizer adamw only')
+    parser.add_argument('--lr_schedule', choices=['plateau', 'cosine'], default='plateau',
+                        help="plateau = ReduceLROnPlateau when --use_lr_scheduler (original); cosine = "
+                             "linear warmup over --warmup_epochs then cosine decay to --final_lr, per "
+                             "batch, fixed in advance (ignores --use_lr_scheduler)")
+    parser.add_argument('--warmup_epochs', type=float, default=1.0, help='--lr_schedule cosine only')
+    parser.add_argument('--final_lr', type=float, default=1e-5, help='--lr_schedule cosine only')
+    parser.add_argument('--diag_every', type=int, default=25,
+                        help='Log grad norm (pre-clip) / ReLU activity / LR every N batches (0 = off)')
     parser.add_argument('--lr_patience', type=int, default=5, help='Epochs with no val_loss improvement before cutting LR (only with --use_lr_scheduler)')
     parser.add_argument('--lr_factor', type=float, default=0.5, help='Multiplicative LR cut factor (only with --use_lr_scheduler)')
     parser.add_argument('--lr_min', type=float, default=1e-6, help='Floor below which LR will not be reduced further (only with --use_lr_scheduler)')
@@ -151,6 +204,44 @@ def main():
     parser.add_argument('--image_size', type=int, default=28)
     parser.add_argument('--v_range', type=int, default=2)
     parser.add_argument('--num_vel_modes', type=int, default=2, help='Number of velocity modes for MEConvLSTM')
+    parser.add_argument('--track_mode', choices=['h', 'propose', 'prior', 'window', 'tie', 'propose_distinct'], default='h',
+                        help="MELSTM velocity tracking: 'h' = peak of PC(h_k, x_t) (original); "
+                             "'propose' = top --n_proposals peaks of the raw pair PC(x_{t-1}, x_t) are "
+                             "candidates and each slot picks the one PC(h_k, x_t) scores highest; "
+                             "'prior' = peak of PC(h_k,x_t)/max + --track_prior_weight * PC(x_{t-1},x_t)/max")
+    parser.add_argument('--track_prior_weight', type=float, default=0.5, help="--track_mode prior only")
+    parser.add_argument('--n_proposals', type=int, default=None, help="--track_mode propose / propose_distinct; default = --num_vel_modes")
+    parser.add_argument('--track_window', type=int, default=2, help="--track_mode window: |vx|,|vy| <= this")
+    parser.add_argument('--no_detach', action='store_true',
+                        help="All models: keep the gradient through the prediction fed back as the next decoder input")
+    parser.add_argument('--decoder_act', choices=['relu', 'leaky'], default='relu',
+                        help="All models: decoder hidden activation (leaky = LeakyReLU 0.01, cannot die)")
+    parser.add_argument('--decoder_skip', action='store_true',
+                        help="MELSTM: add a 1x1 linear read-out of the pooled state to the decoder output")
+    parser.add_argument('--x_curriculum_epochs', type=int, default=0,
+                        help="MELSTM: training-only x-tracking curriculum. Encoder steps t < T_x track from the raw "
+                             "frame pair (continuity-assigned); T_x falls linearly from --x_curriculum_start at epoch 1 "
+                             "to 2 (pure h-tracking) at this epoch and stays there. 0 = off")
+    parser.add_argument('--x_curriculum_start', type=int, default=15, help="T_x at epoch 1 (15 = the whole context)")
+    parser.add_argument('--x_curriculum_mode', choices=['cutoff', 'stochastic'], default='cutoff',
+                        help="cutoff = the deterministic T_x above. stochastic = the stochastic handover: each "
+                             "encoder step t >= 2 of each sequence takes the raw-pair velocity with probability "
+                             "p(t, epoch), else its h-tracked one. p(t, e) = clip((c(e) - t)/W + 1/2, 0, 1) with "
+                             "W = --x_curriculum_width; the centre c(e) slides so that p = 1 at every step at epoch 1 "
+                             "and p = 0 at every step from epoch --x_curriculum_epochs on (progress shape "
+                             "--x_curriculum_shape). W = inf makes p independent of t, and the mean of p over the "
+                             "steps roughly follows the progress for every W (exactly for W = inf)")
+    parser.add_argument('--x_curriculum_width', type=float, default=float('inf'),
+                        help="--x_curriculum_mode stochastic: width W (in steps) of the ramp in t; inf = p(epoch) only")
+    parser.add_argument('--x_curriculum_shape', choices=['linear', 'cosine'], default='linear',
+                        help="--x_curriculum_mode stochastic: how the progress s(epoch) falls from 1 to 0")
+    parser.add_argument('--frozen_prob_max', type=float, default=0.0,
+                        help="MELSTM: scheduled sampling of the decoder velocity mode in training -- the fraction "
+                             "of sequences decoded with the encoder's final velocity frozen (the inference "
+                             "protocol) rises linearly from 0 at --frozen_start_epoch to this over "
+                             "--frozen_ramp_epochs. 0 = off (always tracked in training)")
+    parser.add_argument('--frozen_start_epoch', type=int, default=5)
+    parser.add_argument('--frozen_ramp_epochs', type=int, default=10)
     parser.add_argument('--data_v_range', type=int, default=2)
     parser.add_argument('--motion_mode', choices=['constant', 'piecewise', 'stochastic', 'accelerate'], default='piecewise',
                         help="How digit velocity evolves over time: 'constant' = fixed for the whole "
@@ -173,6 +264,14 @@ def main():
     parser.add_argument('--gen_seq_len', type=int, default=40, help='Sequence length used **only** for length‑generalization evaluation (must be > seq_len)')
     parser.add_argument('--data_seed', type=int, default=42, help='Random seed for dataset splitting')
     parser.add_argument('--model_seed', type=int, default=None, help='Random seed for model initialization (default: random)')
+    parser.add_argument('--init_seed', type=int, default=None,
+                        help='Seed for the initial weights only (default: --model_seed). The weights are those a '
+                             '--model_seed=<init_seed> run starts from; everything after them (the on-the-fly '
+                             'training stream, the val draws) is exactly the --model_seed run\'s')
+    parser.add_argument('--init_scheme', choices=['default', 'delta'], default='default',
+                        help="'delta': after the default init, set the centre tap of the input -> "
+                             "candidate kernel to +1 (the cell starts by copying the frame into its "
+                             "state). Untrained MELSTM then tracks a real digit on every seed tried.")
     parser.add_argument('--run_name', type=str, default=None, help='Name of the run')
     parser.add_argument('--model_save_dir', type=str, default='./fernn/movmnist/', help='Directory to save model checkpoints')
     parser.add_argument('--load_model', type=str, default=None, help='Path to a saved model checkpoint to load for evaluation')
@@ -199,6 +298,10 @@ def main():
                         help="MELSTM decoder velocity at evaluation: 'frozen' = honest inference (default, drives scheduler/selection); "
                              "'tracked' = oracle GT-tracked eval drives scheduler/selection; "
                              "'both' = select on frozen but also log val_tracked_loss each epoch")
+    parser.add_argument('--len_gen_at_end', action='store_true',
+                        help='Run the length-generalization rollout ONCE, after training, on the saved best-val '
+                             'model (same len_gen_<model>_<id>.npz as before), instead of at every new best and '
+                             'every --len_gen_every epochs. The rollout was 20-40%% of wall-clock.')
     parser.add_argument('--len_gen_every', type=int, default=0,
                         help='Also run length-generalization every N epochs regardless of val improvement '
                              '(0 = only on new best val). Saves to a separate *_latest.npz')
@@ -253,6 +356,9 @@ def main():
 
     assert args.input_frames < args.seq_len, "input_frames must be less than seq_len"
     assert args.gen_input_frames < args.gen_seq_len, "gen_input_frames must be less than gen_seq_len"
+    if args.x_curriculum_mode == 'stochastic':
+        assert args.x_curriculum_epochs >= 2, "--x_curriculum_mode stochastic needs --x_curriculum_epochs >= 2"
+        assert args.x_curriculum_width > 0, "--x_curriculum_width must be > 0 (a hard cut-off is --x_curriculum_mode cutoff)"
     pred_frames = args.seq_len - args.input_frames
     gen_pred_frames = args.gen_seq_len - args.gen_input_frames
 
@@ -477,7 +583,7 @@ def main():
     
     # Single construction path shared with motion_generalization.py, so an
     # offline evaluation cannot rebuild a different architecture than was trained.
-    model = build_model(args).to(device)
+    model = apply_init_scheme(build_model_seeded(args), args.init_scheme).to(device)
 
     # Parameter count: printed per top-level submodule and stored in the
     # wandb config so runs of different models are directly comparable.
@@ -565,11 +671,31 @@ def main():
         return
 
     # Optimizers & loss
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    def make_optimizer():
+        if args.optimizer == 'adamw':
+            return torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+        return torch.optim.Adam(model.parameters(), lr=args.lr, amsgrad=args.optimizer == 'amsgrad')
+    optimizer = make_optimizer()
     criterion = MSEPlusL1Loss()
 
+    # Per-batch warmup + cosine, fixed in advance (--lr_schedule cosine). A function of
+    # the global step only, so a resumed run lands on the same curve.
+    steps_per_epoch = len(train_loader)
+    lr_fn = None
+    if args.lr_schedule == 'cosine':
+        import math
+        total = args.epochs * steps_per_epoch
+        warm = max(1, int(round(args.warmup_epochs * steps_per_epoch)))
+        def lr_fn(step):
+            if step < warm:
+                return args.lr * (step + 1) / warm
+            p = min(1.0, (step - warm) / max(1, total - warm))
+            return args.final_lr + 0.5 * (args.lr - args.final_lr) * (1 + math.cos(math.pi * p))
+        print(f"LR schedule: warmup {warm} steps to {args.lr:g}, cosine to {args.final_lr:g} at step {total}")
+    print(f"Optimizer: {args.optimizer}" + (f" (weight_decay {args.weight_decay:g})" if args.optimizer == 'adamw' else ""))
+
     scheduler = None
-    if args.use_lr_scheduler:
+    if args.use_lr_scheduler and args.lr_schedule == 'plateau':
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             optimizer, mode='min', factor=args.lr_factor,
             patience=args.lr_patience, min_lr=args.lr_min,
@@ -604,6 +730,7 @@ def main():
     best_val_losses = float('inf')
     epochs_since_improve = 0
     start_epoch = 1
+    best_epoch = None
     checkpoint_path = os.path.join(run_state_dir, f"checkpoint_{args.model}_{wandb.run.id}.pth")
 
     if resume_ckpt is not None:
@@ -623,6 +750,7 @@ def main():
                 scheduler.load_state_dict(resume_ckpt["scheduler_state"])
             best_val_losses = resume_ckpt["best_val_losses"]
             epochs_since_improve = resume_ckpt.get("epochs_since_improve", 0)
+            best_epoch = resume_ckpt.get("best_epoch")
             history = resume_ckpt["history"]
             if curve_recorder is not None and resume_ckpt.get("curve_recorder") is not None:
                 curve_recorder.load_state_dict(resume_ckpt["curve_recorder"])
@@ -632,8 +760,8 @@ def main():
         except RuntimeError as e:
             model.load_state_dict(fresh_model_state)   # undo any partial copy
             epochs_since_improve = 0
-            optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
-            if args.use_lr_scheduler:
+            optimizer = make_optimizer()
+            if args.use_lr_scheduler and args.lr_schedule == 'plateau':
                 scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
                     optimizer, mode='min', factor=args.lr_factor,
                     patience=args.lr_patience, min_lr=args.lr_min,
@@ -643,10 +771,54 @@ def main():
                   f"and was ignored -- starting fresh instead:\n{e}")
             print(f"Delete the stale file to silence this: rm {args.resume}")
 
+    def x_track_until_at(epoch):
+        """T_x for the x-tracking curriculum (2 = pure h-tracking)."""
+        E = args.x_curriculum_epochs
+        if E <= 0 or epoch > E:
+            return 0 if E <= 0 else 2
+        frac = (epoch - 1) / max(1, E - 1)
+        return int(round(args.x_curriculum_start - (args.x_curriculum_start - 2) * frac))
+
+    def x_track_probs_at(epoch):
+        """Stochastic handover: p(t, epoch) for encoder steps t = 0 .. input_frames-1 (the
+        entries for t = 0, 1 -- zero velocity and bootstrap -- are unused). The progress s
+        falls from 1 at epoch 1 to 0 at epoch E; the ramp's centre c slides from
+        t_last + W/2 (p = 1 at every step) to 2 - W/2 (p = 0 at every step)."""
+        import math
+        E, W, T = args.x_curriculum_epochs, args.x_curriculum_width, args.input_frames
+        if epoch >= E:
+            return [0.0] * T
+        frac = (epoch - 1) / (E - 1)
+        s = 1.0 - frac if args.x_curriculum_shape == 'linear' else 0.5 * (1.0 + math.cos(math.pi * frac))
+        if math.isinf(W):
+            return [0.0, 0.0] + [s] * (T - 2)
+        c = 2 - W / 2 + s * (T - 1 - 2 + W)
+        return [0.0, 0.0] + [min(1.0, max(0.0, (c - t) / W + 0.5)) for t in range(2, T)]
+
+    def frozen_prob_at(epoch):
+        """Scheduled freezing: 0 before --frozen_start_epoch, then a linear ramp."""
+        if args.frozen_prob_max <= 0 or epoch < args.frozen_start_epoch:
+            return 0.0
+        return args.frozen_prob_max * min(1.0, (epoch - args.frozen_start_epoch + 1) / max(1, args.frozen_ramp_epochs))
+
     for epoch in range(start_epoch, args.epochs + 1):
         epoch_start = time.time()
+        if args.frozen_prob_max > 0 and hasattr(model, "frozen_prob"):
+            model.frozen_prob = frozen_prob_at(epoch)
+            print(f"  scheduled freezing: {100 * model.frozen_prob:.0f}% of training sequences decode with the frozen velocity")
+        if args.x_curriculum_epochs > 0 and hasattr(model, "x_track_until"):
+            if args.x_curriculum_mode == 'stochastic':
+                model.x_track_p = x_track_probs_at(epoch)
+                ps = model.x_track_p[2:]
+                print(f"  stochastic handover: P(raw-pair velocity) at steps 2..{args.input_frames - 1} = "
+                      + " ".join(f"{p:.2f}" for p in ps) + f"  (mean {sum(ps) / len(ps):.2f})")
+            else:
+                model.x_track_until = x_track_until_at(epoch)
+                print(f"  x-tracking curriculum: encoder steps t < {model.x_track_until} use the raw frame pair")
         train_loss = train_fn(model, train_loader, optimizer, criterion, device, args.input_frames, args.grad_clip,
-                              curve_recorder=curve_recorder, show_h_state=args.show_h_state)
+                              curve_recorder=curve_recorder, show_h_state=args.show_h_state,
+                              lr_fn=lr_fn, step_offset=(epoch - 1) * steps_per_epoch,
+                              diag_every=args.diag_every)
         epoch_time = time.time() - epoch_start
         val_loss = eval_fn(model, val_loader, criterion, device, args.input_frames, epoch, split_name="val",
                            show_h_state=args.show_h_state)
@@ -684,6 +856,14 @@ def main():
             "epoch_time_sec": epoch_time,
             "epoch": epoch
         }
+        if args.x_curriculum_epochs > 0:
+            if args.x_curriculum_mode == 'stochastic':
+                ps = x_track_probs_at(epoch)[2:]
+                log_payload["x_track_p_mean"] = sum(ps) / len(ps)
+            else:
+                log_payload["x_track_until"] = x_track_until_at(epoch)
+        if args.frozen_prob_max > 0:
+            log_payload["frozen_prob"] = frozen_prob_at(epoch)
         if val_tracked_loss is not None:
             log_payload["val_tracked_loss"] = val_tracked_loss
         wandb.log(log_payload)
@@ -695,6 +875,7 @@ def main():
         ran_len_gen_this_epoch = False
         if selection_val < best_val_losses:
             best_val_losses = selection_val
+            best_epoch = epoch
             epochs_since_improve = 0
             ran_len_gen_this_epoch = True
             model_filename = f"{args.model}_best_model_{wandb.run.id}.pth"
@@ -710,18 +891,19 @@ def main():
             history['test_loss'].append(test_loss)
             print(f"Test Loss: {test_loss:.4f}")
 
-            gen_test_dataset.reset_rng()   # identical benchmark set every evaluation
-            gen_mean, gen_std, gen_details = len_gen_fn(model, gen_test_loader, device, args.gen_input_frames,
-                                                        show_h_state=args.show_h_state)
-            save_len_gen_results(
-                os.path.join(results_dir, f"len_gen_{args.model}_{wandb.run.id}.npz"),
-                gen_mean, gen_std, gen_details, args, epoch=epoch,
-            )
+            if not args.len_gen_at_end:
+                gen_test_dataset.reset_rng()   # identical benchmark set every evaluation
+                gen_mean, gen_std, gen_details = len_gen_fn(model, gen_test_loader, device, args.gen_input_frames,
+                                                            show_h_state=args.show_h_state)
+                save_len_gen_results(
+                    os.path.join(results_dir, f"len_gen_{args.model}_{wandb.run.id}.npz"),
+                    gen_mean, gen_std, gen_details, args, epoch=epoch,
+                )
 
-            wandb.log({f"len_gen_mean_t{t+1}": gen_mean[t] for t in range(len(gen_mean))})
-            wandb.log({f"len_gen_std_t{t+1}":  gen_std[t]  for t in range(len(gen_std))})
-            wandb.log({f"len_gen_mean_mean_over_time": gen_mean.mean()})
-            log_length_generalization_curve(gen_mean, gen_std, gen_pred_frames, args)
+                wandb.log({f"len_gen_mean_t{t+1}": gen_mean[t] for t in range(len(gen_mean))})
+                wandb.log({f"len_gen_std_t{t+1}":  gen_std[t]  for t in range(len(gen_std))})
+                wandb.log({f"len_gen_mean_mean_over_time": gen_mean.mean()})
+                log_length_generalization_curve(gen_mean, gen_std, gen_pred_frames, args)
             
             if args.run_velocity_generalization:
                 vx, vy, err = eval_velocity_generalization(model, device, args)
@@ -761,7 +943,7 @@ def main():
         # starve the len-gen monitoring. Saves to *_latest.npz so it never
         # overwrites the best-checkpoint results.
         if (args.len_gen_every > 0 and epoch % args.len_gen_every == 0
-                and not ran_len_gen_this_epoch):
+                and not ran_len_gen_this_epoch and not args.len_gen_at_end):
             gen_test_dataset.reset_rng()   # identical benchmark set every evaluation
             gen_mean, gen_std, gen_details = len_gen_fn(model, gen_test_loader, device, args.gen_input_frames,
                                                         show_h_state=args.show_h_state)
@@ -779,6 +961,7 @@ def main():
             "optimizer_state": optimizer.state_dict(),
             "scheduler_state": scheduler.state_dict() if scheduler is not None else None,
             "best_val_losses": best_val_losses,
+            "best_epoch": best_epoch,
             "epochs_since_improve": epochs_since_improve,
             "history": history,
             "curve_recorder": curve_recorder.state_dict() if curve_recorder is not None else None,
@@ -795,6 +978,28 @@ def main():
                   f"{epochs_since_improve} epochs (patience={args.early_stop_patience}, "
                   f"min_epochs={args.min_epochs}).")
             break
+
+    # --len_gen_at_end: the one length-generalization rollout, on the saved best-val
+    # model -- the same weights and the same file the per-best evaluation produced.
+    if args.len_gen_at_end:
+        best_path = os.path.join(models_dir, f"{args.model}_best_model_{wandb.run.id}.pth")
+        if os.path.exists(best_path):
+            model.load_state_dict(torch.load(best_path, map_location=device))
+            print(f"Length generalization on the best model (epoch {best_epoch}) ...")
+            gen_test_dataset.reset_rng()   # identical benchmark set every evaluation
+            gen_mean, gen_std, gen_details = len_gen_fn(model, gen_test_loader, device, args.gen_input_frames,
+                                                        show_h_state=args.show_h_state)
+            save_len_gen_results(
+                os.path.join(results_dir, f"len_gen_{args.model}_{wandb.run.id}.npz"),
+                gen_mean, gen_std, gen_details, args, epoch=best_epoch if best_epoch is not None else -1,
+            )
+            wandb.log({f"len_gen_mean_t{t+1}": gen_mean[t] for t in range(len(gen_mean))})
+            wandb.log({f"len_gen_std_t{t+1}":  gen_std[t]  for t in range(len(gen_std))})
+            wandb.log({"len_gen_mean_mean_over_time": gen_mean.mean(), "len_gen_best_epoch": best_epoch})
+            log_length_generalization_curve(gen_mean, gen_std, gen_pred_frames, args)
+            print(f"Length generalization mean MSE: {gen_mean.mean():.4f}")
+        else:
+            print(f"WARNING: no best model at {best_path} -- length generalization skipped")
 
     # Final history dump (also written incrementally after every epoch)
     dump_history(history)
