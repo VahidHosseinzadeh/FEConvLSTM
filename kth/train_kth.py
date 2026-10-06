@@ -85,6 +85,10 @@ def get_args(argv=None):
                    help="melstm frame-pair candidates -> slots: nearest previous velocity; "
                         "nearest after the best common shift (equivariant to time-varying camera "
                         "motion); or slot 0 = the top peak and the rest nearest (kth_model.py)")
+    p.add_argument("--static_slot", type=int, default=0,
+                   help="melstm (frame_pair / bootstrap): 1 = slot 0 pinned to velocity (0, 0), a "
+                        "ConvLSTM state inside the MEConvLSTM; slots 1..K-1 take the top K-1 "
+                        "peaks. Use K+1 slots to keep K moving ones")
     p.add_argument("--x_curriculum_epochs", type=int, default=0,
                    help="melstm --velocity_source tracked: the stochastic handover -- training "
                         "steps take the frame-pair velocity with probability p(epoch), 1 -> 0 "
@@ -267,6 +271,7 @@ def run_epoch(model, loader, device, criterion, optimizer=None, grad_clip=1.0, l
     model.train(train)
     tot_loss = tot_correct = tot_n = 0
     vstats = VelocityStats()
+    w_sum, w_n = None, 0
     y_true, y_pred = [], []
     for b, (seq, label, motion, person) in enumerate(loader):
         if max_batches and b >= max_batches:
@@ -292,11 +297,18 @@ def run_epoch(model, loader, device, criterion, optimizer=None, grad_clip=1.0, l
         tot_n += bs
         if aux.get("velocities") is not None:
             vstats.update(aux["velocities"].cpu(), motion, person, label.cpu())
+        w = aux.get("pool_weights")
+        if w is not None and w.dim() == 2:
+            w = w.detach().sum(0).cpu()
+            w_sum = w if w_sum is None else w_sum + w
+            w_n += bs
         if collect:
             y_true += label.tolist()
             y_pred += pred.tolist()
     stats = {"loss": tot_loss / max(tot_n, 1), "acc": tot_correct / max(tot_n, 1),
              **vstats.result(), "_global_step": global_step}
+    if w_sum is not None:                     # attention pool: mean weight on each copy / slot
+        stats.update({f"attn_{k}": float(v) / w_n for k, v in enumerate(w_sum)})
     if collect:
         stats["_y_true"], stats["_y_pred"] = y_true, y_pred
     return stats
@@ -386,7 +398,10 @@ def log_panels(model, state, args, epoch, step, device, wandb, tag):
                            rec["winner"][i].numpy(), seq[i, :, 0].numpy(), model.copy_labels(),
                            motion[i, :, 0].numpy(), person[i].numpy(),
                            slot_v=None if vel is None else vel[i].numpy(), lattice=lattice,
-                           pc_picks=None if picks is None else picks[i], title=title)
+                           pc_picks=None if picks is None else picks[i], title=title,
+                           pool_label=model.pool_label(),
+                           pool_weights=(None if rec["weights"] is None
+                                         else rec["weights"][i].numpy()))
         emit(fig, f"states_{tag}/{i}_{name}")
     if vel is not None:
         names = [KTH_ACTIONS[int(c)] for c in label[:n_fig]]

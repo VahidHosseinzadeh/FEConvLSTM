@@ -6,7 +6,8 @@ state_figure     one clip. One row per velocity copy (felstm: the 9 lattice velo
                  frame; then "max over V", the channel mean of the elementwise max over copies --
                  exactly the tensor the head reads (velocity_pool 'max'); then "argmax V", which
                  copy supplies that max at each pixel (in the most channels), coloured like the
-                 copies; and the input frames underneath.
+                 copies; and the input frames underneath. With another pool (attention) the pooled
+                 row is that pool's output and every tile shows the copy's weight a.
                  Marks, at every step t >= 1 (the step that brought the state into frame t):
                    green frame : the copy / slot moving at the TRUE camera velocity
                    red dot     : the copy / slot nearest the person's apparent velocity (the
@@ -35,13 +36,15 @@ def _fmt(v):
 
 
 def state_figure(copies, pooled, winner, frames, labels, cam_v, person_v, slot_v=None,
-                 lattice=None, pc_picks=None, title=""):
+                 lattice=None, pc_picks=None, title="", pool_label="max over V\n(head input)",
+                 pool_weights=None):
     """
     copies (T, V, H, W), pooled (T, H, W), winner (T, H, W) int, frames (T, H, W) in [0, 1];
     labels: V row labels; cam_v (T, 2) camera steps (cam_v[t] takes frame t to t+1);
     person_v (T, 2) person proxy steps (NaN = unknown); slot_v (T-1, K, 2) melstm velocities (the
     one used into frame t is slot_v[t-1]); lattice: felstm's (vx, vy) per copy; pc_picks
-    (T-1, K, 2) raw frame-pair peaks. All numpy.
+    (T-1, K, 2) raw frame-pair peaks; pool_weights (T, V) attention weights, printed on the tiles.
+    All numpy.
     """
     T, V = copies.shape[:2]
     pool_rows = 2 if V > 1 else 0
@@ -72,6 +75,10 @@ def state_figure(copies, pooled, winner, frames, labels, cam_v, person_v, slot_v
             m = copies[t, k]
             lim = max(float(np.abs(m).max()), 1e-8)
             ax.imshow(m, cmap="coolwarm", vmin=-lim, vmax=lim, interpolation="nearest")
+            if pool_weights is not None:
+                ax.text(0.03, 0.97, f"a={pool_weights[t, k]:.2f}", transform=ax.transAxes,
+                        ha="left", va="top", fontsize=5.5, color="black",
+                        bbox=dict(boxstyle="square,pad=0.08", fc="#fff3b0", ec="none", alpha=0.8))
             if t == 0:
                 continue
             if lattice is not None:
@@ -111,7 +118,7 @@ def state_figure(copies, pooled, winner, frames, labels, cam_v, person_v, slot_v
                 sp.set_linewidth(0.4)
                 sp.set_color("0.7")
 
-    row_names = list(labels) + (["max over V\n(head input)", "argmax V"] if pool_rows else [])
+    row_names = list(labels) + ([pool_label, "argmax V"] if pool_rows else [])
     row_names.append("input")
     for r, name in enumerate(row_names):
         axes[r, 0].set_ylabel(name, fontsize=8, rotation=0, ha="right", va="center", labelpad=6)

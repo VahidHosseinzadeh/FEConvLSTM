@@ -53,14 +53,32 @@ from .kth_dataset import KTH_ACTIONS
 
 
 class KTHClassifier(MotionVideoClassifier):
+    """
+    static_slot  melstm with a frame-pair or bootstrap source: slot 0 is pinned to velocity
+                 (0, 0) -- an untransported state, i.e. a ConvLSTM inside the MEConvLSTM -- and
+                 slots 1..K-1 take the top K-1 candidates, assigned by slot_assign among
+                 themselves. With K-1 moving slots this is exactly the K-1-slot model plus one
+                 static slot. Same parameters (all slots share the cell).
+    """
 
-    def __init__(self, *args, slot_assign="nearest", **kwargs):
+    def __init__(self, *args, slot_assign="nearest", static_slot=False, **kwargs):
         super().__init__(*args, **kwargs)
         if slot_assign not in ("nearest", "shift", "anchored"):
             raise ValueError(f"slot_assign {slot_assign!r}: expected nearest, shift or anchored")
+        if static_slot and (self.model != "melstm" or self.velocity_source == "tracked"
+                            or self.n_velocities < 2):
+            raise ValueError("static_slot needs melstm, >= 2 slots and a frame-pair or "
+                             "bootstrap velocity source")
         self.slot_assign = slot_assign
+        self.static_slot = bool(static_slot)
 
-    def _match_to_slots(self, cand, v_prev):
+    def _candidate_velocities(self, x0, x1):
+        cand = super()._candidate_velocities(x0, x1)
+        if self.static_slot:
+            cand = torch.cat([torch.zeros_like(cand[:, :1]), cand[:, :-1]], dim=1)
+        return cand
+
+    def _assign(self, cand, v_prev):
         match = MotionDigitClassifier._match_to_slots
         if self.slot_assign == "anchored" and cand.shape[1] > 1:
             return torch.cat([cand[:, :1], match(cand[:, 1:], v_prev[:, 1:])], dim=1)
@@ -68,13 +86,23 @@ class KTHClassifier(MotionVideoClassifier):
             return match_up_to_shift(cand, v_prev)
         return match(cand, v_prev)
 
+    def _match_to_slots(self, cand, v_prev):
+        if self.static_slot:
+            return torch.cat([cand[:, :1], self._assign(cand[:, 1:], v_prev[:, 1:])], dim=1)
+        return self._assign(cand, v_prev)
+
     def copy_labels(self):
         """Row labels for the velocity axis: lattice velocities, slot names, or the one state."""
         if self.model == "felstm":
             return [f"({vx},{vy})" for vx, vy in self.backbone.cell.v_list]
         if self.model == "melstm":
-            return [f"s{k}" for k in range(self.n_velocities)]
+            return [("s0 (0,0)" if self.static_slot and k == 0 else f"s{k}")
+                    for k in range(self.n_velocities)]
         return ["h"]
+
+    def pool_label(self):
+        return {"max": "max over V", "attention": "attention\npool", "mean": "mean over V",
+                "concat": "concat V\n(ch. mean)"}[self.pool.mode] + "\n(head input)"
 
 
 def match_up_to_shift(cand, v_prev):
@@ -137,6 +165,7 @@ def build_kth_classifier(cfg):
         phase_corr_kwargs=pc,
         forget_bias=get("forget_bias", None),
         slot_assign=get("slot_assign", "nearest"),
+        static_slot=bool(get("static_slot", 0)),
     )
     if net.model == "melstm":
         net.backbone.cell.integer_shift = not pc.get("subpixel", False)
@@ -150,11 +179,12 @@ def record_states(model, seq):
     once per frame with the full state h (B, V, C, H, W). Per step, keeps:
 
       copies : channel mean of every velocity copy / slot             (B, T, V, H, W)
-      pooled : channel mean of the MAX over V -- the tensor the head reads with
-               velocity_pool 'max'                                     (B, T, H, W)
+      pooled : channel mean of the model's own velocity pool of h -- at the last step exactly
+               what the head reads (max, attention, ...)               (B, T, H, W)
       winner : per pixel, the copy that supplies the max in the most channels (B, T, H, W)
       share  : at the last step, the fraction of all (channel, pixel) maxima each copy supplies,
                per sample                                              (B, V)
+      weights: the attention pool's weight on each copy per step (B, T, V), or None
     plus the slot velocities (B, T-1, K, 2) for melstm (None otherwise) and the logits.
     """
     rec = []
@@ -162,11 +192,12 @@ def record_states(model, seq):
     def hook(_module, _inputs, out):
         h = out[0]
         B, V, C, H, W = h.shape
+        feat, w = model.pool(h)
         hmax, arg = h.max(dim=1)                                        # (B, C, H, W)
         counts = torch.zeros(B, V, H, W, device=h.device).scatter_add_(
             1, arg, torch.ones_like(hmax))
-        rec.append((h.mean(dim=2), hmax.mean(dim=1), counts.argmax(dim=1),
-                    counts.sum(dim=(-2, -1)) / (C * H * W)))
+        rec.append((h.mean(dim=2), feat.mean(dim=1), counts.argmax(dim=1),
+                    counts.sum(dim=(-2, -1)) / (C * H * W), w))
 
     was_training = model.training
     model.eval()
@@ -182,6 +213,8 @@ def record_states(model, seq):
         "pooled": torch.stack([r[1] for r in rec], dim=1).cpu(),
         "winner": torch.stack([r[2] for r in rec], dim=1).cpu(),
         "share": rec[-1][3].cpu(),
+        "weights": (None if rec[-1][4] is None
+                    else torch.stack([r[4] for r in rec], dim=1).cpu()),
         "velocities": None if velocities is None else velocities.cpu(),
         "logits": logits.cpu(),
     }

@@ -169,6 +169,13 @@ def test_trained_parameter_counts_match():
     counts = {m: build_kth_classifier(dict(model=m)).parameter_report()["trained"]
               for m in ("lstm", "felstm", "melstm")}
     assert len(set(counts.values())) == 1, counts
+    base = counts["melstm"]
+    # a static slot is free (every slot shares the cell); attention adds its scoring MLP,
+    # Linear(2C, 32) + Linear(32, 1) at C = 64
+    assert build_kth_classifier(dict(model="melstm", num_vel_modes=5, static_slot=1)
+                                ).parameter_report()["trained"] == base
+    att = build_kth_classifier(dict(model="melstm", velocity_pool="attention"))
+    assert att.parameter_report()["trained"] == base + (2 * 64 * 32 + 32) + (32 + 1)
 
 
 def _frame_pair_runs(store, mode, assign, every=8):
@@ -230,15 +237,40 @@ def test_nearest_assignment_breaks_under_a_moving_camera(store):
     assert slot_eq.float().mean() < 0.7
 
 
-def test_pooled_panel_row_is_the_head_input(store):
+@pytest.mark.parametrize("model_name,pool,V", [("felstm", "max", 9), ("melstm", "attention", 4)])
+def test_pooled_panel_row_is_the_head_input(store, model_name, pool, V):
     torch.manual_seed(0)
-    model = build_kth_classifier(dict(model="felstm", hidden_size=16)).eval()
+    model = build_kth_classifier(dict(model=model_name, hidden_size=16, velocity_pool=pool)).eval()
     ds = KTHClips(store, "test", seed=42)
     x = torch.stack([ds[i][0] for i in range(3)])
     rec = record_states(model, x)
     with torch.no_grad():
         h = model.encode(x)[0]
-        feat, _ = model.pool(h)
+        feat, w = model.pool(h)
     assert torch.allclose(rec["pooled"][:, -1], feat.mean(dim=1), atol=1e-6)
-    assert rec["copies"].shape[2] == 9
+    assert rec["copies"].shape[2] == V
     assert torch.allclose(rec["share"].sum(-1), torch.ones(3), atol=1e-5)
+    if pool == "attention":
+        assert torch.allclose(rec["weights"][:, -1], w, atol=1e-6)
+        assert torch.allclose(rec["weights"].sum(-1), torch.ones(3, x.shape[1]), atol=1e-5)
+    else:
+        assert rec["weights"] is None
+
+
+def test_static_slot_is_the_smaller_model_plus_a_resting_slot(store):
+    """K = 5 with a static slot moves slots 1..4 exactly like the 4-slot model, slot 0 at rest."""
+    ds = KTHClips(store, "test", camera=CameraMotion("piecewise"), seed=42)
+    x = torch.stack([ds[i][0] for i in range(0, 120, 4)])
+    torch.manual_seed(0)
+    static = build_kth_classifier(dict(model="melstm", hidden_size=16, num_vel_modes=5,
+                                       static_slot=1, pc_search_radius=5)).eval()
+    plain = build_kth_classifier(dict(model="melstm", hidden_size=16, num_vel_modes=4,
+                                      pc_search_radius=5)).eval()
+    with torch.no_grad():
+        v5 = static.encode(x)[1]
+        v4 = plain.encode(x)[1]
+    assert torch.equal(v5[:, :, 0], torch.zeros_like(v5[:, :, 0]))
+    assert torch.equal(v5[:, :, 1:], v4)
+    assert static.copy_labels()[0] == "s0 (0,0)"
+    with pytest.raises(ValueError):
+        build_kth_classifier(dict(model="melstm", velocity_source="tracked", static_slot=1))
