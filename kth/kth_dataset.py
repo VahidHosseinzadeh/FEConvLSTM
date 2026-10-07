@@ -141,10 +141,15 @@ class KTHClips(Dataset):
     seed fixes the eval windows (from seed and the split only, so every camera law sees the same
     windows) and the trajectories (from seed, the split and the camera law). Keller's constant
     draws ignore the seed, as his code does: they depend on the clip order alone.
+
+    camera_mix : the fraction of clips that get the camera law; the rest have a static camera.
+        Decided per clip, once, with an RNG of its own: the moving clips keep exactly the
+        trajectories they would have with camera_mix = 1, and a clip's windows share its fate.
+        1.0 (default) = every clip.
     """
 
     def __init__(self, store, split="train", scheme="keller", camera=None, seq_len=16, step=2,
-                 train=False, seed=0, eval_windows=1, resample_camera=False):
+                 train=False, seed=0, eval_windows=1, resample_camera=False, camera_mix=1.0):
         self.store = store
         self.split, self.scheme = split, scheme
         self.seq_len, self.step = seq_len, step
@@ -176,6 +181,12 @@ class KTHClips(Dataset):
             rng = np.random.RandomState(seed * 7919 + split_salt * 101 + 17)
             traj = np.stack([self.camera.draw(rng) for _ in range(n_clips)]) if n_clips else \
                 np.zeros((0, seq_len, 2), dtype=np.int64)
+        self.camera_mix = float(camera_mix)
+        self.moving = np.ones(n_clips, dtype=bool)
+        if self.camera_mix < 1.0:
+            mix_rng = np.random.RandomState(seed * 7919 + split_salt * 101 + 29)
+            self.moving = mix_rng.rand(n_clips) < self.camera_mix
+            traj = traj * self.moving[:, None, None]
         self.trajectories = np.repeat(traj, self.windows, axis=0) if self.windows > 1 else traj
         assert len(self.trajectories) == n_items
 
@@ -198,7 +209,11 @@ class KTHClips(Dataset):
         idx = start + step * np.arange(T)
         frames = self.store.frames[video][idx].astype(np.float32) / 255.0      # (T, H, W)
 
-        v = self.camera.draw(np.random) if self.resample_camera else self.trajectories[i]
+        if self.resample_camera:
+            v = (self.camera.draw(np.random) if np.random.rand() < self.camera_mix
+                 else np.zeros((T, 2), dtype=np.int64))
+        else:
+            v = self.trajectories[i]
         d = displacements(v)
         clip = np.stack([np.roll(frames[t], (int(d[t, 1]), int(d[t, 0])), axis=(0, 1))
                          for t in range(T)])

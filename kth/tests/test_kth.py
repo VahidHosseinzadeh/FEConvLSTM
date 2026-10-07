@@ -320,3 +320,18 @@ def test_static_slot_with_tracking_and_handover(store, p):
     assert torch.equal(v5[:, :, 0], torch.zeros_like(v5[:, :, 0]))
     assert torch.equal(v5[:, :, 1:], v4)
     assert torch.allclose(h5[:, 1:], h4, atol=1e-6)
+
+
+def test_camera_mix(store):
+    """A fixed, seeded half of the clips shakes, with the very trajectories of the all-shake set."""
+    full = KTHClips(store, "train", camera=CameraMotion("shake"), seed=42)
+    half = KTHClips(store, "train", camera=CameraMotion("shake"), seed=42, camera_mix=0.5)
+    again = KTHClips(store, "train", camera=CameraMotion("shake"), seed=42, camera_mix=0.5)
+    assert 0.45 < half.moving.mean() < 0.55
+    assert np.array_equal(half.moving, again.moving)
+    assert np.array_equal(half.trajectories[half.moving], full.trajectories[half.moving])
+    assert not half.trajectories[~half.moving].any()
+    windows = KTHClips(store, "val", camera=CameraMotion("shake"), seed=42, camera_mix=0.5,
+                       eval_windows=3)
+    per_window = np.abs(windows.trajectories).sum(axis=(1, 2)).reshape(-1, 3) > 0
+    assert (per_window == per_window[:, :1]).all()          # a clip's windows share its fate

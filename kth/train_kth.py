@@ -146,6 +146,10 @@ def get_args(argv=None):
     p.add_argument("--shake_axes", choices=["both", "x", "y"], default="both")
     p.add_argument("--shake_vmax", type=int, default=1,
                    help="largest whole-pixel shake step; 1 keeps the shake on V_1 (0 = no cap)")
+    p.add_argument("--camera_mix", type=float, default=1.0,
+                   help="fraction of train/val clips that get --camera; the rest have a static "
+                        "camera (fixed per clip). The test sets are not mixed: 'none' and the "
+                        "--camera test set are the two halves")
     p.add_argument("--resample_camera", action="store_true",
                    help="draw a new trajectory on every training access (Keller fixes one per clip)")
     p.add_argument("--test_conditions", type=str,
@@ -452,15 +456,18 @@ def main(argv=None):
     common = dict(scheme=args.split_scheme, seq_len=args.seq_len, step=args.step,
                   seed=args.data_seed)
     train_ds = KTHClips(store, "train", camera=conditions[args.camera], train=True,
-                        resample_camera=args.resample_camera, **common)
+                        resample_camera=args.resample_camera, camera_mix=args.camera_mix,
+                        **common)
     val_ds = KTHClips(store, "val", camera=conditions[args.camera],
-                      eval_windows=args.eval_windows, **common)
+                      eval_windows=args.eval_windows, camera_mix=args.camera_mix, **common)
     test_ds = {name: KTHClips(store, "test", camera=cam, eval_windows=args.eval_windows, **common)
                for name, cam in conditions.items()}
     print(f"data         : {len(store.frames)} videos loaded in {time.time() - t0:.1f}s; "
           f"split {args.split_scheme}: train {len(train_ds)} / val {len(val_ds)} / "
           f"test {len(test_ds[in_dist])} clips; T={args.seq_len} at step {args.step}")
-    print(f"camera       : train/val {conditions[args.camera].describe()}")
+    mix = (f", on {train_ds.moving.mean():.0%} of the train clips (the rest static)"
+           if args.camera_mix < 1 else "")
+    print(f"camera       : train/val {conditions[args.camera].describe()}{mix}")
     for name, ds in test_ds.items():
         print(f"  test {name:12s}: {ds.camera.describe()}")
 
