@@ -103,6 +103,24 @@ def test_shake_respects_vmax_and_moves():
     assert np.all(one_axis[:, 0] == 0)
 
 
+def test_moving_mnist_laws_without_rest():
+    """include_zero=False: Moving MNIST's grid (no (0, 0)); 'constant' then uses the generator."""
+    rng = np.random.RandomState(5)
+    for mode in ("constant", "stochastic", "piecewise"):
+        cam = CameraMotion(mode, v_range=2, transition="smooth", neighbor_kernel="symmetric",
+                           p_change=0.5, include_zero=False)
+        vs = np.stack([cam.draw(rng) for _ in range(300)])
+        assert vs.shape == (300, 16, 2) and np.abs(vs).max() == 2
+        assert (np.abs(vs).max(-1) > 0).all()                     # never at rest
+    const = CameraMotion("constant", v_range=2, include_zero=False)
+    assert not const.uses_keller_draws
+    c = np.stack([const.draw(rng) for _ in range(50)])
+    assert (c == c[:, :1]).all()                                   # one velocity per clip
+    assert len({tuple(x) for x in c[:, 0]}) > 10
+    rest = {tuple(CameraMotion("constant", v_range=1).draw(rng)[0]) for _ in range(300)}
+    assert (0, 0) in rest                                          # the default keeps it
+
+
 def test_keller_draws_sign_convention():
     v = keller_constant_velocities(5, 1)
     rng = np.random.RandomState(42)

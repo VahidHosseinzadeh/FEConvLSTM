@@ -86,15 +86,21 @@ def test_sets(store, a):
     return sets
 
 
-@torch.no_grad()
-def score_run(run, sets, a, device):
-    ck = torch.load(Path(a.save_dir) / "models" / f"{run}_best.pth", map_location=device,
+def load_run(run, save_dir, device):
+    """(model in eval mode, its config, the epoch it was saved at) of a best-val checkpoint."""
+    ck = torch.load(Path(save_dir) / "models" / f"{run}_best.pth", map_location=device,
                     weights_only=False)
     cfg = ck["config"]
     model = build_kth_classifier(cfg).to(device)
     model.load_state_dict(ck["model"])
     model.eval()
     model.x_track_p = 0.0
+    return model, cfg, int(ck.get("epoch", -1))
+
+
+@torch.no_grad()
+def score_run(run, sets, a, device):
+    model, cfg, epoch = load_run(run, a.save_dir, device)
     criterion = nn.CrossEntropyLoss()
     out = {}
     for name, (ds, meta) in sets.items():
@@ -103,7 +109,7 @@ def score_run(run, sets, a, device):
         rep = class_report(r.pop("_y_true"), r.pop("_y_pred"))
         out[name] = {"acc": r["acc"], "loss": r["loss"], **meta,
                      "acc_locomotion": rep["acc_locomotion"], "acc_inplace": rep["acc_inplace"]}
-    return cfg, int(ck.get("epoch", -1)), out
+    return cfg, epoch, out
 
 
 def logged_test_at_best(save_dir, run, epoch):

@@ -34,6 +34,10 @@ shake       a periodic shake per axis, d(t) = A sin(2 pi t / P + phi), rounded t
             by vmax and therefore every ROUNDED step too: vmax = 1 keeps the shake on V_1, i.e. on
             FEConvLSTM's 9-copy lattice. At the model's 12.5 frames/s (25 fps, step 2) a period
             of P frames is 12.5 / P Hz.
+
+include_zero=False takes (0, 0) off the grid, as Moving MNIST does, so the generator modes are
+exactly the Moving MNIST motion laws (kth/motion_sweep_kth.py); 'constant' then also comes from
+the generator, one velocity per clip from V_R without (0, 0).
 """
 import math
 
@@ -99,7 +103,7 @@ class CameraMotion:
                  min_segment=3, max_segment=6, neighbor_kernel="legacy",
                  smooth_probability=0.8, p_change=0.25,
                  shake_amp=(1.0, 3.0), shake_period=(6.0, 16.0), shake_axes="both",
-                 shake_vmax=1, keller_draws=True):
+                 shake_vmax=1, keller_draws=True, include_zero=True):
         if mode not in MODES:
             raise ValueError(f"unknown camera mode {mode!r}; expected one of {MODES}")
         if shake_axes not in ("both", "x", "y"):
@@ -112,24 +116,27 @@ class CameraMotion:
         self.shake_period = (float(shake_period[0]), float(shake_period[1]))
         self.shake_axes = shake_axes
         self.shake_vmax = shake_vmax
+        self.include_zero = bool(include_zero)
         self._process = None
-        if mode in GENERATOR_MODES:
+        if mode in GENERATOR_MODES or (mode == "constant" and not self.include_zero):
             self._process = _VelocityProcess(
                 seq_len, self.v_range, mode, transition, min_segment, max_segment,
                 smooth_probability=smooth_probability, p_change=p_change,
-                neighbor_kernel=neighbor_kernel, include_zero=True)
+                neighbor_kernel=neighbor_kernel, include_zero=self.include_zero)
         self.transition = transition
         self.min_segment, self.max_segment = min_segment, max_segment
 
     # ------------------------------------------------------------------
     @property
     def uses_keller_draws(self):
-        return self.mode == "constant" and self.keller_draws
+        return self.mode == "constant" and self.keller_draws and self.include_zero
 
     def draw(self, rng):
         T = self.seq_len
         if self.mode == "none":
             return np.zeros((T, 2), dtype=np.int64)
+        if self._process is not None:
+            return self._process.draw(rng)
         if self.mode == "constant":
             v = (rng.randint(-self.v_range, self.v_range + 1),
                  rng.randint(-self.v_range, self.v_range + 1))
@@ -140,7 +147,7 @@ class CameraMotion:
                 if self.shake_axes == "both" or self.shake_axes == "xy"[axis]:
                     v[:, axis] = self._shake_axis(rng, T)
             return v
-        return self._process.draw(rng)
+        raise AssertionError(f"no draw rule for mode {self.mode!r}")
 
     def _shake_axis(self, rng, T):
         """One axis of the shake: T whole-pixel steps of a rounded sinusoid."""
@@ -161,14 +168,16 @@ class CameraMotion:
     def describe(self):
         if self.mode == "none":
             return "none (static camera)"
+        zero = "" if self.include_zero else " without (0,0)"
         if self.mode == "constant":
-            src = "Keller's draws" if self.keller_draws else "seeded draws"
-            return f"constant, one v per clip from V_{self.v_range} ({src})"
+            src = "Keller's draws" if self.uses_keller_draws else "seeded draws"
+            return f"constant, one v per clip from V_{self.v_range}{zero} ({src})"
         if self.mode == "shake":
             return (f"shake, A in [{self.shake_amp[0]:g}, {self.shake_amp[1]:g}] px, "
                     f"P in [{self.shake_period[0]:g}, {self.shake_period[1]:g}] frames, "
                     f"axes {self.shake_axes}, |v| <= {self.shake_vmax or 'inf'}")
-        return (f"{self.mode} on V_{self.v_range} incl. (0,0), transition {self.transition}, "
+        zero = "incl. (0,0)" if self.include_zero else "without (0,0)"
+        return (f"{self.mode} on V_{self.v_range} {zero}, transition {self.transition}, "
                 f"segments {self.min_segment}-{self.max_segment}")
 
 
