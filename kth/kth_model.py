@@ -44,7 +44,6 @@ integer warp MotionVideoClassifier turns on MEConvLSTMCell's padded (sub-pixel-e
              ~28% slower).
 """
 import torch
-import torch.nn as nn
 
 from motion_benchmarks import _repo  # noqa: F401  (puts moving_mnist/ on sys.path)
 from motion_benchmarks.models.cf_classifier import MotionVideoClassifier  # noqa: E402
@@ -66,95 +65,36 @@ class KTHClassifier(MotionVideoClassifier):
                   recurrent cell, so it works for every backbone and velocity source, the
                   handover included (MotionVideoClassifier's own readout path does not run the
                   handover). No extra parameters.
-    velocity_readout
-                  melstm: 'centered' also hands the head the slot velocities of the whole
-                  sequence. A slot that moves with the person sees the person standing still,
-                  so its state cannot carry the person's speed -- the velocity can.
-                    * centered: at every step each slot's velocity minus the mean over the
-                      (moving) slots. The camera shifts every slot alike, so this is camera-
-                      invariant: what is left is motion relative to the scene.
-                    * encoded per slot by a small MLP (2 -> 16 -> 16), max over slots (slot order
-                      does not matter), then mean and max over the T-1 steps: 32 numbers.
-                    * appended to the head's pooled conv features before its MLP.
-                  The velocities carry no gradient (phase-correlation argmaxes); the encoder and
-                  the widened first MLP layer train. ~4.5k extra parameters at the defaults.
     """
 
-    VEL_DIM = 16
-
-    def __init__(self, *args, slot_assign="nearest", static_slot=False, velocity_readout="none",
-                 **kwargs):
+    def __init__(self, *args, slot_assign="nearest", static_slot=False, **kwargs):
         super().__init__(*args, **kwargs)
         if slot_assign not in ("nearest", "shift", "anchored"):
             raise ValueError(f"slot_assign {slot_assign!r}: expected nearest, shift or anchored")
         if static_slot and (self.model != "melstm" or self.n_velocities < 2):
             raise ValueError("static_slot needs melstm with >= 2 slots")
-        if velocity_readout not in ("none", "centered"):
-            raise ValueError(f"velocity_readout {velocity_readout!r}: expected none or centered")
-        if velocity_readout != "none" and (self.model != "melstm"
-                                           or self.n_velocities - int(static_slot) < 2):
-            raise ValueError("velocity_readout needs melstm with >= 2 moving slots")
         self.slot_assign = slot_assign
         self.static_slot = bool(static_slot)
-        self.velocity_readout = velocity_readout
-        if velocity_readout != "none":
-            # Built after everything else, so the rest of the initialisation is unchanged.
-            D = self.VEL_DIM
-            self.vel_encoder = nn.Sequential(nn.Linear(2, D), nn.LeakyReLU(0.01),
-                                             nn.Linear(D, D))
-            first = self.head.mlp[0]
-            self.head.mlp[0] = nn.Linear(first.in_features + 2 * D, first.out_features)
 
-    # ------------------------------------------------- readout over time / velocity readout
-    def velocity_features(self, velocities):
-        """(B, T-1, K, 2) slot velocities -> (B, 32), invariant to a common shift and slot order."""
-        v = velocities[:, :, 1:] if self.static_slot else velocities
-        c = v - v.mean(dim=2, keepdim=True)
-        e = self.vel_encoder(c).amax(dim=2)                              # (B, T-1, D)
-        return torch.cat([e.mean(dim=1), e.amax(dim=1)], dim=1)
-
-    def _head(self, features, vel_feat=None):
-        """ConvClassifierHead.forward, with the velocity features joining the pooled vector."""
-        if vel_feat is None:
-            return self.head(features)
-        f = self.head.conv(features)
-        pooled = torch.cat([f.mean(dim=(-2, -1)), f.amax(dim=(-2, -1)), vel_feat], dim=1)
-        return self.head.mlp(pooled)
-
+    # ------------------------------------------------------------------ readout over time
     def forward(self, seq, return_aux=False):
-        if self.readout_steps <= 1 and self.velocity_readout == "none":
+        if self.readout_steps <= 1:
             return MotionDigitClassifier.forward(self, seq, return_aux=return_aux)
-        states, handle = [], None
-        if self.readout_steps > 1:
-            handle = self.backbone.cell.register_forward_hook(
-                lambda _module, _inputs, out: states.append(out[0]))
+        states = []
+        handle = self.backbone.cell.register_forward_hook(
+            lambda _module, _inputs, out: states.append(out[0]))
         try:
-            h, velocities = self.encode(seq)[:2]
+            velocities = self.encode(seq)[1]
         finally:
-            if handle is not None:
-                handle.remove()
-        vel_feat = (self.velocity_features(velocities)
-                    if self.velocity_readout != "none" else None)
+            handle.remove()
         logits, weights = [], None
-        for h_t in (states[-self.readout_steps:] if self.readout_steps > 1 else [h]):
-            features, weights = self.pool(h_t)
-            logits.append(self._head(features, vel_feat))
+        for h in states[-self.readout_steps:]:
+            features, weights = self.pool(h)
+            logits.append(self.head(features))
         logits = torch.stack(logits, dim=0).mean(dim=0)
         if not return_aux:
             return logits
         return logits, {"velocities": velocities, "pool_weights": weights}
-
-    def head_parameters(self):
-        extra = list(self.vel_encoder.parameters()) if self.velocity_readout != "none" else []
-        return super().head_parameters() + extra
-
-    def submodule_report(self):
-        rows, trained = super().submodule_report()
-        if self.velocity_readout != "none":
-            n = sum(p.numel() for p in self.vel_encoder.parameters())
-            rows.insert(-1, ("vel_encoder", "slot velocities -> head (centered)", n))
-            trained += n
-        return rows, trained
 
     # ------------------------------------------------- static slot with h-tracking / handover
     def encode(self, seq, return_states=False):
@@ -303,7 +243,6 @@ def build_kth_classifier(cfg):
         slot_assign=get("slot_assign", "nearest"),
         static_slot=bool(get("static_slot", 0)),
         readout_steps=int(get("readout_steps", 1)),
-        velocity_readout=get("velocity_readout", "none"),
     )
     if net.model == "melstm":
         net.backbone.cell.integer_shift = not pc.get("subpixel", False)

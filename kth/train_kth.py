@@ -89,10 +89,6 @@ def get_args(argv=None):
                    help="melstm (any velocity source): 1 = slot 0 pinned to velocity (0, 0), a "
                         "ConvLSTM state inside the MEConvLSTM; slots 1..K-1 behave exactly like "
                         "the (K-1)-slot model's. Use K+1 slots to keep K moving ones")
-    p.add_argument("--velocity_readout", choices=["none", "centered"], default="none",
-                   help="melstm: also feed the head the slot velocities of the whole sequence, "
-                        "centered on the mean slot velocity per step (camera-invariant), encoded "
-                        "per slot, max over slots, mean and max over time (kth_model.py)")
     p.add_argument("--readout_steps", type=int, default=1,
                    help="average the head's logits over the last N encoder steps (1 = h_T only, "
                         "the original). Every model and velocity source, the handover included")
