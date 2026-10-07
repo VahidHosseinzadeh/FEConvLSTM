@@ -44,7 +44,9 @@ def get_args(argv=None):
     p.add_argument("--runs", nargs="+", required=True, help="run names (models/<run>_best.pth)")
     p.add_argument("--save_dir", default="./experiments_kth")
     p.add_argument("--root", default=str(Path(__file__).resolve().parent.parent / "data" / "kth"))
-    p.add_argument("--amps", type=float, nargs="+", default=[0, 0.5, 1, 2, 3, 4, 6])
+    p.add_argument("--amps", type=float, nargs="+", default=[0, 1, 1.5, 2, 3, 4, 6, 8],
+                   help="amplitudes, px. Not 0.5: with whole-pixel rounding it never moves the "
+                        "camera (measured: that row equals the static one for every model)")
     p.add_argument("--periods", type=float, nargs="+", default=[4, 6, 8, 12, 16, 24, 32])
     p.add_argument("--extra", default="constant,piecewise,constant:2",
                    help="drift motions scored as well ('mode:R' sets the velocity range)")
