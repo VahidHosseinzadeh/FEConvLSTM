@@ -94,8 +94,10 @@ def get_args(argv=None):
                         "steps take the frame-pair velocity with probability p(epoch), 1 -> 0 "
                         "over this many epochs; evaluation is always pure tracking. 0 = off")
     p.add_argument("--x_curriculum_shape", choices=["linear", "cosine"], default="cosine")
-    p.add_argument("--pc_subpixel", type=int, default=0,
-                   help="1 = parabolic sub-pixel peaks (then the padded warp is used)")
+    p.add_argument("--pc_subpixel", type=int, default=1,
+                   help="1 (default since set 2) = parabolic sub-pixel peaks, with the padded "
+                        "(interpolating) warp; 0 = whole-pixel peaks and the exact integer warp. "
+                        "Set 1 ran 0; at seed 1 the two were within 2.3 pt on every test set")
     p.add_argument("--pc_suppress_radius", type=int, default=0,
                    help="Chebyshev radius cleared around each phase-correlation peak before the "
                         "next is taken (0 = distinct pixels, the original top-K)")
