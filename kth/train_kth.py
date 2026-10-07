@@ -86,9 +86,12 @@ def get_args(argv=None):
                         "nearest after the best common shift (equivariant to time-varying camera "
                         "motion); or slot 0 = the top peak and the rest nearest (kth_model.py)")
     p.add_argument("--static_slot", type=int, default=0,
-                   help="melstm (frame_pair / bootstrap): 1 = slot 0 pinned to velocity (0, 0), a "
-                        "ConvLSTM state inside the MEConvLSTM; slots 1..K-1 take the top K-1 "
-                        "peaks. Use K+1 slots to keep K moving ones")
+                   help="melstm (any velocity source): 1 = slot 0 pinned to velocity (0, 0), a "
+                        "ConvLSTM state inside the MEConvLSTM; slots 1..K-1 behave exactly like "
+                        "the (K-1)-slot model's. Use K+1 slots to keep K moving ones")
+    p.add_argument("--readout_steps", type=int, default=1,
+                   help="average the head's logits over the last N encoder steps (1 = h_T only, "
+                        "the original). Every model and velocity source, the handover included")
     p.add_argument("--x_curriculum_epochs", type=int, default=0,
                    help="melstm --velocity_source tracked: the stochastic handover -- training "
                         "steps take the frame-pair velocity with probability p(epoch), 1 -> 0 "

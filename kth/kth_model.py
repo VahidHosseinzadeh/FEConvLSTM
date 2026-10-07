@@ -54,23 +54,96 @@ from .kth_dataset import KTH_ACTIONS
 
 class KTHClassifier(MotionVideoClassifier):
     """
-    static_slot  melstm with a frame-pair or bootstrap source: slot 0 is pinned to velocity
-                 (0, 0) -- an untransported state, i.e. a ConvLSTM inside the MEConvLSTM -- and
-                 slots 1..K-1 take the top K-1 candidates, assigned by slot_assign among
-                 themselves. With K-1 moving slots this is exactly the K-1-slot model plus one
-                 static slot. Same parameters (all slots share the cell).
+    static_slot   melstm: slot 0 is pinned to velocity (0, 0) -- an untransported state, i.e. a
+                  ConvLSTM inside the MEConvLSTM. Slots 1..K-1 behave exactly like the slots of
+                  the (K-1)-slot model: they take the top K-1 bootstrap / frame-pair candidates
+                  (assigned by slot_assign among themselves) and, with h-tracking, track their own
+                  states. So K = 5 with a static slot is the 4-slot model plus a resting slot
+                  (tested, for frame-pair, tracking and the handover). No extra parameters.
+    readout_steps average the head's logits over the states of the last N encoder steps instead
+                  of reading h_T alone (1 = h_T, the original). Implemented with a hook on the
+                  recurrent cell, so it works for every backbone and velocity source, the
+                  handover included (MotionVideoClassifier's own readout path does not run the
+                  handover). No extra parameters.
     """
 
     def __init__(self, *args, slot_assign="nearest", static_slot=False, **kwargs):
         super().__init__(*args, **kwargs)
         if slot_assign not in ("nearest", "shift", "anchored"):
             raise ValueError(f"slot_assign {slot_assign!r}: expected nearest, shift or anchored")
-        if static_slot and (self.model != "melstm" or self.velocity_source == "tracked"
-                            or self.n_velocities < 2):
-            raise ValueError("static_slot needs melstm, >= 2 slots and a frame-pair or "
-                             "bootstrap velocity source")
+        if static_slot and (self.model != "melstm" or self.n_velocities < 2):
+            raise ValueError("static_slot needs melstm with >= 2 slots")
         self.slot_assign = slot_assign
         self.static_slot = bool(static_slot)
+
+    # ------------------------------------------------------------------ readout over time
+    def forward(self, seq, return_aux=False):
+        if self.readout_steps <= 1:
+            return MotionDigitClassifier.forward(self, seq, return_aux=return_aux)
+        states = []
+        handle = self.backbone.cell.register_forward_hook(
+            lambda _module, _inputs, out: states.append(out[0]))
+        try:
+            velocities = self.encode(seq)[1]
+        finally:
+            handle.remove()
+        logits, weights = [], None
+        for h in states[-self.readout_steps:]:
+            features, weights = self.pool(h)
+            logits.append(self.head(features))
+        logits = torch.stack(logits, dim=0).mean(dim=0)
+        if not return_aux:
+            return logits
+        return logits, {"velocities": velocities, "pool_weights": weights}
+
+    # ------------------------------------------------- static slot with h-tracking / handover
+    def encode(self, seq, return_states=False):
+        if self.model == "melstm" and self.static_slot and self.velocity_source == "tracked":
+            p = self.x_track_p if self.training else 0.0
+            h, vels, states = self._encode_static_tracked(seq, p, return_states)
+            v = torch.stack(vels, dim=1)
+            st = torch.stack(states, dim=1) if states else None
+            return (h, v, st) if return_states else (h, v)
+        return super().encode(seq, return_states=return_states)
+
+    def _encode_static_tracked(self, seq, p, return_states=False):
+        """
+        MotionDigitClassifier's tracked encoder (p = 0, the backbone's own protocol) and its
+        stochastic handover (0 < p <= 1, _encode_melstm_mixed), with slot 0 at rest: the bootstrap
+        and the frame-pair candidates go to slots 1..K-1, and only those slots track.
+        """
+        cell = self.backbone.cell
+        B, T, C, H, W = seq.shape
+        K = self.n_velocities
+        h, c = cell.init_hidden(B, K, H, W, seq.device, seq.dtype)
+        rest = torch.zeros(B, 1, 2, device=seq.device, dtype=seq.dtype)
+        v = torch.zeros(B, K, 2, device=seq.device, dtype=seq.dtype)
+        vels, states = [], ([] if return_states else None)
+        for t in range(T):
+            if t == 1:
+                boot = self.backbone.bootstrap_velocities(seq[:, 0], seq[:, 1]).to(seq.dtype)
+                v = torch.cat([rest, boot[:, :K - 1]], dim=1)
+            elif t >= 2:
+                if p > 0:
+                    with torch.no_grad():
+                        cand = self._frame_pair_pc(seq[:, t - 1], seq[:, t])[0]
+                    v_x = self._assign(cand[:, :K - 1].to(seq.dtype), v[:, 1:])
+                if p >= 1:
+                    v_new = v_x
+                else:
+                    v_h = self.backbone.track_velocities(h[:, 1:], seq[:, t]).to(seq.dtype)
+                    if p <= 0:
+                        v_new = v_h
+                    else:
+                        use_x = torch.rand(B, device=seq.device) < p
+                        v_new = torch.where(use_x.view(B, 1, 1), v_x, v_h)
+                v = torch.cat([rest, v_new], dim=1)
+            h, c = cell(seq[:, t], h, c, v)
+            if t > 0:
+                vels.append(v.detach())
+            if return_states:
+                states.append(h.mean(dim=2).detach())
+        return h, vels, states
 
     def _candidate_velocities(self, x0, x1):
         cand = super()._candidate_velocities(x0, x1)
@@ -101,8 +174,11 @@ class KTHClassifier(MotionVideoClassifier):
         return ["h"]
 
     def pool_label(self):
-        return {"max": "max over V", "attention": "attention\npool", "mean": "mean over V",
-                "concat": "concat V\n(ch. mean)"}[self.pool.mode] + "\n(head input)"
+        label = {"max": "max over V", "attention": "attention\npool", "mean": "mean over V",
+                 "concat": "concat V\n(ch. mean)"}[self.pool.mode]
+        if self.readout_steps > 1:
+            return label + f"\n(head input,\nlast {self.readout_steps} steps)"
+        return label + "\n(head input)"
 
 
 def match_up_to_shift(cand, v_prev):
@@ -166,6 +242,7 @@ def build_kth_classifier(cfg):
         forget_bias=get("forget_bias", None),
         slot_assign=get("slot_assign", "nearest"),
         static_slot=bool(get("static_slot", 0)),
+        readout_steps=int(get("readout_steps", 1)),
     )
     if net.model == "melstm":
         net.backbone.cell.integer_shift = not pc.get("subpixel", False)

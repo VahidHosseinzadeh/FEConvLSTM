@@ -272,5 +272,51 @@ def test_static_slot_is_the_smaller_model_plus_a_resting_slot(store):
     assert torch.equal(v5[:, :, 0], torch.zeros_like(v5[:, :, 0]))
     assert torch.equal(v5[:, :, 1:], v4)
     assert static.copy_labels()[0] == "s0 (0,0)"
-    with pytest.raises(ValueError):
-        build_kth_classifier(dict(model="melstm", velocity_source="tracked", static_slot=1))
+    for bad in (dict(model="lstm", static_slot=1), dict(model="melstm", num_vel_modes=1,
+                                                         static_slot=1)):
+        with pytest.raises(ValueError):
+            build_kth_classifier(bad)
+
+
+@pytest.mark.parametrize("model_name", ["lstm", "melstm"])
+def test_readout_averages_the_last_steps(store, model_name):
+    """readout_steps N: the logits are the mean of head(pool(h_t)) over the last N steps."""
+    torch.manual_seed(0)
+    model = build_kth_classifier(dict(model=model_name, hidden_size=16, readout_steps=3)).eval()
+    ds = KTHClips(store, "test", seed=42)
+    x = torch.stack([ds[i][0] for i in range(4)])
+    states = []
+    handle = model.backbone.cell.register_forward_hook(lambda m, i, o: states.append(o[0]))
+    with torch.no_grad():
+        model.encode(x)
+        handle.remove()
+        expected = torch.stack([model.head(model.pool(h)[0]) for h in states[-3:]]).mean(0)
+        got = model(x)
+    assert torch.allclose(got, expected, atol=1e-6)
+    one = build_kth_classifier(dict(model=model_name, hidden_size=16, readout_steps=1)).eval()
+    one.load_state_dict(model.state_dict())
+    with torch.no_grad():
+        assert torch.allclose(one(x), model.head(model.pool(states[-1])[0]), atol=1e-6)
+
+
+@pytest.mark.parametrize("p", [0.0, 0.5, 1.0])
+def test_static_slot_with_tracking_and_handover(store, p):
+    """K = 5 with a static slot = the 4-slot tracked (or handover) model plus a resting slot."""
+    ds = KTHClips(store, "test", camera=CameraMotion("piecewise"), seed=42)
+    x = torch.stack([ds[i][0] for i in range(0, 120, 8)])
+    cfg = dict(model="melstm", hidden_size=16, velocity_source="tracked", pc_search_radius=0)
+    torch.manual_seed(0)
+    static = build_kth_classifier(dict(cfg, num_vel_modes=5, static_slot=1))
+    torch.manual_seed(0)
+    plain = build_kth_classifier(dict(cfg, num_vel_modes=4))
+    for m in (static, plain):
+        m.train(p > 0)                 # the handover only runs in training
+        m.x_track_p = p
+    with torch.no_grad():
+        torch.manual_seed(1)
+        h5, v5 = static.encode(x)
+        torch.manual_seed(1)
+        h4, v4 = plain.encode(x)
+    assert torch.equal(v5[:, :, 0], torch.zeros_like(v5[:, :, 0]))
+    assert torch.equal(v5[:, :, 1:], v4)
+    assert torch.allclose(h5[:, 1:], h4, atol=1e-6)
