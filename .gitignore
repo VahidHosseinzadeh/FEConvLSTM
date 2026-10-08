@@ -95,6 +95,7 @@ PREDICTION_EXPERIMENTS.md
 COMMON_FATE_CLASSIFICATION.md
 COMMON_FATE_CLASSIFICATION_SWEEP.md
 KTH_EXPERIMENTS.md
+KTH_CAMERA_MOTION.md
 experiments_classification/
 # per-(model seed, arm) save dirs of run_comparison.sh, and its SMOKE=1 runs
 experiments_*/
